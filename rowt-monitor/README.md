@@ -35,7 +35,11 @@ re-press or `↵` to commit; batched into one reload ~7s later) · `t` put it on
 the **hotspot** lane — macOS's proxy *bypass* list, so a venue's captive-portal
 page loads with the proxy on (`t` is the one letter of "hotspot" not already
 bound) · `u` use the selected server · `a` auto server selection on/off · `o`
-toggle the system proxy.
+toggle the system proxy · `r` re-probe servers · `R` update saved subscriptions.
+Subscription updates report whether anything changed (added, removed, or changed
+nodes); unchanged subscriptions do not restart the router. In `auto`/`best`, the
+watchdog also refreshes every six hours while online and running, even with
+Monitor closed. Each attempt resets that timer; failed fetches keep the old pool.
 
 **Auto server selection** (`a`, from any pane; or click `auto` above the strip)
 switches between a pinned server and **`best`** (`rowt use best`): rowt picks the

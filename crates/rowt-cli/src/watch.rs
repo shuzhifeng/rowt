@@ -1094,6 +1094,7 @@ fn finish_tick(ctx: &Ctx, lock: &Path) {
 }
 
 fn tick(ctx: &Ctx) {
+    if crate::pool::subscription_update_busy(&ctx.cfg) { return; }
     // The debounce lock is taken UP FRONT, so the crash-recovery, stale-proxy
     // and reload paths can never overlap a concurrent tick — a StartInterval
     // timer tick and a WatchPaths network tick can fire moments apart.
@@ -1114,6 +1115,10 @@ fn tick(ctx: &Ctx) {
         if std::fs::create_dir(&lock).is_err() {
             return;
         }
+    }
+    if crate::pool::subscription_update_busy(&ctx.cfg) {
+        finish_tick(ctx, &lock);
+        return;
     }
     let cfg = cfg_of(ctx);
     let mut st = load_state(ctx);
@@ -1192,6 +1197,7 @@ fn tick(ctx: &Ctx) {
             .and_then(|o| o.get("bind_interface").and_then(|b| b.as_str()))
             .unwrap_or("").to_string();
         if !ifc.is_empty() && ifc == cur {
+            crate::pool::watch_subscriptions(ctx, &ifc);
             crate::best::watch_best(ctx, &ifc, &read(&health_file(ctx)));
         }
     }

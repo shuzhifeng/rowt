@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::source::parse::BlockBuckets;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -92,6 +92,9 @@ pub struct LiveSource {
     // so we actively run clash delay tests off the UI thread, like `rowt ping`).
     escape_members: Vec<String>,
     prev_members: Vec<String>, // sorted; to detect pool changes -> auto re-probe
+    prev_pool_mtime: Option<SystemTime>,
+    pending_pool_probe: bool,
+    sub_result_mtime: Arc<Mutex<Option<SystemTime>>>,
     host_cache: Option<(SystemTime, HostInfo)>, // re-parse host.json only on mtime change
     delays: Delays,
     last_probe: Arc<Mutex<Option<Instant>>>,
@@ -142,6 +145,9 @@ impl LiveSource {
         // Probe every 10 minutes by default (override with ROWT_MONITOR_PROBE_INTERVAL secs).
         let probe_interval = Duration::from_secs(env_port("ROWT_MONITOR_PROBE_INTERVAL", 600).max(5) as u64);
         LiveSource {
+            prev_pool_mtime: modified(&cfg.join("servers.json")),
+            sub_result_mtime: Arc::new(Mutex::new(modified(&cfg.join("sub-update.result")))),
+            pending_pool_probe: false,
             cfg,
             clash_port,
             proxy_port,
@@ -200,6 +206,9 @@ impl LiveSource {
     /// the command may restart the router, so it counts as in flight until it exits.
     fn spawn_rowt(&self, args: Vec<String>, ok: String, restarts: bool) {
         let out = Arc::clone(&self.ctl_out);
+        let subscriptions = args == ["sub", "update"];
+        let sub_result = self.cfg.join("sub-update.result");
+        let sub_result_mtime = Arc::clone(&self.sub_result_mtime);
         let in_flight = restarts.then(|| InFlight::new(&self.restarts));
         std::thread::Builder::new()
             .name("rowt-monitor-ctl".into())
@@ -207,19 +216,23 @@ impl LiveSource {
                 let _in_flight = in_flight;
                 let bin = std::env::var("ROWT_BIN").unwrap_or_else(|_| "rowt".to_string());
                 let outcome = match std::process::Command::new(&bin).args(&args).output() {
-                    Ok(o) if o.status.success() => crate::source::CtlOutcome::Ok(ok),
+                    Ok(o) if o.status.success() => crate::source::CtlOutcome::Ok(if subscriptions {
+                        subscription_message(&String::from_utf8_lossy(&o.stdout)).unwrap_or(ok)
+                    } else { ok }),
                     Ok(o) => {
                         let err = String::from_utf8_lossy(&o.stderr);
-                        let msg = err
-                            .lines()
-                            .map(str::trim)
-                            .find(|l| !l.is_empty())
+                        let mut lines = err.lines().map(str::trim).filter(|l| !l.is_empty());
+                        let line = if subscriptions { lines.next_back() } else { lines.next() };
+                        let msg = line
                             .map(|l| l.trim_start_matches("error:").trim().to_string())
                             .unwrap_or_else(|| format!("rowt {} failed", args.join(" ")));
                         crate::source::CtlOutcome::Err(msg)
                     }
                     Err(e) => crate::source::CtlOutcome::Err(format!("{bin}: {e}")),
                 };
+                if subscriptions {
+                    if let Ok(mut stamp) = sub_result_mtime.lock() { *stamp = modified(&sub_result); }
+                }
                 if let Ok(mut v) = out.lock() {
                     v.push(outcome);
                 }
@@ -632,6 +645,12 @@ impl Source for LiveSource {
         request_probe(self.probe_tx.as_ref())
     }
 
+    fn update_subscriptions(&self) -> Result<(), &'static str> {
+        if self.restart_in_flight() { return Err("update or router restart in progress"); }
+        self.spawn_rowt(vec!["sub".into(), "update".into()], "subscriptions updated".into(), true);
+        Ok(())
+    }
+
     fn use_server(&self, tag: &str) {
         // In flight even pin → pin: that is a live clash switch, but `rowt use`
         // falls back to a restart when the switch fails (e.g. mid-restart).
@@ -745,6 +764,22 @@ impl Source for LiveSource {
     }
 
     fn poll(&mut self, window: Window, lane: Option<Lane>) -> Snapshot {
+        if !self.restart_in_flight() {
+            let path = self.cfg.join("sub-update.result");
+            let stamp = modified(&path);
+            if let Ok(mut previous) = self.sub_result_mtime.lock() {
+                if stamp.is_some() && stamp != *previous {
+                    if let Ok(message) = std::fs::read_to_string(path) {
+                        let message = message.trim();
+                        let outcome = if let Some(error) = message.strip_prefix("error: ") {
+                            crate::source::CtlOutcome::Err(error.to_string())
+                        } else { crate::source::CtlOutcome::Ok(message.to_string()) };
+                        if let Ok(mut out) = self.ctl_out.lock() { out.push(outcome); }
+                    }
+                }
+                *previous = stamp;
+            }
+        }
         // No rowt config at all -> demo fixture so we always render something.
         let Some(info) = self.host_info() else {
             return self.fallback.poll(window, lane);
@@ -760,6 +795,9 @@ impl Source for LiveSource {
         sig.sort();
         let pool_changed = !self.prev_members.is_empty() && sig != self.prev_members;
         self.prev_members = sig;
+        let pool_mtime = modified(&self.cfg.join("servers.json"));
+        self.pending_pool_probe |= pool_changed || pool_mtime != self.prev_pool_mtime;
+        self.prev_pool_mtime = pool_mtime;
 
         // Connections + throughput from clash (empty if unreachable).
         let conns_json = self.clash_get("/connections");
@@ -775,8 +813,8 @@ impl Source for LiveSource {
             self.ensure_prober();
             // Pool changed (server add/rm, sub update) -> probe now rather than
             // waiting up to the full interval.
-            if pool_changed {
-                let _ = self.force_probe();
+            if self.pending_pool_probe && !self.restart_in_flight() && !self.cfg.join("sub-update.lock").exists() && self.force_probe().is_ok() {
+                self.pending_pool_probe = false;
             }
         }
 
@@ -914,6 +952,14 @@ impl Source for LiveSource {
 }
 
 // ---------------- helpers ----------------
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn subscription_message(stdout: &str) -> Option<String> {
+    stdout.lines().map(str::trim).find(|line| line.starts_with("subscriptions ")).map(str::to_string)
+}
 
 fn request_probe(tx: Option<&SyncSender<()>>) -> Result<(), &'static str> {
     // The zero-capacity channel only accepts a request while the worker is

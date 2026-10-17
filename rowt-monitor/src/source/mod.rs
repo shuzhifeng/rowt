@@ -40,6 +40,9 @@ pub trait Source {
     /// Request an immediate server re-probe, or explain why it cannot start.
     fn force_probe(&self) -> Result<(), &'static str> { Err("probe unavailable") }
 
+    /// Refresh saved subscriptions off the UI thread; completion goes to `drain_ctl`.
+    fn update_subscriptions(&self) -> Result<(), &'static str> { Err("subscription update unavailable") }
+
     // ---- control layer (CONTROLS.md) — default no-ops so fixtures stay inert.
     // Each spawns the corresponding `rowt` command off the UI thread and reports
     // its outcome via `drain_ctl`. Lane edits pass `--no-reload`; the reload is

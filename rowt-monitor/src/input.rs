@@ -76,6 +76,7 @@ pub fn key(k: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('[') => Action::WindowStep(-1),
         KeyCode::Char('y') => Action::Yank,
         KeyCode::Char('r') => Action::ForceProbe,
+        KeyCode::Char('R') => Action::UpdateSubscriptions,
         KeyCode::Char('p') => Action::TogglePause,
         KeyCode::Char('?') => Action::ToggleHelp,
         // Control layer (CONTROLS.md): contextual routing edits (armed → commit),

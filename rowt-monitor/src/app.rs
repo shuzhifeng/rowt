@@ -258,6 +258,7 @@ pub enum Action {
     TogglePause,
     ToggleHelp,
     ForceProbe,
+    UpdateSubscriptions,
     // Control layer (CONTROLS.md):
     Route(Lane),  // e/c/b — arm routing the selected domain into a lane
     Unroute,      // d — arm removing the selected domain (→ direct)
@@ -580,6 +581,17 @@ impl App {
                 let message = match self.source.force_probe() {
                     Ok(()) => "re-probing servers…",
                     Err(message) => message,
+                };
+                self.notify(message.to_string());
+            }
+            UpdateSubscriptions => {
+                let message = if self.source.restart_in_flight() {
+                    "update or router restart in progress"
+                } else {
+                    match self.source.update_subscriptions() {
+                        Ok(()) => "updating subscriptions…",
+                        Err(message) => message,
+                    }
                 };
                 self.notify(message.to_string());
             }

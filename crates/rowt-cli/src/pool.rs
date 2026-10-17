@@ -572,12 +572,143 @@ pub fn load_sub_dump(ctx: &Ctx, file: &Path) -> Result<String, String> {
 
 /// `sub update` — re-fetch every subscription.
 pub fn update_subs(ctx: &Ctx) -> Result<String, String> {
-    info(&format!(
-        "re-fetching {} subscription(s)…",
-        sub_count(&ctx.cfg)
-    ));
-    rebuild(ctx)?;
-    after_import(ctx)
+    refresh_subs(ctx, false)
+}
+
+struct SubscriptionLock(PathBuf);
+impl SubscriptionLock {
+    fn acquire(cfg: &Path) -> Result<Self, String> {
+        if subscription_update_busy(cfg) {
+            return Err("subscription update in progress".into());
+        }
+        let path = cfg.join("sub-update.lock");
+        std::fs::create_dir(&path).map_err(|_| "subscription update in progress".to_string())?;
+        set_mode(&path, 0o700);
+        let guard = Self(path);
+        std::fs::write(guard.0.join("pid"), format!("{}\n", std::process::id())).map_err(|e| format!("write lock: {e}"))?;
+        Ok(guard)
+    }
+}
+impl Drop for SubscriptionLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0.join("pid"));
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+/// A slow fetch must not let the watchdog reclaim its minute-old tick lock.
+pub fn subscription_update_busy(cfg: &Path) -> bool {
+    let path = cfg.join("sub-update.lock");
+    if !path.exists() { return false; }
+    let pid = read(&path.join("pid")).trim().parse::<i32>().ok().filter(|p| *p > 0);
+    let stale = match pid {
+        Some(p) => unsafe { libc::kill(p, 0) != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) },
+        None => std::fs::metadata(&path).ok().and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok()).is_some_and(|e| e.as_secs() > 60),
+    };
+    if stale {
+        // Bash keeps its fetch/merge scratch files inside this shared lock.
+        for name in ["pid", "acc", "acc.n", "error", "servers"] {
+            let _ = std::fs::remove_file(path.join(name));
+        }
+        let _ = std::fs::remove_dir(&path);
+    }
+    path.exists()
+}
+
+fn subscription_update_due(selected: &str, mode: &str, has_subs: bool, elapsed: Option<std::time::Duration>) -> bool {
+    matches!(selected, "auto" | "best") && mode != "local" && has_subs
+        && elapsed.is_none_or(|e| e.as_secs() >= 6 * 60 * 60)
+}
+
+pub fn watch_subscriptions(ctx: &Ctx, iface: &str) {
+    let elapsed = std::fs::metadata(ctx.cfg.join("sub-update.at")).ok().and_then(|m| m.modified().ok())
+        .map(|t| t.elapsed().unwrap_or_default());
+    if !subscription_update_due(&ctx.sget("selected"), &ctx.mode(), sub_count(&ctx.cfg) > 0, elapsed) { return; }
+    let online = std::process::Command::new("ipconfig").args(["getifaddr", iface])
+        .output().is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+    if !online { return; }
+    match refresh_subs(ctx, true) {
+        Ok(message) => info(&message),
+        Err(message) => err(&message),
+    }
+    // The shared subscription lock protected a potentially long fetch. Resume
+    // the ordinary watchdog stale-lock clock for the rest of this tick.
+    if let Ok(f) = std::fs::File::open(ctx.cfg.join("watch.lock")) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+fn refresh_summary(old: &[Value], new: &[Value]) -> String {
+    let by_tag = |nodes: &[Value]| -> std::collections::BTreeMap<String, Value> {
+        nodes.iter().filter_map(|v| Some((v.get("tag")?.as_str()?.to_string(), v.clone()))).collect()
+    };
+    let before = by_tag(old);
+    let after = by_tag(new);
+    let added = after.keys().filter(|t| !before.contains_key(*t)).count();
+    let removed = before.keys().filter(|t| !after.contains_key(*t)).count();
+    let changed = after.iter().filter(|(t, v)| before.get(*t).is_some_and(|o| o != *v)).count();
+    if added + removed + changed == 0 {
+        "subscriptions updated: server order changed".into()
+    } else {
+        format!("subscriptions updated: +{added} added, -{removed} removed, {changed} changed")
+    }
+}
+
+fn refresh_subs(ctx: &Ctx, watchdog: bool) -> Result<String, String> {
+    let _lock = SubscriptionLock::acquire(&ctx.cfg)?;
+    if !watchdog && ctx.cfg.join("watch.lock").exists() {
+        return Err("watchdog in progress; retry shortly".into());
+    }
+    if sub_count(&ctx.cfg) == 0 { return Err("no saved subscriptions".into()); }
+    let stamp = ctx.cfg.join("sub-update.at");
+    std::fs::write(&stamp, "").map_err(|e| format!("write update time: {e}"))?;
+    set_mode(&stamp, 0o600);
+    info(&format!("re-fetching {} subscription(s)…", sub_count(&ctx.cfg)));
+    let result = refresh_pool(ctx);
+    let message = match &result { Ok(m) => m.clone(), Err(e) => format!("error: {e}") };
+    let tmp = ctx.cfg.join("sub-update.result.tmp");
+    if std::fs::write(&tmp, format!("{message}\n")).is_ok() {
+        set_mode(&tmp, 0o600);
+        let _ = std::fs::rename(tmp, ctx.cfg.join("sub-update.result"));
+    }
+    result
+}
+
+fn refresh_pool(ctx: &Ctx) -> Result<String, String> {
+    let mut fetched = Vec::new();
+    for url in read(&subs_file(&ctx.cfg)).lines().filter(|u| !u.is_empty() && !u.starts_with('#')) {
+        fetched.push(fetch_sub(url).map_err(|status| format!("subscription fetch failed: {}{}; previous servers kept",
+            shown_url(url), status.map(|s| format!(" (HTTP {s})")).unwrap_or_default()))?);
+    }
+    let batch = combine(&accumulate(manual_array(&ctx.cfg), fetched)).map_err(|_| "combine failed".to_string())?;
+    let path = servers_file(&ctx.cfg);
+    let old: Vec<Value> = serde_json::from_str(&read(&path)).unwrap_or_default();
+    let changed = old != batch.outbounds;
+    let pending = ctx.cfg.join("sub-update.pending");
+    let retrying = pending.exists();
+    if !changed && !retrying { return Ok("subscriptions unchanged".into()); }
+    let message = if changed { refresh_summary(&old, &batch.outbounds) } else { "subscriptions unchanged; pending update applied".into() };
+    // Retain a retry marker if applying fails after the pool has been saved.
+    std::fs::write(&pending, "").map_err(|e| format!("write pending update: {e}"))?;
+    set_mode(&pending, 0o600);
+    if changed {
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, sharelink::render(&Value::Array(batch.outbounds.clone()))).map_err(|e| format!("write servers: {e}"))?;
+        set_mode(&tmp, 0o600);
+        std::fs::rename(&tmp, &path).map_err(|e| format!("mv: {e}"))?;
+        let sel = ctx.sget("selected");
+        if sel != "auto" && sel != "best" && !batch.outbounds.iter().any(|o| o.get("tag").and_then(Value::as_str) == Some(&sel)) {
+            let first = batch.outbounds.first().and_then(|o| o.get("tag")).and_then(Value::as_str).unwrap_or("auto");
+            lifecycle::sset(ctx, "selected", first);
+        }
+    }
+    if retrying && lifecycle::host_running(ctx).is_none() {
+        return Err("subscriptions saved; pending update awaits a running router".into());
+    }
+    lifecycle::reload_if_running(ctx).map_err(|e| format!("subscriptions saved but apply failed: {e}"))?;
+    std::fs::remove_file(pending).map_err(|e| format!("clear pending update: {e}"))?;
+    Ok(message)
 }
 
 /// `sub clear` — drop every subscription. `: >` truncates in place, so the
@@ -732,5 +863,110 @@ mod tests {
         // no handler for it and raises URLError without a socket, so sending it
         // to curl was a request bin/rowt never made.
         assert!(!opens_a_request("s3+http://example.com/feed"));
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    struct Scratch(Ctx);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let p = std::env::temp_dir().join(format!("rowt-sub-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("state"), "selected=best\nmode=host\n").unwrap();
+            Self(Ctx::new(p))
+        }
+        fn feed(&self, body: &str) {
+            let p = self.0.cfg.join("feed.txt");
+            std::fs::write(&p, body).unwrap();
+            std::fs::write(self.0.cfg.join("subs.txt"), format!("file://{}\n", p.display())).unwrap();
+        }
+    }
+    impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0.cfg); } }
+    const LINK: &str = "vless://00000000-0000-4000-8000-000000000001@node.example:443#node\n";
+
+    #[test]
+    fn refresh_schedule_only_auto_best_and_six_hours_since_last_attempt() {
+        for selection in ["auto", "best"] {
+            assert!(subscription_update_due(selection, "host", true, None));
+            assert!(!subscription_update_due(selection, "host", true, Some(Duration::from_secs(21599))));
+            assert!(subscription_update_due(selection, "host", true, Some(Duration::from_secs(21600))));
+            assert!(!subscription_update_due(selection, "local", true, None));
+            assert!(!subscription_update_due(selection, "host", false, None));
+        }
+        assert!(!subscription_update_due("node", "host", true, None));
+    }
+
+    #[test]
+    fn refresh_failure_preserves_pool_selection_and_records_attempt() {
+        let s = Scratch::new();
+        s.feed(LINK);
+        update_subs(&s.0).unwrap();
+        let old = read(&servers_file(&s.0.cfg));
+        let state = s.0.state();
+        std::fs::write(s.0.cfg.join("subs.txt"), "file:///does-not-exist/secret-token\n").unwrap();
+        let error = update_subs(&s.0).unwrap_err();
+        assert!(!error.contains("secret-token"));
+        assert_eq!(read(&servers_file(&s.0.cfg)), old);
+        assert_eq!(s.0.state(), state);
+        assert!(s.0.cfg.join("sub-update.at").exists());
+        assert!(!s.0.cfg.join("sub-update.lock").exists());
+    }
+
+    #[test]
+    fn refresh_unchanged_does_not_rewrite_pool_but_manual_update_resets_timer() {
+        let s = Scratch::new();
+        s.feed(LINK);
+        update_subs(&s.0).unwrap();
+        let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
+        std::fs::File::open(servers_file(&s.0.cfg)).unwrap().set_modified(old_time).unwrap();
+        std::fs::File::open(s.0.cfg.join("sub-update.at")).unwrap().set_modified(old_time).unwrap();
+        assert_eq!(update_subs(&s.0).unwrap(), "subscriptions unchanged");
+        assert_eq!(std::fs::metadata(servers_file(&s.0.cfg)).unwrap().modified().unwrap(), old_time);
+        assert!(std::fs::metadata(s.0.cfg.join("sub-update.at")).unwrap().modified().unwrap() > old_time);
+    }
+
+    #[test]
+    fn refresh_rejects_partial_results_and_empty_subscription_body() {
+        let s = Scratch::new();
+        s.feed(LINK);
+        update_subs(&s.0).unwrap();
+        let old = read(&servers_file(&s.0.cfg));
+        let feed = read(&subs_file(&s.0.cfg));
+        std::fs::write(subs_file(&s.0.cfg), format!("{feed}file:///does-not-exist/second\n")).unwrap();
+        assert!(update_subs(&s.0).is_err());
+        assert_eq!(read(&servers_file(&s.0.cfg)), old);
+        s.feed("not a subscription");
+        assert!(update_subs(&s.0).is_err());
+        assert_eq!(read(&servers_file(&s.0.cfg)), old);
+    }
+
+    #[test]
+    fn refresh_reports_added_removed_and_changed_nodes() {
+        let s = Scratch::new();
+        s.feed(LINK);
+        assert_eq!(update_subs(&s.0).unwrap(), "subscriptions updated: +1 added, -0 removed, 0 changed");
+        let second = LINK.replace("#node", "#second").replace("node.example", "second.example");
+        s.feed(&format!("{}{}", LINK.replace(":443", ":8443"), second));
+        assert_eq!(update_subs(&s.0).unwrap(), "subscriptions updated: +1 added, -0 removed, 1 changed");
+        s.feed(LINK);
+        assert_eq!(update_subs(&s.0).unwrap(), "subscriptions updated: +0 added, -1 removed, 1 changed");
+        assert_eq!(s.0.sget("selected"), "best");
+    }
+
+    #[test]
+    fn refresh_lock_is_shared_and_cleans_up() {
+        let s = Scratch::new();
+        s.feed(LINK);
+        let guard = SubscriptionLock::acquire(&s.0.cfg).unwrap();
+        assert!(update_subs(&s.0).unwrap_err().contains("in progress"));
+        assert!(!s.0.cfg.join("sub-update.at").exists());
+        drop(guard);
+        assert!(update_subs(&s.0).is_ok());
     }
 }

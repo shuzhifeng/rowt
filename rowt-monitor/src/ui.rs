@@ -1191,6 +1191,7 @@ fn draw_help(buf: &mut Buffer, area: Rect) {
         "             (off pins the server in use)",
         "  o          toggle the system proxy on/off",
         "  r          re-probe servers now",
+        "  R          update subscriptions now",
         "  p          pause sampling   · esc  cancel",
         "  ?          toggle this help · q  quit",
         "",
@@ -1318,13 +1319,16 @@ pub fn draw_footer(buf: &mut Buffer, area: Rect, app: &App) {
 
     // Normal: global group, then a contextual group when something is live.
     let global = if app.paused {
-        " ↑↓←→ navigate · v flip · s span · f lane · / search · w window · o proxy · a auto · p resume · g servers · ? help · q quit "
+        " ↑↓←→ navigate · v flip · s span · f lane · / search · w window · o proxy · a auto · r reprobe · R subs · p resume · g servers · ? help · q quit "
     } else {
-        " ↑↓←→ navigate · v flip · s span · f lane · / search · w window · o proxy · a auto · p pause · g servers · ? help · q quit "
+        " ↑↓←→ navigate · v flip · s span · f lane · / search · w window · o proxy · a auto · r reprobe · R subs · p pause · g servers · ? help · q quit "
     };
-    let global = if area.width < dw(global) {
-        if app.focus == Focus::Health && app.server_mode == ServerMode::List { "↑↓ page · g servers · ? help · q quit" }
-        else { "Tab pane · g servers · ? help · q quit" }
+    // Leave room for contextual route/select keys on medium-width terminals.
+    let global = if area.width < dw(global) + 35 {
+        if area.width >= 100 { "Tab pane · / search · o proxy · a auto · r reprobe · R subs · g servers · ? help · q quit " }
+        else if area.width >= 65 { "Tab pane · r reprobe · R subs · g servers · ? help · q quit " }
+        else if app.focus == Focus::Health && app.server_mode == ServerMode::List { "↑↓ page · g servers · ? help · q quit" }
+        else { "r reprobe · R subs · g servers · ? help" }
     } else { global };
     let shown = truncate(global, area.width);
     put(buf, left, y, &shown, dimmer);

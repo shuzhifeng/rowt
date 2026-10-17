@@ -69,7 +69,10 @@ foreground with output redirected to a file (see SKILL.md → Rules).
 - `rowt use auto` is sing-box's own auto: the fastest live server by single samples.
   In the monitor, `a` toggles `best`, and turning either auto off pins the server in use.
 - Pool: `rowt server list|add|rm|clear|import|dump`. Subscriptions:
-  `rowt sub list|add|rm|update|clear|import|dump`; `update` re-fetches them.
+  `rowt sub list|add|rm|update|clear|import|dump`; `update` re-fetches them (`R` in
+  Monitor, after `r` reprobe). The watchdog refreshes every six hours in
+  `auto`/`best` while online and running. Each attempt resets the timer;
+  unchanged subscriptions skip reload, and failed fetches keep the old pool.
 - `server dump` and `sub dump` output contains secrets.
 
 ## Lanes

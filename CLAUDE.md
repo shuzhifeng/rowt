@@ -76,6 +76,10 @@ trusting a summary. It runs on every push to `main` and every PR:
   `kern.boottime`). The monitor is a separate workspace and needs its own
   `cd rowt-monitor && cargo test` or it is simply not built.
 
+For subscription/watchdog changes, also run `python3 tests/test_subscriptions.py`
+locally after the release build. It uses Python stdlib + `jq`, isolated configs,
+a loopback feed, and a fake router; no live subscription or sing-box is needed.
+
 **Do NOT run `cargo fmt`.** The tree is intentionally hand-formatted with long
 lines and is not fmt-clean. CI deliberately omits `cargo fmt --check`. Match the
 surrounding style by hand. A pre-existing clippy "very complex type" note in

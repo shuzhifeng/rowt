@@ -59,7 +59,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.3"
+ROWT_VERSION="3.6.5"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -2187,6 +2187,111 @@ server_load_dump() {
 # subscribe <url> [url2...]        replace the subscription list
 # subscribe --add <url> [url2...]  append to it
 # Subscriptions: rowt sub [list | add <url>… | rm <n|url> | update | clear]
+_sub_update_busy() {
+  local lock="$CFG/sub-update.lock" pid
+  [ -d "$lock" ] || return 1
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*|0) [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] || return 0 ;;
+    *) kill -0 "$pid" 2>/dev/null && return 0 ;;
+  esac
+  rm -f "$lock/pid" "$lock/acc" "$lock/acc.n" "$lock/error" "$lock/servers"
+  rmdir "$lock" 2>/dev/null || true
+  [ -d "$lock" ]
+}
+
+_sub_update_fail() { _SUB_RESULT="error: $*"; err "$*"; exit 1; }
+
+# Keep the last complete pool if any subscription fails. The lock spans fetch
+# and reload, shared by monitor, CLI and watchdog; a crashed owner is reclaimed.
+_sub_update() (
+  umask 077
+  # Bash 3.2 unwinds function locals before EXIT inside command substitution.
+  # These values must survive that unwind; the subshell keeps them private.
+  _SUB_LOCK="$CFG/sub-update.lock"; _SUB_RESULT=""
+  local acc url out why shown sub_err sel summary changed=0 retrying=0
+  _sub_update_busy && { err "subscription update in progress"; exit 1; }
+  mkdir "$_SUB_LOCK" 2>/dev/null || { err "subscription update in progress"; exit 1; }
+  trap 'if [ -n "$_SUB_RESULT" ]; then
+          printf "%s\n" "$_SUB_RESULT" > "$CFG/sub-update.result.tmp"
+          chmod 600 "$CFG/sub-update.result.tmp"
+          mv "$CFG/sub-update.result.tmp" "$CFG/sub-update.result"
+        fi
+        rm -f "$_SUB_LOCK/pid" "$_SUB_LOCK/acc" "$_SUB_LOCK/acc.n" "$_SUB_LOCK/error" "$_SUB_LOCK/servers"
+        rmdir "$_SUB_LOCK" 2>/dev/null || true' EXIT
+  printf '%s\n' "$$" > "$_SUB_LOCK/pid"
+  if [ "${1:-}" != watchdog ] && [ -d "$CFG/watch.lock" ]; then
+    err "watchdog in progress; retry shortly"; exit 1
+  fi
+  [ "$(sub_count)" -gt 0 ] || { err "no saved subscriptions"; exit 1; }
+  : > "$CFG/sub-update.at"; chmod 600 "$CFG/sub-update.at"
+  _SUB_RESULT="error: subscription update failed"
+  info "re-fetching $(sub_count) subscription(s)…"
+  _py_ok || _sub_update_fail "python3 not found"
+  acc="$_SUB_LOCK/acc"; sub_err="$_SUB_LOCK/error"
+  echo '[]' > "$acc"
+  [ -s "$MANUAL" ] && jq -s 'add' "$acc" "$MANUAL" > "$acc.n" && mv "$acc.n" "$acc"
+  while IFS= read -r url || [ -n "$url" ]; do
+    case "$url" in ''|\#*) continue ;; esac
+    if out="$("${PY_VLESS[@]}" --sub "$url" 2>"$sub_err")"; then
+      jq -s 'add' "$acc" <(printf '%s' "$out") > "$acc.n" && mv "$acc.n" "$acc" || _sub_update_fail "combine failed"
+    else
+      why="$(sed -n 's/^urllib\.error\.HTTPError: HTTP Error \([0-9][0-9]*\).*/ (HTTP \1)/p' "$sub_err" | tail -1)"
+      shown="$(printf '%s' "$url" | sed -nE 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/?#]*).*#\1/…#p')"
+      [ -n "$shown" ] || shown="${url%%\?*}…"
+      _sub_update_fail "subscription fetch failed: $shown$why; previous servers kept"
+    fi
+  done < "$SUBS_FILE"
+  "${PY_VLESS[@]}" --combine < "$acc" > "$_SUB_LOCK/servers" || _sub_update_fail "combine failed"
+  if [ "$(jq -cS . "$SERVERS" 2>/dev/null || echo '[]')" != "$(jq -cS . "$_SUB_LOCK/servers")" ]; then changed=1; fi
+  [ -f "$CFG/sub-update.pending" ] && retrying=1
+  if [ "$changed" = 0 ] && [ "$retrying" = 0 ]; then
+    _SUB_RESULT="subscriptions unchanged"; echo "$_SUB_RESULT"; exit 0
+  fi
+  summary="subscriptions unchanged; pending update applied"
+  if [ "$changed" = 1 ]; then
+    [ -f "$SERVERS" ] && cp "$SERVERS" "$acc" || echo '[]' > "$acc"
+    summary="$(jq -rs '
+      (.[0] | map({key: .tag, value: .}) | from_entries) as $old |
+      (.[1] | map({key: .tag, value: .}) | from_entries) as $new |
+      ([$new | keys[] | select($old[.] == null)] | length) as $added |
+      ([$old | keys[] | select($new[.] == null)] | length) as $removed |
+      ([$new | keys[] | select($old[.] != null and $old[.] != $new[.])] | length) as $changed |
+      if $added + $removed + $changed == 0 then "subscriptions updated: server order changed"
+      else "subscriptions updated: +\($added) added, -\($removed) removed, \($changed) changed" end
+      ' "$acc" "$_SUB_LOCK/servers")" || _sub_update_fail "compare servers failed"
+  fi
+  : > "$CFG/sub-update.pending"; chmod 600 "$CFG/sub-update.pending"
+  if [ "$changed" = 1 ]; then
+    chmod 600 "$_SUB_LOCK/servers"; mv "$_SUB_LOCK/servers" "$SERVERS"
+    sel="$(sget selected)"
+    case "$sel" in auto|best) ;;
+      *) jq -e --arg t "$sel" 'any(.tag==$t)' "$SERVERS" >/dev/null 2>&1 || sset selected "$(jq -r '.[0].tag // "auto"' "$SERVERS")" ;;
+    esac
+  fi
+  if [ "$retrying" = 1 ] && ! host_running; then
+    _sub_update_fail "subscriptions saved; pending update awaits a running router"
+  fi
+  reload_if_running || _sub_update_fail "subscriptions saved but apply failed"
+  rm -f "$CFG/sub-update.pending"
+  _SUB_RESULT="$summary"; echo "$_SUB_RESULT"
+)
+
+_watch_subscriptions() {
+  case "$(sget selected)" in auto|best) ;; *) return 0 ;; esac
+  [ "$(sget mode)" != local ] && [ "$(sub_count)" -gt 0 ] || return 0
+  if [ -f "$CFG/sub-update.at" ]; then
+    local last now
+    last="$(stat -f %m "$CFG/sub-update.at" 2>/dev/null || stat -c %Y "$CFG/sub-update.at")"
+    now="$(date +%s)"
+    [ "$((now - last))" -ge 21600 ] || return 0
+  fi
+  [ -n "$(ipconfig getifaddr "${1:-}" 2>/dev/null || true)" ] || return 0
+  local result
+  if result="$(_sub_update watchdog)"; then info "$result"; fi
+  touch "$CFG/watch.lock" 2>/dev/null || true
+}
+
 cmd_sub() {
   local action="${1:-list}"; [ "$#" -gt 0 ] && shift || true
   case "$action" in
@@ -2204,7 +2309,7 @@ cmd_sub() {
     rm|remove) subs_remove "$@" ;;
     update)
       [ -s "$SUBS_FILE" ] || die "no saved subscriptions — use: $PROG sub add <url>"
-      info "re-fetching $(sub_count) subscription(s)…"; rebuild_servers; after_import ;;
+      _sub_update ;;
     clear) : > "$SUBS_FILE"; info "all subscriptions removed"; rebuild_servers; after_import ;;
     import)
       # a file (not --apply) restores a `sub dump`; otherwise Shadowrocket
@@ -5892,6 +5997,7 @@ cmd_watch() {
       [ -f "$WATCH_LOG" ] && { echo "  recent:"; tail -5 "$WATCH_LOG" | sed 's/^/    /'; }
       ;;
     tick)
+      _sub_update_busy && exit 0
       # Fired by the LaunchAgent on a resolver change OR the periodic timer.
       # Debounce via a lock dir + a short settle so a burst of resolv.conf writes
       # = one reload. When the router is up and nothing moved, probe the escape
@@ -5914,6 +6020,9 @@ cmd_watch() {
         else
           exit 0
         fi
+      fi
+      if _sub_update_busy; then
+        touch "$CFG/watch.tick"; rmdir "$lock"; exit 0
       fi
       # Clean the lock by its absolute path, not the local $lock, so the trap
       # still resolves if it fires at top-level scope after a fall-through path.
@@ -6095,7 +6204,10 @@ cmd_watch() {
       cur="$(jq -r '.outbounds[]?|select(.tag=="direct")|.bind_interface // empty' "$HOST_CFG" 2>/dev/null || true)"
       # `best` re-picks here — but not on a tick where the network just moved:
       # a reload is coming, and measuring over a half-moved interface is noise.
-      if [ -n "$ifc" ] && [ "$ifc" = "$cur" ]; then _watch_best "$ifc" || true; fi
+      if [ -n "$ifc" ] && [ "$ifc" = "$cur" ]; then
+        _watch_subscriptions "$ifc"
+        _watch_best "$ifc" || true
+      fi
       svc="$(active_service 2>/dev/null || true)"
       nid="$(net_id "$ifc")"                       # e.g. "MyWifi 192.168.1.42/192.168.1.1"
       last="$(cat "$WATCH_NET" 2>/dev/null || true)"
@@ -6865,10 +6977,14 @@ $PROG sub <subcommand> — manage subscriptions.
   add <url> [more]     add subscription link(s) and fetch them
   rm <n|url>           remove a subscription by number or URL substring
   update               re-fetch all saved subscriptions
+                       unchanged: no restart; failures keep previous servers
   clear                remove all subscriptions
   import [--apply]     same as '$PROG server import' (Shadowrocket)
   import <file>        restore subscriptions from a 'sub dump' (round-trip)
   dump [file]          print the subscription URLs (or write them to a file)
+
+In auto/best mode, the watchdog refreshes subscriptions every 6 hours while
+online and running. Manual updates reset this timer, including failed attempts.
 EOF
 ;;
     use) cat <<EOF

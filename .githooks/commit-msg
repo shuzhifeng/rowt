@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuse a commit message carrying agent attribution (see check-commit-messages.sh).
+# Enabled with the rest of .githooks: git config core.hooksPath .githooks
+exec sh "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/check-commit-messages.sh" --message "$1"

@@ -54,6 +54,14 @@ skill** in `skills/rowt/`. Don't duplicate that here.
 - **`.githooks/pre-commit`** — the auto version-bump, **and** a refusal when a
   commit leaves `tests/parity/{LEDGER,CLI-LEDGER}.md` stale. Enable in a fresh
   clone: `git config core.hooksPath .githooks`.
+- **`.githooks/commit-msg`** — refuses a commit message carrying agent
+  attribution (`Co-Authored-By: Claude`, `Claude-Session:`, "Generated with
+  Claude Code"), through `.githooks/check-commit-messages.sh`. CI's
+  `commit-messages` job runs the same script over a PR's commits and
+  description and over every push to `main`, which is the only place a squash
+  merge written on GitHub (`gh pr merge --body`) gets checked: write that body
+  without the lines. Commits on `main` from before the gate keep theirs (Hong,
+  2026-10-17: no history rewrite).
 
 ## Gates
 

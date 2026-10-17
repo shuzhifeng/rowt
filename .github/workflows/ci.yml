@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: bash syntax check
         run: |
-          for f in bin/rowt install.sh .githooks/pre-commit; do
+          for f in bin/rowt install.sh .githooks/pre-commit .githooks/commit-msg .githooks/check-commit-messages.sh; do
             echo "bash -n $f"; bash -n "$f"
           done
       - name: shellcheck (errors only, advisory)
@@ -23,6 +23,42 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck --shell=bash --severity=error bin/rowt install.sh .githooks/pre-commit
+
+  # No agent attribution (Co-Authored-By: Claude, Claude-Session, "Generated with
+  # Claude Code") in what lands. .githooks/commit-msg refuses it in a local commit;
+  # this catches what no local hook sees: a PR's commits and description, and a
+  # squash merge whose body was written on GitHub (`gh pr merge --body`), which
+  # turns main red the moment it lands. Commits already on main are not re-read.
+  commit-messages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: no agent attribution
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          check=.githooks/check-commit-messages.sh
+          if [ "$EVENT" = pull_request ]; then
+            printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body"
+            rc=0
+            sh "$check" --message "$RUNNER_TEMP/pr-body" || rc=1
+            sh "$check" "$PR_BASE..$PR_HEAD" || rc=1
+            exit $rc
+          fi
+          # A new branch has an all-zero `before`, and a force-push's may no
+          # longer exist: check the pushed tip alone then.
+          if git rev-parse --quiet --verify "$BEFORE^{commit}" >/dev/null; then
+            sh "$check" "$BEFORE..$SHA"
+          else
+            sh "$check" "$SHA~1..$SHA"
+          fi
 
   python:
     runs-on: ubuntu-latest

@@ -564,6 +564,11 @@ PARITY_SCENARIO=explain-resolve explain nores.example
 PARITY_SCENARIO=explain-resolve ROWT_FINAL=escape explain corp-svc.example
 PARITY_SCENARIO=explain-resolve ROWT_PRIVATE_DEFAULT=direct explain lan-svc.example
 PARITY_SCENARIO=explain-resolve ROWT_PRIVATE_DEFAULT=direct explain corp-svc.example
+# The watchdog's six-hour subscription refresh (PR #3), due and not due. Only a
+# FAILED fetch is reachable here (a reload with the router up would stop the
+# harness); success and the reload's audit pair are in tests/test_subscriptions.py.
+PARITY_NOTRACE=1 PARITY_SCENARIO=sub-watch-due watch tick
+PARITY_NOTRACE=1 PARITY_SCENARIO=sub-watch-notdue watch tick
 PARITY_SCENARIO=best-tick-fresh use alpha
 run
 

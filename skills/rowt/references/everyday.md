@@ -72,7 +72,8 @@ foreground with output redirected to a file (see SKILL.md → Rules).
   `rowt sub list|add|rm|update|clear|import|dump`; `update` re-fetches them (`R` in
   Monitor, after `r` reprobe). The watchdog refreshes every six hours in
   `auto`/`best` while online and running. Each attempt resets the timer;
-  unchanged subscriptions skip reload, and failed fetches keep the old pool.
+  unchanged subscriptions (a reorder included) skip reload, and failed fetches keep
+  the old pool. `rowt audit` shows each watchdog refresh and any reload it caused.
 - `server dump` and `sub dump` output contains secrets.
 
 ## Lanes

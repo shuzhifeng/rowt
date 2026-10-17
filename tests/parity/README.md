@@ -263,7 +263,7 @@ reconcile and the watchdog's decision table. Each has a gate:
 | `merge-diff` | the review FILE, plus the streams, vs the Python | 1,500 generated cases |
 | `foreign-diff` | stdout + stderr + exit status, over client config TREES | 1,200 generated cases |
 | `sr-diff` | stdout + stderr + exit status, over Shadowrocket installs | 1,200 generated cases |
-| `watch-diff` | decisions, read back from watch.log + trace | 399 cases |
+| `watch-diff` | decisions, read back from watch.log + trace | 401 cases |
 | `platform-diff` | the argv the platform layer produces | 10 cases |
 | `cli-diff` | stdout, status, the config tree + rc files + LaunchAgent plist (content + mode), argv trace, audit log | 388 cases |
 

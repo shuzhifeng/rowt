@@ -59,7 +59,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.5"
+ROWT_VERSION="3.6.6"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -2202,6 +2202,15 @@ _sub_update_busy() {
 
 _sub_update_fail() { _SUB_RESULT="error: $*"; err "$*"; exit 1; }
 
+# A pool as a value, for "did the refresh change anything": every server
+# canonicalised (object keys sorted) and the list sorted, so neither key order
+# nor SERVER ORDER counts. A feed that reorders its nodes routes nothing
+# differently, and treating that as a change restarted the router — from the
+# watchdog, every six hours. pool.rs `same_pool` is the same test.
+_pool_key() {
+  jq -c 'map(walk(if type == "object" then to_entries | sort_by(.key) | from_entries else . end) | tojson) | sort' "$1" 2>/dev/null || echo '[]'
+}
+
 # Keep the last complete pool if any subscription fails. The lock spans fetch
 # and reload, shared by monitor, CLI and watchdog; a crashed owner is reclaimed.
 _sub_update() (
@@ -2209,6 +2218,10 @@ _sub_update() (
   # Bash 3.2 unwinds function locals before EXIT inside command substitution.
   # These values must survive that unwind; the subshell keeps them private.
   _SUB_LOCK="$CFG/sub-update.lock"; _SUB_RESULT=""
+  # The watchdog's refresh leaves an audit line with its outcome (and a
+  # BEGIN/END pair around any reload it causes): it fetches and may restart the
+  # router on its own, and the audit log is the record of who changed what.
+  _SUB_WD=0; [ "${1:-}" = watchdog ] && _SUB_WD=1
   local acc url out why shown sub_err sel summary changed=0 retrying=0
   _sub_update_busy && { err "subscription update in progress"; exit 1; }
   mkdir "$_SUB_LOCK" 2>/dev/null || { err "subscription update in progress"; exit 1; }
@@ -2216,6 +2229,7 @@ _sub_update() (
           printf "%s\n" "$_SUB_RESULT" > "$CFG/sub-update.result.tmp"
           chmod 600 "$CFG/sub-update.result.tmp"
           mv "$CFG/sub-update.result.tmp" "$CFG/sub-update.result"
+          if [ "$_SUB_WD" = 1 ]; then _audit "watchdog: subscription refresh — $_SUB_RESULT"; fi
         fi
         rm -f "$_SUB_LOCK/pid" "$_SUB_LOCK/acc" "$_SUB_LOCK/acc.n" "$_SUB_LOCK/error" "$_SUB_LOCK/servers"
         rmdir "$_SUB_LOCK" 2>/dev/null || true' EXIT
@@ -2243,7 +2257,7 @@ _sub_update() (
     fi
   done < "$SUBS_FILE"
   "${PY_VLESS[@]}" --combine < "$acc" > "$_SUB_LOCK/servers" || _sub_update_fail "combine failed"
-  if [ "$(jq -cS . "$SERVERS" 2>/dev/null || echo '[]')" != "$(jq -cS . "$_SUB_LOCK/servers")" ]; then changed=1; fi
+  if [ "$(_pool_key "$SERVERS")" != "$(_pool_key "$_SUB_LOCK/servers")" ]; then changed=1; fi
   [ -f "$CFG/sub-update.pending" ] && retrying=1
   if [ "$changed" = 0 ] && [ "$retrying" = 0 ]; then
     _SUB_RESULT="subscriptions unchanged"; echo "$_SUB_RESULT"; exit 0
@@ -2272,7 +2286,13 @@ _sub_update() (
   if [ "$retrying" = 1 ] && ! host_running; then
     _sub_update_fail "subscriptions saved; pending update awaits a running router"
   fi
-  reload_if_running || _sub_update_fail "subscriptions saved but apply failed"
+  if [ "$_SUB_WD" = 1 ] && host_running; then
+    _audit "BEGIN watchdog reload — $summary"
+    if reload_if_running; then _audit "END   watchdog reload — ok"
+    else _audit "END   watchdog reload — FAILED"; _sub_update_fail "subscriptions saved but apply failed"; fi
+  else
+    reload_if_running || _sub_update_fail "subscriptions saved but apply failed"
+  fi
   rm -f "$CFG/sub-update.pending"
   _SUB_RESULT="$summary"; echo "$_SUB_RESULT"
 )

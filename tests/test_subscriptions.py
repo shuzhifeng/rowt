@@ -77,6 +77,48 @@ class SubscriptionTests(unittest.TestCase):
                     self.assertFalse((box.cfg / "sub-update.pending").exists())
                     self.assertEqual(box.pool()[0]["server_port"], 9443)
 
+    def test_a_reordered_feed_neither_rewrites_the_pool_nor_restarts_the_router(self):
+        # The same servers in a different order route nothing differently. From
+        # the watchdog, treating that as a change restarted the router every six
+        # hours for any feed that shuffles its nodes.
+        second = LINK.replace("node.example", "second.example").replace("#node", "#second")
+        for implementation in ("bash", "rust"):
+            with self.subTest(implementation=implementation):
+                with Sandbox(implementation) as box:
+                    box.body = LINK + second
+                    box.http_feed()
+                    box.start_router()
+                    box.run("sub", "update")          # a real change from the sandbox's pool
+                    before, starts = (box.cfg / "servers.json").read_bytes(), box.starts()
+                    box.body = second + LINK
+                    self.assertIn("subscriptions unchanged", box.run("sub", "update"))
+                    self.assertEqual((box.cfg / "servers.json").read_bytes(), before)
+                    self.assertEqual(box.starts(), starts, "a reorder must not restart the router")
+
+    def test_the_watchdog_refresh_and_its_reload_are_in_the_audit_log(self):
+        for implementation in ("bash", "rust"):
+            with self.subTest(implementation=implementation):
+                with Sandbox(implementation) as box:
+                    box.http_feed()
+                    box.start_router()
+                    (box.cfg / "sub-update.at").unlink(missing_ok=True)
+                    box.run("watch", "tick")
+                    audit = (box.cfg / "log/audit.log").read_text()
+                    self.assertIn("watchdog: subscription refresh — subscriptions unchanged", audit)
+                    self.assertNotIn("BEGIN watchdog reload", audit)
+
+                    box.body = box.body.replace(":443", ":8443")
+                    (box.cfg / "sub-update.at").unlink()
+                    box.run("watch", "tick")
+                    lines = [l.split("  ", 2)[-1] for l in (box.cfg / "log/audit.log").read_text().splitlines()]
+                    tail = [l for l in lines if "watchdog" in l][-3:]
+                    self.assertEqual(tail, [
+                        "BEGIN watchdog reload — subscriptions updated: +0 added, -0 removed, 1 changed",
+                        "END   watchdog reload — ok",
+                        "watchdog: subscription refresh — subscriptions updated: +0 added, -0 removed, 1 changed",
+                    ])
+                    self.assertEqual(box.starts(), 1)
+
     def test_manual_and_watchdog_refreshes_share_one_lock_across_processes(self):
         for implementation, first in (("bash", ("watch", "tick")), ("rust", ("sub", "update"))):
             with self.subTest(implementation=implementation, first=first):

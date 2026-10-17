@@ -1,0 +1,3 @@
+As sub-watch-due, but with a sub-update.at written moments ago (its mtime is the
+copy time): the six-hour schedule is not due, so the tick fetches nothing and
+writes no audit line.

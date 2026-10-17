@@ -612,7 +612,10 @@ The selector lives wherever the tunnel runs (host in mode `host`, the VM in mode
 `vm`), so selection works identically for both. `sub add` remembers the URLs;
 `sub update` re-fetches them (`R` in Monitor). In `auto`/`best`, the watchdog
 also refreshes every six hours while online and running; unchanged subscriptions
-do not restart the router, and failed fetches keep the previous servers.
+do not restart the router — and a feed that only reorders its servers counts as
+unchanged — and failed fetches keep the previous servers. Each watchdog refresh
+is in `rowt audit` with its outcome, and a restart it causes as a
+`BEGIN`/`END watchdog reload` pair.
 
 ## Do apps need proxy config?
 

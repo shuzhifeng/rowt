@@ -665,17 +665,46 @@ fn refresh_subs(ctx: &Ctx, watchdog: bool) -> Result<String, String> {
     std::fs::write(&stamp, "").map_err(|e| format!("write update time: {e}"))?;
     set_mode(&stamp, 0o600);
     info(&format!("re-fetching {} subscription(s)…", sub_count(&ctx.cfg)));
-    let result = refresh_pool(ctx);
+    let result = refresh_pool(ctx, watchdog);
     let message = match &result { Ok(m) => m.clone(), Err(e) => format!("error: {e}") };
     let tmp = ctx.cfg.join("sub-update.result.tmp");
     if std::fs::write(&tmp, format!("{message}\n")).is_ok() {
         set_mode(&tmp, 0o600);
         let _ = std::fs::rename(tmp, ctx.cfg.join("sub-update.result"));
     }
+    // `_sub_update`'s exit trap, for the watchdog: its outcome, after the reload.
+    if watchdog {
+        crate::shell::audit(&ctx.cfg, &format!("watchdog: subscription refresh — {message}"));
+    }
     result
 }
 
-fn refresh_pool(ctx: &Ctx) -> Result<String, String> {
+/// A server as a canonical string: object keys sorted at every level, so two
+/// servers that differ only in key order compare equal.
+fn canon(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let body: Vec<String> = keys.iter()
+                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), canon(&m[*k])))
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        Value::Array(a) => format!("[{}]", a.iter().map(canon).collect::<Vec<_>>().join(",")),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// `_pool_key` — the same servers, whatever their ORDER. A feed that reorders
+/// its nodes routes nothing differently, and treating that as a change
+/// restarted the router — from the watchdog, every six hours.
+fn same_pool(old: &[Value], new: &[Value]) -> bool {
+    let key = |p: &[Value]| { let mut v: Vec<String> = p.iter().map(canon).collect(); v.sort(); v };
+    key(old) == key(new)
+}
+
+fn refresh_pool(ctx: &Ctx, watchdog: bool) -> Result<String, String> {
     let mut fetched = Vec::new();
     for url in read(&subs_file(&ctx.cfg)).lines().filter(|u| !u.is_empty() && !u.starts_with('#')) {
         fetched.push(fetch_sub(url).map_err(|status| format!("subscription fetch failed: {}{}; previous servers kept",
@@ -684,7 +713,7 @@ fn refresh_pool(ctx: &Ctx) -> Result<String, String> {
     let batch = combine(&accumulate(manual_array(&ctx.cfg), fetched)).map_err(|_| "combine failed".to_string())?;
     let path = servers_file(&ctx.cfg);
     let old: Vec<Value> = serde_json::from_str(&read(&path)).unwrap_or_default();
-    let changed = old != batch.outbounds;
+    let changed = !same_pool(&old, &batch.outbounds);
     let pending = ctx.cfg.join("sub-update.pending");
     let retrying = pending.exists();
     if !changed && !retrying { return Ok("subscriptions unchanged".into()); }
@@ -706,7 +735,20 @@ fn refresh_pool(ctx: &Ctx) -> Result<String, String> {
     if retrying && lifecycle::host_running(ctx).is_none() {
         return Err("subscriptions saved; pending update awaits a running router".into());
     }
-    lifecycle::reload_if_running(ctx).map_err(|e| format!("subscriptions saved but apply failed: {e}"))?;
+    // The watchdog's reload is bracketed in the audit log, as its other
+    // reloads are; a manual one is already inside the command's own bracket.
+    if watchdog && lifecycle::host_running(ctx).is_some() {
+        crate::shell::audit(&ctx.cfg, &format!("BEGIN watchdog reload — {message}"));
+        match lifecycle::reload_if_running(ctx) {
+            Ok(_) => crate::shell::audit(&ctx.cfg, "END   watchdog reload — ok"),
+            Err(e) => {
+                crate::shell::audit(&ctx.cfg, "END   watchdog reload — FAILED");
+                return Err(format!("subscriptions saved but apply failed: {e}"));
+            }
+        }
+    } else {
+        lifecycle::reload_if_running(ctx).map_err(|e| format!("subscriptions saved but apply failed: {e}"))?;
+    }
     std::fs::remove_file(pending).map_err(|e| format!("clear pending update: {e}"))?;
     Ok(message)
 }

@@ -46,6 +46,7 @@
 #   43.  pass a stale corp verdict off as current    -> cli-diff must fire
 #   44.  stop resolving unmatched names              -> render-matrix must fire
 #   45.  file the router's lookup failure as escape  -> splitter-diff must fire
+#   46.  stop auditing the watchdog's sub refresh    -> cli-diff must fire
 #
 # Everything happens in a throwaway copy of the repo; the real tree is never
 # touched. Run it after changing the harness itself.
@@ -1269,6 +1270,27 @@ else
     bad "splitter-diff passed with the two splitters filing a router lookup differently"
   else
     ok "splitter-diff caught a router lookup filed under the wrong lane"
+  fi
+  cp "$ROOT/bin/rowt" "$tmp/bin/rowt"
+fi
+
+echo "46. the watchdog's subscription refresh must be audited, and compared"
+cp "$ROOT/bin/rowt" "$tmp/bin/rowt"
+if [ ! -x "$ROOT/target/release/rowt-rs" ]; then
+  echo "  skip — no release build"
+else
+  # The watchdog fetches subscriptions on its own every six hours and may
+  # restart the router, so its outcome goes in the audit log. A tick skips the
+  # trace, so the audit log is what shows it: drop the line on one side.
+  perl -0pi -e 's|then _audit "watchdog: subscription refresh — \$_SUB_RESULT"; fi|then :; fi|' "$tmp/bin/rowt"
+  if grep -qF '_audit "watchdog: subscription refresh' "$tmp/bin/rowt"; then
+    bad "could not drop the refresh audit line (_sub_update moved?)"
+  elif PARITY_RUST_CLI="$ROOT/target/release/rowt-rs" \
+       PARITY_CASES="$(only 'PARITY_NOTRACE=1 PARITY_SCENARIO=sub-watch-due watch tick')" \
+       "$P" cli-diff >/dev/null 2>&1; then
+    bad "cli-diff passed with one side not auditing the watchdog's subscription refresh"
+  else
+    ok "cli-diff caught an unaudited watchdog subscription refresh"
   fi
   cp "$ROOT/bin/rowt" "$tmp/bin/rowt"
 fi

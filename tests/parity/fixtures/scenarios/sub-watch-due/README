@@ -1,0 +1,10 @@
+The watchdog's subscription refresh, due: selected=auto, a running router, saved
+subscriptions and no sub-update.at, so this tick refreshes. The feeds are the
+closed port 127.0.0.1:9 (as in pool-seeded), so the fetch fails — which keeps
+the pool and never reloads, the one outcome this sandbox can reach (a reload
+with the router "up" would stop the harness). What it must show, on both sides:
+the audit line `watchdog: subscription refresh — error: subscription fetch
+failed: http://127.0.0.1:9/…; previous servers kept` (scheme and host only — no
+token), sub-update.at written, and the pool untouched. Successful refreshes and
+the reload's BEGIN/END audit lines are covered by tests/test_subscriptions.py,
+whose fake router can be restarted.

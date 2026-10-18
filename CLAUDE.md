@@ -3,11 +3,12 @@
 Guidance for Claude Code (claude.ai/code) working in this repository.
 
 This file covers **developing and releasing rowt itself**. For how the tool
-*behaves* — lanes, config layout, and the operational rules (e.g. never run
-`up`/`reload`/`restart` as a killable background task: sing-box stays in the
-task's process group, so killing that group kills the router — and redirect
-their output to a file rather than piping it: through rowt 3.5.8 the log
-splitter held a pipe open and the command never returned) — use the **`rowt`
+*behaves* — lanes, config layout, and the operational rules (e.g. run
+`up`/`reload`/`restart` in the foreground and redirect their output to a file
+rather than piping it: through rowt 3.5.8 the log splitter held a pipe open and
+the command never returned; through 3.6.6 sing-box also stayed in the caller's
+process group, so killing that group — a timed-out task, or launchd cleaning up
+the daemon an SSH command ran under — killed the router) — use the **`rowt`
 skill** in `skills/rowt/`. Don't duplicate that here.
 
 ## Repo layout

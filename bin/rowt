@@ -59,7 +59,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.6"
+ROWT_VERSION="3.6.7"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -3147,16 +3147,36 @@ PY
 # Start sing-box in the background, recording ITS pid (not the splitter's).
 #   $1=1 -> divert block noise via the splitter (if there is one to run)
 #   $1=0 -> plain append to host.log (fallback: no splitter, or a retry)
+# Start a daemon in a SESSION OF ITS OWN and record its pid. A background job
+# of a non-interactive shell stays in the CALLER's process group, and being
+# reparented to launchd changes nothing about that — so every signal aimed at
+# the caller's group reached the router: a closed terminal's SIGHUP (ignored
+# since 3.5.9), a harness killing a timed-out task's group, and, on 2026-10-18,
+# launchd's cleanup of a system daemon. A lane edit run over Tailscale SSH had
+# started sing-box, the splitter and the collector inside tailscaled's process
+# group (tailscaled runs an SSH command as its own child, in its own group), and
+# when a Tailscale update SIGTERMed tailscaled, launchd's cleanup killed the
+# three with it: no log line, nothing to restart them for the 95 s to the next
+# watchdog tick. setsid() puts the daemon where no caller's group signal can
+# land. perl does it because macOS ships no setsid binary (the watchdog's
+# self-heal forks the same way). The child writes its pid BEFORE exec, and exec
+# keeps the pid, so the pid file names the daemon itself, not a wrapper.
+# stdin is /dev/null; a daemon that inherited the caller's stdin held that pipe.
+_detach() { # $1 = pid file; the rest = the command (bash -c '…' for redirections)
+  local pidf="$1"; shift
+  rm -f "$pidf"
+  perl -e 'use POSIX (); my $p = fork(); exit 0 if $p; POSIX::setsid(); exec @ARGV or exit 127' \
+    "${BASH:-bash}" -c 'pidf="$1"; shift; trap "" HUP; echo "$$" > "$pidf"; exec "$@"' _ "$pidf" "$@" </dev/null
+  local i=0; while [ ! -s "$pidf" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+}
+
 _start_host_router() {
   mkdir -p "$LOGDIR"; rotate_log "$HOST_LOG"
   local _l; for _l in $LANE_NAMES; do rotate_log "$(lane_log "$_l")"; done
-  # Both daemons run with SIGHUP ignored, like the collector: a background job
-  # of a non-interactive shell stays in the CALLER's process group, and being
-  # reparented to launchd changes nothing about that. So when the caller is a
-  # long-running foreground process — rowt-monitor, whose lane reloads and auto
-  # toggles restart the router — closing its terminal hung up sing-box and the
-  # splitter with it. The subshell scopes the ignore to them (rowt keeps its own
-  # handling), and `exec` makes it sing-box, so $! is still sing-box's pid.
+  # Both daemons run detached (see _detach) with SIGHUP ignored, like the
+  # collector: when the caller is a long-running foreground process —
+  # rowt-monitor, whose lane reloads and auto toggles restart the router —
+  # closing its terminal once hung up sing-box and the splitter with it.
   if [ "${1:-1}" = 1 ] && _py_ok; then
     # Append (>>) happens inside the splitter. The splitter's OWN stdout/stderr
     # go to /dev/null: a process substitution inherits this shell's fds, so
@@ -3165,11 +3185,12 @@ _start_host_router() {
     # caller waited for an EOF that only arrived at the next router restart. It
     # writes only to its log files; rowt-rs's start_router gives it
     # Stdio::null() the same way.
-    ( trap '' HUP; exec "$SB" run -c "$HOST_CFG" > >(exec "${PY_SPLITTER[@]}" "$HOST_LOG" "$LOGDIR" >/dev/null 2>&1) 2>&1 ) &
+    _detach "$(host_pidfile)" "${BASH:-bash}" -c 'sb="$1"; cfg="$2"; log="$3"; dir="$4"; shift 4
+      exec "$sb" run -c "$cfg" > >(exec "$@" "$log" "$dir" >/dev/null 2>&1) 2>&1' \
+      _ "$SB" "$HOST_CFG" "$HOST_LOG" "$LOGDIR" "${PY_SPLITTER[@]}"
   else
-    ( trap '' HUP; exec "$SB" run -c "$HOST_CFG" >>"$HOST_LOG" 2>&1 ) &
+    _detach "$(host_pidfile)" "${BASH:-bash}" -c 'exec "$1" run -c "$2" >>"$3" 2>&1' _ "$SB" "$HOST_CFG" "$HOST_LOG"
   fi
-  echo $! > "$(host_pidfile)"
 }
 
 # Confirm the router STAYS up for a few seconds — sing-box can bind, pass a quick
@@ -3234,9 +3255,10 @@ _start_collector() {
   ep="$(controller 2>/dev/null || true)"; [ -n "$ep" ] || return 0
   sec="$(clash_secret)"
   mkdir -p "$LOGDIR"
+  # Detached like the router (see _detach): it died with sing-box on 2026-10-18
+  # for sharing the same inherited process group.
   ROWT_COLLECT_EP="$ep" ROWT_COLLECT_SECRET="$sec" ROWT_CFG="$CFG" \
-    nohup "$bin" >>"$LOGDIR/collector.log" 2>&1 &
-  echo $! > "$(collector_pidfile)"
+    _detach "$(collector_pidfile)" "${BASH:-bash}" -c 'exec "$1" >>"$2" 2>&1' _ "$bin" "$LOGDIR/collector.log"
 }
 _stop_collector() {
   local p; p="$(cat "$(collector_pidfile)" 2>/dev/null || true)"

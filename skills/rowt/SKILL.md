@@ -230,10 +230,11 @@ replaced**, run `rowt fetch host` (with a working path to GitHub) or `rowt reloa
   restart), in the FOREGROUND, with output redirected to a file:**
   `rowt reload >| /tmp/rowt-out 2>&1; echo "exit=$?"; tail -15 /tmp/rowt-out`.
   The shell here may be zsh with `noclobber`, hence `>|`. **Never background them.**
-  sing-box and its log splitter stay in the launcher's process group, so a harness
-  that kills a timed-out task's group kills the router. **Never pipe them.** On rowt
-  ≤ 3.5.8 the pipe never closed and the caller hung, although the change had already
-  applied. They finish in well under 30 s.
+  On rowt ≤ 3.6.6 sing-box and its log splitter stay in the launcher's process group,
+  so a harness that kills a timed-out task's group kills the router (since 3.6.7 they
+  start in their own session). **Never pipe them.** On rowt ≤ 3.5.8 the pipe never
+  closed and the caller hung, although the change had already applied. They finish
+  in well under 30 s.
 - **There is no hot reload.** Lane `add`/`rm` restart the router themselves. After
   editing a lane file by hand, run `rowt reload`.
 - **Never type or ask for a password**, and never kill the user's other apps. Admin

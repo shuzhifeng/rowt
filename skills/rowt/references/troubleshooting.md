@@ -32,13 +32,19 @@ When the router is down, run `rowt up` in the foreground; it's idempotent.
 
 **"It hung", but the change applied.** You piped `up`, `reload` or a lane edit on rowt
 ≤ 3.5.8. The log splitter held the pipe's write end, so the reader never saw EOF. The
-router is fine. Don't kill the task, because that kills the router's process group. Run
-one clean foreground `rowt reload` with output redirected to a file; the old router
-pair exits and the stuck reader completes. Fixed in 3.5.9.
+router is fine. Don't kill the task: on rowt ≤ 3.6.6 that kills the router's process
+group too. Run one clean foreground `rowt reload` with output redirected to a file; the
+old router pair exits and the stuck reader completes. Fixed in 3.5.9.
 
-**Router died with your task or terminal.** You backgrounded it, and the harness killed
-the process group. Since 3.5.9, sing-box ignores SIGHUP, but SIGTERM or SIGKILL to the
-group still kills it. Always run it in the foreground.
+**Router died with your task, your terminal, or a daemon restart — on rowt ≤ 3.6.6.**
+sing-box, its splitter and the collector stayed in the process group of whatever ran
+`up`/`reload`/a lane edit, so anything that killed that group killed them: a harness
+ending a timed-out task, or launchd cleaning up a daemon that an SSH command ran under
+(a lane edit over Tailscale SSH starts them inside tailscaled's group; a Tailscale
+update then took the router down with no log line). Since 3.5.9 sing-box ignores
+SIGHUP; since 3.6.7 the three start in a session of their own, so no group signal
+reaches them. On an older rowt, run those commands in the foreground and never over
+a daemon's SSH; the watchdog restarts a dead router within its 120 s tick either way.
 
 **Fan loud, battery draining, everything green.** This is the spin: sing-box at 100–200%
 CPU with little traffic.

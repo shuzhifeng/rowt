@@ -493,6 +493,27 @@ fn ignore_hangup(cmd: &mut Command) {
     }
 }
 
+/// `setsid` for the daemons: each starts in a session — and so a process
+/// group — of its own, where no signal aimed at the caller's group can land.
+/// Ignoring SIGHUP was not enough. On 2026-10-18 a lane edit run over Tailscale
+/// SSH had started sing-box, the splitter and the collector inside tailscaled's
+/// process group (tailscaled runs an SSH command as its own child, in its own
+/// group); when a Tailscale update SIGTERMed tailscaled, launchd's cleanup of
+/// that group killed the three with it — no log line, and nothing to bring
+/// them back for the 95 s to the next watchdog tick. The shell does the same
+/// through perl (`_detach` in bin/rowt). Reparenting to launchd never changes a
+/// process group; only setsid does.
+fn own_session(cmd: &mut Command) {
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // Fails only for a process-group leader, which a fresh child never is.
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
 /// Returns the live `Child`, not just its pid, and the caller must keep it.
 ///
 /// A spawned process this process never reaps becomes a ZOMBIE when it exits —
@@ -516,6 +537,7 @@ pub fn start_router(ctx: &Ctx, split: bool) -> Result<std::process::Child, Strin
     // script: a daemon that inherited the caller's stdin would hold that pipe.
     cmd.arg("-c").arg(&merged).stdin(Stdio::null());
     ignore_hangup(&mut cmd);
+    own_session(&mut cmd);
     let child = if split {
         // The splitter is its own process, so both outlive this CLI — the shell
         // gets the same shape from process substitution.
@@ -528,6 +550,7 @@ pub fn start_router(ctx: &Ctx, split: bool) -> Result<std::process::Child, Strin
             .stdin(Stdio::from(out))
             .stdout(Stdio::null()).stderr(Stdio::null());
         ignore_hangup(&mut splitter);
+        own_session(&mut splitter);
         splitter.spawn().map_err(|e| format!("spawn splitter: {e}"))?;
         child
     } else {
@@ -631,6 +654,7 @@ pub fn start_collector(ctx: &Ctx) {
     // `nohup` — the collector outlives the shell that started it, so a hangup
     // on the terminal `rowt up` was typed into must not reach it.
     ignore_hangup(&mut cmd);
+    own_session(&mut cmd);
     if let Ok(c) = cmd.spawn() {
         let _ = fs::write(ctx.cfg.join("collector.pid"), format!("{}\n", c.id()));
     }
@@ -1321,5 +1345,24 @@ mod tests {
         // an empty secret is an unauthenticated clash API — which is why this
         // is written down rather than assumed away.
         assert_eq!(mint(&[0xfb, 0xff, 0xbf].repeat(8)), "");
+    }
+
+    /// The daemons' spawn hook puts the child in a session of its own: its
+    /// process group is its own pid, not ours. (`ps` prints the child's pgid;
+    /// a child that merely ignored SIGHUP would print ours.)
+    #[test]
+    fn a_detached_daemon_is_its_own_process_group() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo $$; ps -o pgid= -p $$").stdin(Stdio::null());
+        ignore_hangup(&mut cmd);
+        own_session(&mut cmd);
+        let out = cmd.output().expect("spawn sh");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines().map(|l| l.trim().to_string());
+        let (pid, pgid) = (lines.next().unwrap_or_default(), lines.next().unwrap_or_default());
+        assert!(!pid.is_empty(), "no pid line in {text:?}");
+        assert_eq!(pgid, pid, "child's pgid is its own pid (a new session), got {text:?}");
+        let ours = unsafe { libc::getpgrp() }.to_string();
+        assert_ne!(pgid, ours, "child must not share this process's group");
     }
 }

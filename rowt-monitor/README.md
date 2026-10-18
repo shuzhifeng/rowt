@@ -153,9 +153,14 @@ lane / window-tab to activate, a server chip to select it in place, or `sys prox
   way out), `stalled · 14m` (orange) means launchd holds the job but no tick
   has finished in twice its interval, `off` means installed but not loaded,
   `—` not installed. Plain `on` with no age means an older rowt that writes no
-  heartbeat. And a monitor left open across a `brew upgrade` announces it on
-  the top rule — `┤ monitor 3.5.2 ≠ installed 3.5.5 · restart ├` — rather than
-  presenting a days-old binary as current.
+  heartbeat. And a monitor left open across a `brew upgrade` refreshes
+  itself: within a minute of its install changing under it, it re-executes
+  into the installed `rowt-monitor` — same pid, same terminal, so a tmux pane
+  or a wrapper loop sees only a repaint, and a footer note names the build it
+  was. Only when there is nothing to become (no `rowt-monitor` on PATH) or the
+  exec failed does it keep announcing on the top rule —
+  `┤ monitor 3.5.2 ≠ installed 3.5.5 · restart ├` — rather than presenting a
+  days-old binary as current.
 - **`live connections`** and **`errors & blocked`** panes — side by side,
   split by a center rule (tab labels shorten on narrow terminals).
 - Full-width **`server health`**, merged onto the closing `┴` rule. The row

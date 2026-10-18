@@ -10,6 +10,9 @@
 //!   rowt-monitor --version / --help
 
 use std::io::{stdout, Write};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -118,6 +121,12 @@ fn main() -> Result<()> {
     };
     let mut app = App::new(source);
     app.server_mode = server_mode;
+    // Set by `reexec` in the process we just replaced: say so once, then drop
+    // it so a later refresh (the next upgrade) is not blamed on this one.
+    if let Ok(from) = std::env::var("ROWT_MONITOR_REFRESHED_FROM") {
+        std::env::remove_var("ROWT_MONITOR_REFRESHED_FROM");
+        app.notify(format!("refreshed into the installed rowt-monitor (was {from})"));
+    }
     run(app, theme_arg)
 }
 
@@ -194,6 +203,43 @@ fn restore() -> Result<()> {
     Ok(())
 }
 
+/// The terminal setup `run` does, again — for the one path that gave the
+/// terminal back and then had to keep running (a failed `reexec`).
+fn reenter() -> Result<()> {
+    enable_raw_mode()?;
+    let mut o = stdout();
+    execute!(o, EnterAlternateScreen, EnableMouseCapture)?;
+    write!(o, "\x1b[?1003h")?;
+    o.flush()?;
+    Ok(())
+}
+
+/// Become the installed rowt-monitor, in place. A monitor left open across a
+/// `brew upgrade` has outlived its install (`stale_reexec_target`): rather than
+/// present a days-old binary as current, leave the screen as `quit` would and
+/// exec the installed binary with this process's argv and env — exec keeps the
+/// pid, the tty and the shell job, so a tmux pane or a wrapper loop sees nothing
+/// but a repaint, and the new process announces the refresh in its footer. exec
+/// returns only on failure; then the terminal is taken back, the error is
+/// reported, and the top-rule label stays as the fallback it always was.
+fn reexec<B: Backend>(term: &mut Terminal<B>, target: &Path) -> Result<()>
+where
+    <B as Backend>::Error: Send + Sync + 'static,
+{
+    let from = std::env::current_exe()
+        .ok()
+        .and_then(|p| rowt_monitor::source::live::cellar_version(&p))
+        .unwrap_or_else(|| "an older build".into());
+    restore()?;
+    let err = Command::new(target)
+        .args(std::env::args_os().skip(1))
+        .env("ROWT_MONITOR_REFRESHED_FROM", &from)
+        .exec();
+    reenter()?;
+    term.clear()?;
+    Err(anyhow::anyhow!("{}: {err}", target.display()))
+}
+
 // ratatui 0.30 made `Backend::Error` an associated type, so `term.draw(…)?`
 // only converts into `anyhow::Error` when that type is Send + Sync. Naming the
 // bound is the whole of the upgrade for us; `CrosstermBackend`'s error is
@@ -204,6 +250,9 @@ where
 {
     let mut last_data = Instant::now();
     let mut hit = ui::Hit::default();
+    // One refresh attempt per process: a failed exec is reported once, not
+    // retried every minute over the same missing binary.
+    let mut reexec_tried = false;
     loop {
         term.draw(|f| {
             let area = f.area();
@@ -269,6 +318,22 @@ where
         if last_data.elapsed() >= DATA_TICK {
             app.tick();
             last_data = Instant::now();
+            // The install changed under us (checked once a minute by the live
+            // source): become the installed binary. The target is None when
+            // there is nothing to become — no rowt-monitor on PATH, or this
+            // already is it, which is also what stops an exec from looping.
+            // Never while a control action is in flight: `rowt router restart`
+            // runs on a ctl thread with pipes back to this process, and exec
+            // would close them under it, mid-restart. Skipping leaves
+            // `reexec_tried` false, so the next data tick looks again.
+            if app.snap.monitor_stale.is_some() && !reexec_tried && !app.source.restart_in_flight() {
+                reexec_tried = true;
+                if let Some(target) = rowt_monitor::source::live::stale_reexec_target() {
+                    if let Err(e) = reexec(term, &target) {
+                        app.notify(format!("refresh failed: {e} \u{2014} restart by hand"));
+                    }
+                }
+            }
         }
     }
 }

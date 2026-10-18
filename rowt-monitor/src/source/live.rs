@@ -1432,22 +1432,60 @@ fn read_watch_status(cfg: &std::path::Path) -> (String, Option<u64>) {
 /// install was removed under it (a `brew upgrade` beneath a TUI left open for
 /// days) fails to canonicalize at all — that failure IS the signal, not an
 /// error. No rowt-monitor on PATH means nothing to compare against.
-fn detect_stale_monitor() -> Option<String> {
+/// Returns (the path this process was started as, its canonical path while
+/// the file still exists, the canonical rowt-monitor on PATH if there is one).
+fn monitor_paths() -> Option<(PathBuf, Option<PathBuf>, Option<PathBuf>)> {
     let me = std::env::current_exe().ok()?;
-    let ver = |p: &std::path::Path| {
-        p.to_string_lossy().split("/Cellar/rowt/").nth(1).and_then(|s| s.split('/').next()).map(|s| s.to_string())
-    };
     let mine = std::fs::canonicalize(&me).ok();
     let on_path = std::env::var_os("PATH")
         .and_then(|p| std::env::split_paths(&p).map(|d| d.join("rowt-monitor")).find(|c| c.is_file()))
         .and_then(|c| std::fs::canonicalize(c).ok());
+    Some((me, mine, on_path))
+}
+
+/// The version in a Cellar path (`…/Cellar/rowt/3.6.1/libexec/bin/…` → `3.6.1`).
+pub fn cellar_version(p: &Path) -> Option<String> {
+    p.to_string_lossy().split("/Cellar/rowt/").nth(1).and_then(|s| s.split('/').next()).map(|s| s.to_string())
+}
+
+/// The top-rule label for a monitor that has outlived its install; None when
+/// this process is the installed one.
+fn detect_stale_monitor() -> Option<String> {
+    let (me, mine, on_path) = monitor_paths()?;
+    stale_label(&me, mine.as_deref(), on_path.as_deref())
+}
+
+fn stale_label(me: &Path, mine: Option<&Path>, on_path: Option<&Path>) -> Option<String> {
     match (mine, on_path) {
         (None, _) => Some(format!("monitor {} \u{00b7} its install is gone \u{00b7} restart",
-                                  ver(&me).unwrap_or_else(|| "binary".into()))),
-        (Some(m), Some(p)) if m != p => Some(match (ver(&m), ver(&p)) {
+                                  cellar_version(me).unwrap_or_else(|| "binary".into()))),
+        (Some(m), Some(p)) if m != p => Some(match (cellar_version(m), cellar_version(p)) {
             (Some(a), Some(b)) => format!("monitor {a} \u{2260} installed {b} \u{00b7} restart"),
             _ => "monitor is not the installed one \u{00b7} restart".into(),
         }),
+        _ => None,
+    }
+}
+
+/// The binary a stale monitor should become: the rowt-monitor on PATH, when it
+/// is a different file from this process's (or this process's file is gone).
+/// None when there is nothing to become — the same file, or no rowt-monitor on
+/// PATH — which is what keeps an exec from looping: once the new process IS the
+/// one on PATH, this answers None for it.
+pub fn stale_reexec_target() -> Option<PathBuf> {
+    let (_, mine, on_path) = monitor_paths()?;
+    reexec_target(mine.as_deref(), on_path.as_deref())
+}
+
+fn reexec_target(mine: Option<&Path>, on_path: Option<&Path>) -> Option<PathBuf> {
+    let p = on_path?;
+    match mine {
+        // Our file is gone: become whatever is installed.
+        None => Some(p.to_path_buf()),
+        // A different INSTALLED build beside ours. A build run from the repo's
+        // target/ against a brew install is being tested, not outlived: it keeps
+        // the label and is never replaced by the install under test.
+        Some(m) if m != p && cellar_version(m).is_some() && cellar_version(p).is_some() => Some(p.to_path_buf()),
         _ => None,
     }
 }
@@ -1850,5 +1888,47 @@ mod auto_selection_tests {
         let mut members: Vec<String> = tags.into_iter().filter(|t| is_pool_member(t)).collect();
         members.sort();
         assert_eq!(members, vec!["JP-1", "SG-1"], "the pool — and its count — is servers only");
+    }
+}
+
+#[cfg(test)]
+mod stale_monitor_tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf { PathBuf::from(s) }
+
+    #[test]
+    fn reexec_only_into_a_different_installed_binary() {
+        let old = p("/opt/homebrew/Cellar/rowt/3.6.1/libexec/bin/rowt-monitor");
+        let new = p("/opt/homebrew/Cellar/rowt/3.6.6/libexec/bin/rowt-monitor");
+        // the install was removed under us: become the one on PATH
+        assert_eq!(reexec_target(None, Some(&new)), Some(new.clone()));
+        // a newer install beside ours: become it
+        assert_eq!(reexec_target(Some(&old), Some(&new)), Some(new.clone()));
+        // we ARE the installed one (the state right after an exec): nothing to do
+        assert_eq!(reexec_target(Some(&new), Some(&new)), None);
+        // nothing on PATH to become, whatever happened to our file
+        assert_eq!(reexec_target(None, None), None);
+        assert_eq!(reexec_target(Some(&old), None), None);
+        // a repo build run against the live config, with a brew install on PATH:
+        // it is being tested, so it keeps the label and is never replaced
+        let dev = p("/Users/x/code/rowt/rowt-monitor/target/release/rowt-monitor");
+        assert_eq!(reexec_target(Some(&dev), Some(&new)), None);
+        assert_eq!(stale_label(&dev, Some(&dev), Some(&new)).as_deref(), Some("monitor is not the installed one \u{00b7} restart"));
+        // …unless its file is gone (a cargo clean under it): then the install is all there is
+        assert_eq!(reexec_target(None, Some(&new)), Some(new.clone()));
+    }
+
+    #[test]
+    fn label_matches_the_target_decision() {
+        let old = p("/opt/homebrew/Cellar/rowt/3.6.1/libexec/bin/rowt-monitor");
+        let new = p("/opt/homebrew/Cellar/rowt/3.6.6/libexec/bin/rowt-monitor");
+        assert_eq!(stale_label(&old, None, Some(&new)).as_deref(), Some("monitor 3.6.1 \u{00b7} its install is gone \u{00b7} restart"));
+        assert_eq!(stale_label(&old, Some(&old), Some(&new)).as_deref(), Some("monitor 3.6.1 \u{2260} installed 3.6.6 \u{00b7} restart"));
+        assert_eq!(stale_label(&new, Some(&new), Some(&new)), None);
+        // gone, and nothing on PATH: the label still says so (a dev build run from target/)
+        assert_eq!(stale_label(&p("/tmp/rowt-monitor"), None, None).as_deref(), Some("monitor binary \u{00b7} its install is gone \u{00b7} restart"));
+        assert_eq!(cellar_version(&new).as_deref(), Some("3.6.6"));
+        assert_eq!(cellar_version(&p("/tmp/x")), None);
     }
 }

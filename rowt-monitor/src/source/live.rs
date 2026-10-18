@@ -102,6 +102,8 @@ pub struct LiveSource {
     probe_interval: Duration,
     probe_tx: Option<SyncSender<()>>, // wake an idle prober without queueing requests
     prev_router_up: bool,         // detect router down->up (reload / net switch)
+    api_fail_streak: u32,         // consecutive ticks on which neither /connections nor /version answered
+    last_conns_json: Option<Value>, // the last /connections answer, shown again through a slow tick
     last_force: Option<Instant>,  // throttle self-heal re-probes
     last_active_traffic: Option<Instant>, // last tick the escape lane moved bytes (health override)
 
@@ -178,6 +180,8 @@ impl LiveSource {
             probe_interval,
             probe_tx: None,
             prev_router_up: true,
+            api_fail_streak: 0,
+            last_conns_json: None,
             last_force: None,
             last_active_traffic: None,
             // Seed synchronously so the first frame is correct (no "off" flash).
@@ -799,9 +803,31 @@ impl Source for LiveSource {
         self.pending_pool_probe |= pool_changed || pool_mtime != self.prev_pool_mtime;
         self.prev_pool_mtime = pool_mtime;
 
-        // Connections + throughput from clash (empty if unreachable).
-        let conns_json = self.clash_get("/connections");
-        let router_up = conns_json.is_some();
+        // Connections + throughput from clash. The verdict on the ROUTER is not
+        // this one call: /connections is the heavy endpoint, and its 400 ms
+        // budget is a tail-latency risk (a large table under load, a busy Mac).
+        // One slow answer used to flip the band to "down · wedged" for a tick
+        // while traffic flowed — and an operator restarted a healthy router.
+        // Read the router process stats every poll — NOT a one-shot base sampled
+        // at launch plus the monitor's own runtime. A reload/recovery spawns a
+        // NEW sing-box, so the counter must track the current process (resetting
+        // on a restart). None = no sing-box process running.
+        let sb = sing_box_stat();
+        let mut conns_json = self.clash_get("/connections");
+        let api_ok = conns_json.is_some();
+        // Only when the heavy call failed with a process alive: a tiny request
+        // that answers says the API is alive but slow.
+        let version_ok = !api_ok && sb.is_some() && self.clash_get("/version").is_some();
+        let (router_up, api_note) = router_verdict(api_ok, version_ok, sb.is_some(), &mut self.api_fail_streak);
+        if api_ok {
+            self.last_conns_json = conns_json.clone();
+        } else if router_up {
+            // Slow, not down: keep showing the last answer rather than an empty
+            // table for a tick (same totals, so the rates read as zero deltas).
+            conns_json = self.last_conns_json.clone();
+        } else {
+            self.last_conns_json = None;
+        }
         let raw = conns_json.as_ref().map(parse::parse_connections).unwrap_or_default();
         let rates = self.rates(&raw);
         self.accumulate_history(&raw, &escape);
@@ -880,19 +906,17 @@ impl Source for LiveSource {
 
         let iface = info.iface.unwrap_or_else(|| "—".to_string());
         let mode = format!("{} · {}", state.get("mode").map(String::as_str).unwrap_or("host"), iface);
-        // Read the router process stats every poll — NOT a one-shot base sampled
-        // at launch plus the monitor's own runtime. A reload/recovery spawns a
-        // NEW sing-box, so the counter must track the current process (resetting
-        // on a restart). None = no sing-box process running.
-        let sb = sing_box_stat();
         let uptime = sb.map(|(s, _)| fmt_uptime(s)).unwrap_or_else(|| "—".to_string());
         // Router line: "running" carries CPU% (a spinning/wedged sing-box shows
-        // ~100%+), and "down" carries WHY, so a glance says what to fix:
-        //   wedged  — process alive but the clash API is unreachable (hung)
+        // ~100%+) — or "api slow" while the heavy call is not answering but the
+        // process and the cheap probe are — and "down" carries WHY, so a glance
+        // says what to fix:
+        //   wedged  — process alive but the clash API stopped answering for good
+        //             (three ticks, see router_verdict)
         //   config  — host.json isn't valid, so it can't start
         //   stopped — no process at all (crashed / never started)
         let (router, router_cpu, router_reason) = if router_up {
-            ("running".to_string(), sb.map(|(_, c)| c), String::new())
+            ("running".to_string(), sb.map(|(_, c)| c), api_note.to_string())
         } else if sb.is_some() {
             ("down".to_string(), None, "wedged".to_string())
         } else if !info.config_ok {
@@ -1502,6 +1526,71 @@ fn read_collector_status(router_up: bool) -> String {
         _ if !router_up => "—".into(),
         Some(_) => "off".into(), // router up but the sidecar stopped writing
         None => "—".into(),      // never established
+    }
+}
+
+/// Consecutive ticks (2 s each) on which neither /connections nor /version
+/// answered, with a sing-box process alive, before the router reads as down.
+const API_DOWN_AFTER: u32 = 3;
+
+/// The router verdict from one tick's evidence: (up, note). `api_ok` —
+/// /connections answered; `version_ok` — the cheap /version probe answered
+/// (consulted only when /connections did not); `process_alive` — a sing-box
+/// process exists; `streak` — failed ticks so far, carried across ticks and
+/// updated here. Up and healthy is ("", up); up on the probe or within the
+/// grace is "api slow"; down is "wedged" for a live process that stopped
+/// answering, else "" for the caller to name (config / stopped). A process
+/// that is gone reads as down at once: there is nothing to wait for.
+fn router_verdict(api_ok: bool, version_ok: bool, process_alive: bool, streak: &mut u32) -> (bool, &'static str) {
+    if api_ok {
+        *streak = 0;
+        return (true, "");
+    }
+    if !process_alive {
+        *streak = 0;
+        return (false, "");
+    }
+    if version_ok {
+        *streak = 0;
+        return (true, "api slow");
+    }
+    *streak += 1;
+    if *streak < API_DOWN_AFTER { (true, "api slow") } else { (false, "wedged") }
+}
+
+#[cfg(test)]
+mod router_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn one_slow_connections_call_is_not_down() {
+        let mut streak = 0;
+        assert_eq!(router_verdict(true, false, true, &mut streak), (true, ""));
+        // the heavy call timed out, the cheap one answered: slow, still up
+        assert_eq!(router_verdict(false, true, true, &mut streak), (true, "api slow"));
+        assert_eq!(streak, 0, "an answering API resets the streak");
+        assert_eq!(router_verdict(true, false, true, &mut streak), (true, ""));
+    }
+
+    #[test]
+    fn a_live_process_that_stops_answering_is_down_after_three_ticks() {
+        let mut streak = 0;
+        assert_eq!(router_verdict(false, false, true, &mut streak), (true, "api slow"));
+        assert_eq!(router_verdict(false, false, true, &mut streak), (true, "api slow"));
+        assert_eq!(router_verdict(false, false, true, &mut streak), (false, "wedged"));
+        assert_eq!(router_verdict(false, false, true, &mut streak), (false, "wedged"));
+        // one answer and it is up again, streak gone
+        assert_eq!(router_verdict(true, false, true, &mut streak), (true, ""));
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn no_process_is_down_at_once_whatever_the_streak() {
+        let mut streak = 1;
+        assert_eq!(router_verdict(false, false, false, &mut streak), (false, ""));
+        assert_eq!(streak, 0);
+        // …and /version is never trusted over a missing process
+        assert_eq!(router_verdict(false, true, false, &mut streak), (false, ""));
     }
 }
 

@@ -335,7 +335,7 @@ pub struct Identity {
     pub server_ms: Option<u32>,  // active server RTT; None -> shown as "—"
     pub router: String,      // base word: "running" | "down"
     pub router_cpu: Option<f32>, // sing-box CPU% when running (for "running · N%")
-    pub router_reason: String,   // when down: "wedged" | "config" | "stopped" (else "")
+    pub router_reason: String,   // when down: "wedged" | "config" | "stopped"; when running: "api slow" or ""
     pub router_up: bool,     // proxy/router reachable — drives the LIVE/DOWN dot
     /// Active server probe result: Some(true) = reachable, Some(false) = failing
     /// (→ ERROR), None = not probed yet. Drives the LIVE/ERROR distinction.

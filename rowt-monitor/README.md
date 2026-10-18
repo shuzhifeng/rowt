@@ -147,7 +147,14 @@ lane / window-tab to activate, a server chip to select it in place, or `sys prox
 
 - One **outer frame** (the only rounded corners); everything inside connects to
   it with `├ ┤` rules — no inset boxes.
-- **Identity band** (neofetch-style logo + session facts) on top. Its `watch`
+- **Identity band** (neofetch-style logo + session facts) on top. Its `router`
+  cell is a verdict, not one API call: `running · N%` while `/connections`
+  answers; `running · api slow` (orange) when that heavy call misses its 400 ms
+  budget but the process and the tiny `/version` probe are there — the last
+  connection rows stay on screen; `down · wedged` only after three straight
+  ticks with neither answering, `down · stopped` the moment there is no process.
+  One slow tick under load used to read as down, and a healthy router got
+  restarted for it. Its `watch`
   cell reports the watchdog agent as *alive*, not merely loaded: `on · 1m` is
   the time since the last tick **completed** (rowt stamps `watch.tick` on its
   way out), `stalled · 14m` (orange) means launchd holds the job but no tick

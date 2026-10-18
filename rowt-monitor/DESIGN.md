@@ -218,7 +218,8 @@ identical to a dark one.
 - **The session-facts band is three tiers, and only three.** Every **label**
   (`mode`, `sys proxy`, `collector`, `server`, `router`, `watch`, `uptime`,
   `MONITOR`) is `dimmer`. Every value that carries a **working/failed/warning
-  state** — the `on`/`off` switches, CPU%, latency, `down · <reason>` — is
+  state** — the `on`/`off` switches, CPU%, latency, `running · api slow`,
+  `down · <reason>` — is
   semantic green/orange/red, or `dim` when there's no reading. **Everything else**
   (`LIVE`'s row-mates `host · en0`, `running`, the uptime) is plain `bright`;
   there is no fourth text weight. The one exception is the **active server's

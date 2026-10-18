@@ -315,7 +315,13 @@ fn draw_identity(buf: &mut Buffer, x0: u16, y0: u16, xr: u16, app: &App, present
     put(buf, rl, y0 + 3, "router", dimmer);
     if id.router_up {
         put(buf, rv, y0 + 3, &id.router, bright);
-        if let Some(cpu) = id.router_cpu {
+        if !id.router_reason.is_empty() {
+            // "running · api slow": the heavy API call is not answering but the
+            // process and the cheap probe are. Warning colour, not red: nothing
+            // to restart yet (live.rs router_verdict).
+            put(buf, rv + dw(&id.router) + 1, y0 + 3, "·", dimmer);
+            put(buf, rv + dw(&id.router) + 3, y0 + 3, &id.router_reason, theme::fg(theme::up()));
+        } else if let Some(cpu) = id.router_cpu {
             let cpu_c = if cpu >= 120.0 {
                 theme::persistent()
             } else if cpu >= 50.0 {

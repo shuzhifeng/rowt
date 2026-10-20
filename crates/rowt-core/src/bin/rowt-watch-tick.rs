@@ -83,6 +83,9 @@ fn run() -> Result<String, String> {
         mode: s(o, "mode"),
         health_ok: b(o, "health_ok"),
         health_slow: b(o, "health_slow"),
+        // Absent in a fixture means no flow was seen, which is what every
+        // case written before this field existed describes.
+        health_flows: o.get("health_flows").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
         now: o.get("now").and_then(|x| x.as_i64()).unwrap_or(0),
     };
     let empty = Value::Object(Default::default());

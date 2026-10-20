@@ -92,8 +92,24 @@ pub struct Observation {
     /// every RTT 7.6-8.8s). Only ever set when the quick probe failed, so a
     /// healthy tick pays nothing for it.
     pub health_slow: bool,
+    /// FLOWING is not WEDGED: how many escape-lane connections opened in the
+    /// last `FLOW_WINDOW_SECS` have received bytes through the tunnel. A wedged
+    /// tunnel makes no new connections; a slow one keeps relaying responses on
+    /// those it does open, however the probe host fares. Measured 2026-10-19 in
+    /// flight: the patient probe failed too, and four reloads dropped every
+    /// open connection on a router that was relaying the whole time. Download,
+    /// not upload: a client's bytes are counted while the dial is still
+    /// pending. Only ever read when the patient probe failed as well, so a
+    /// healthy tick pays nothing for it.
+    pub health_flows: u32,
     pub now: i64,
 }
+
+/// How far back "a connection opened recently" reaches for `health_flows`:
+/// long enough to span the three failed probes that bring a tick here, short
+/// enough that a flow on it says the tunnel was making connections while the
+/// probes were failing.
+pub const FLOW_WINDOW_SECS: u32 = 120;
 
 /// The bits of rowt's state the tick reads and writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -459,8 +475,22 @@ pub fn netcheck(obs: &Observation, st: &State, cfg: &Config) -> Outcome {
                         let t = cfg.health_timeout;
                         a.push(Action::Log(format!(
                             "escape tunnel answered a slower probe ({t}s → {}s) — slow, not wedged; not restarting. \
-                             Raise ROWT_HEALTH_TIMEOUT if this link stays this slow",
+                             Raise ROWT_HEALTH_TIMEOUT if this link stays this slow (ROWT_HEALTH_TIMEOUT=20 rowt watch install bakes it into the agent)",
                             t * 3
+                        )));
+                        s.health_fails = 0;
+                    } else if obs.health_flows > 0 {
+                        // Flowing is not wedged. Positive evidence, like the
+                        // slower probe answering, so the streak clears — and no
+                        // escape hatch, because a tunnel relaying responses on
+                        // connections it opened two minutes ago is working
+                        // whatever the probe host says. What this leaves to a
+                        // `rowt reload` by hand: some destinations flow while
+                        // the probe host never does.
+                        a.push(Action::Log(format!(
+                            "escape tunnel is slow, not wedged: {} connection(s) opened in the last {FLOW_WINDOW_SECS}s \
+                             received bytes through it; not restarting",
+                            obs.health_flows
                         )));
                         s.health_fails = 0;
                     } else if hold_for_network(obs, &s, n, cfg) {
@@ -554,6 +584,7 @@ mod tests {
             mode: "host".into(),
             health_ok: true,
             health_slow: false,
+            health_flows: 0,
             now: 1_000_000,
         }
     }
@@ -575,6 +606,26 @@ mod tests {
         assert!(logs(&r).iter().any(|l| l.contains("ROWT_HEALTH_TIMEOUT")), "name the knob");
         // The streak is cleared, so the next failure starts a fresh count
         // rather than recovering immediately.
+        assert_eq!(r.state.health_fails, 0);
+    }
+
+    /// 2026-10-19, in flight: the link was slow enough that the patient probe
+    /// failed too, and the watchdog reloaded a router that was relaying
+    /// responses the whole time. Connections opened minutes ago that are
+    /// receiving bytes are positive evidence the tunnel works.
+    #[test]
+    fn a_tunnel_still_relaying_on_fresh_connections_is_not_restarted() {
+        let cfg = Config::default();
+        let mut o = running();
+        o.health_ok = false;
+        o.health_slow = false; // the patient probe failed too…
+        o.health_flows = 3;    // …but connections opened minutes ago are receiving bytes
+        let st = State { health_fails: cfg.health_fails - 1, ..State::default() };
+        let r = netcheck(&o, &st, &cfg);
+        assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover { .. })),
+                "a relaying tunnel must not be restarted: {:?}", r.actions);
+        assert!(logs(&r).iter().any(|l| l.contains("slow, not wedged") && l.contains("3 connection(s)")), "{:?}", logs(&r));
+        // Positive evidence clears the streak, exactly like the slower probe.
         assert_eq!(r.state.health_fails, 0);
     }
 

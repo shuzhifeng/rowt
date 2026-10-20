@@ -59,7 +59,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.7"
+ROWT_VERSION="3.6.8"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -202,6 +202,7 @@ CPU_SPIN_BYTES="${ROWT_CPU_SPIN_BYTES:-65536}"  # bytes/s below this counts as "
 CPU_SPIN_TICKS="${ROWT_CPU_SPIN_TICKS:-2}"      # consecutive pathological ticks before acting
 CPU_HEAL_COOLDOWN="${ROWT_CPU_HEAL_COOLDOWN:-86400}"  # floor between spin heals (see _watch_spin)
 HEALTH_TIMEOUT="${ROWT_HEALTH_TIMEOUT:-8}"       # per-probe delay-test timeout, seconds (generous: a slow-but-live tunnel must not read as wedged)
+FLOW_WINDOW=120                                  # seconds: an escape connection opened this recently that has received bytes proves the tunnel is still making connections
 HEALTH_URL="${ROWT_HEALTH_URL:-https://www.gstatic.com/generate_204}"    # target the liveness delay-test fetches THROUGH the escape server
 
 mkdir -p "$CFG" "$BIN" "$LOGDIR"
@@ -5327,6 +5328,31 @@ _watch_probe() {
 # connection-refused" would disable self-healing for the common case.
 _watch_probe_confirm() { _watch_probe "$(( HEALTH_TIMEOUT * 3 ))"; }
 
+# FLOWING is not WEDGED. A wedged tunnel makes no new connections; one that is
+# merely slow keeps relaying responses on the connections it does open, however
+# the probe host fares. Measured 2026-10-19 in flight: the patient probe failed
+# too, and four reloads dropped every open connection on a router that was
+# relaying the whole time. So when even that probe fails, ask the router: how
+# many escape-lane connections opened in the last FLOW_WINDOW seconds have had
+# bytes come BACK through the tunnel? Download, not upload — sing-box counts a
+# client's bytes while the dial is still pending, so upload alone would let a
+# wedged tunnel read as flowing. `start` is RFC3339 in the system zone, as is
+# the stamp it is compared with, so a plain prefix compare works. 0 when the
+# API cannot be read. Mirrors the native tick's `fresh_escape_flows`.
+_watch_fresh_flows() {
+  have jq || { echo 0; return 0; }
+  local json since
+  json="$(clash_curl GET /connections 2>/dev/null || true)"
+  [ -n "$json" ] || { echo 0; return 0; }
+  since="$(date -v-"${FLOW_WINDOW}"S '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || true)"
+  [ -n "$since" ] || { echo 0; return 0; }
+  printf '%s' "$json" | jq -r --arg s "$since" '
+    def lane($c): if ($c|index("block")) then "block" elif ($c|index("direct")) then "direct" elif ($c|index("corp")) then "corp" else "escape" end;
+    [ (.connections // [])[]
+      | select(lane(.chains // []) == "escape" and ((.start // "")[:19] >= $s) and ((.download // 0) > 0)) ]
+    | length' 2>/dev/null || echo 0
+}
+
 # Cooldown-gated, SELF-VERIFYING recovery. $1 = reason (logged); the rest is the
 # recovery command (cmd_reload — it re-renders, starts if down / restarts if up,
 # and re-applies the proxy). Runs at most once per $HEALTH_COOLDOWN so a
@@ -5454,6 +5480,7 @@ _watch_shadow() {
       --argjson bypass "${_SH2_BOK:-false}" \
       --argjson health "$([ "${_SH2_HEALTH:-ok}" = ok ] && echo true || echo false)" \
       --argjson slow "${_SH2_SLOW:-false}" \
+      --argjson flows "${_SH2_FLOWS:-0}" \
       --argjson fails "${_SH_FAILS0:-0}" \
       --argjson lastrec "${_SH_LASTREC0:-0}" \
       --argjson lastnetchg "${_SH_LASTNETCHG0:-0}" \
@@ -5462,7 +5489,7 @@ _watch_shadow() {
       '{obs:{proxy_intent:"", captive:"clear", active_service:$svc, proxy_any_on:true,
              host_running:true, intent:"up", boot_matches:true, iface:$ifc,
              proxy_pointing_ok:$pointing, proxy_bypass_ok:$bypass,
-             bound_iface:$cur, net_id:$nid, health_ok:$health, health_slow:$slow, now:$now, gateway_ok:$gwok,
+             bound_iface:$cur, net_id:$nid, health_ok:$health, health_slow:$slow, health_flows:$flows, now:$now, gateway_ok:$gwok,
              mode:(if $mode == "" then "host" else $mode end)},
         state:{captive_flag:false, health_fails:$fails, last_net_id:$last,
                last_recovery:$lastrec, last_net_change:$lastnetchg}}' > "$obs2" 2>/dev/null
@@ -5783,13 +5810,29 @@ _watch_health() { # $1=iface  $2=captive verdict
   # tunnel that may simply be far away. See `_watch_probe_confirm`.
   if _watch_probe_confirm; then
     _SH2_SLOW=true
-    local sm="escape tunnel answered a slower probe (${HEALTH_TIMEOUT}s → $(( HEALTH_TIMEOUT * 3 ))s) — slow, not wedged; not restarting. Raise ROWT_HEALTH_TIMEOUT if this link stays this slow"
+    local sm="escape tunnel answered a slower probe (${HEALTH_TIMEOUT}s → $(( HEALTH_TIMEOUT * 3 ))s) — slow, not wedged; not restarting. Raise ROWT_HEALTH_TIMEOUT if this link stays this slow (ROWT_HEALTH_TIMEOUT=20 rowt watch install bakes it into the agent)"
     _watch_log "$sm"
     _wact "log $sm"
     rm -f "$WATCH_HEALTH"
     return 0
   fi
   _SH2_SLOW=false
+  # FLOWING is not WEDGED: see `_watch_fresh_flows`. Positive evidence, like the
+  # slower probe answering, so the streak clears — and no escape hatch, because
+  # a tunnel relaying responses on connections it opened two minutes ago is
+  # working whatever the probe host says. The one case this leaves to a
+  # `rowt reload` by hand: some destinations flow while the probe host never
+  # does. Mirrors `rowt_core::watch::netcheck`; same place in the order.
+  local flows; flows="$(_watch_fresh_flows)"
+  case "$flows" in ''|*[!0-9]*) flows=0 ;; esac
+  _SH2_FLOWS="$flows"
+  if [ "$flows" -gt 0 ]; then
+    local fm="escape tunnel is slow, not wedged: $flows connection(s) opened in the last ${FLOW_WINDOW}s received bytes through it; not restarting"
+    _watch_log "$fm"
+    _wact "log $fm"
+    rm -f "$WATCH_HEALTH"
+    return 0
+  fi
   if _watch_hold_for_network "$cap" "$fails" "$gwok" "$now"; then
     # The 2026-09-14 hotel, exactly: the reload could not possibly succeed, and
     # it burned the 600s cooldown and logged a failure that reads as a tunnel

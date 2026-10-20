@@ -636,7 +636,7 @@ fn net_id(iface: &str) -> String {
     format!("{ssid} {addr}/{router}").trim().to_string()
 }
 
-fn observe(ctx: &Ctx, cap: Option<CaptiveState>, portal: Option<String>, portal_host: Option<String>, health_ok: bool, health_slow: bool) -> Observation {
+fn observe(ctx: &Ctx, cap: Option<CaptiveState>, portal: Option<String>, portal_host: Option<String>, health_ok: bool, health_slow: bool, health_flows: u32) -> Observation {
     let p = Mac;
     let svc = p.active_service();
     let iface = p.detect_iface();
@@ -674,6 +674,7 @@ fn observe(ctx: &Ctx, cap: Option<CaptiveState>, portal: Option<String>, portal_
         mode: ctx.mode(),
         health_ok,
         health_slow,
+        health_flows,
         now: crate::sh_date("+%s").parse().unwrap_or(0),
     }
 }
@@ -951,6 +952,39 @@ fn health_ok_within(ctx: &Ctx, t: u32) -> bool {
     false
 }
 
+/// `_watch_fresh_flows` — escape-lane connections opened in the last
+/// `FLOW_WINDOW_SECS` that have received bytes through the tunnel. Download,
+/// not upload: sing-box counts a client's bytes while the dial is still
+/// pending, so upload alone would let a wedged tunnel read as flowing. `start`
+/// is RFC3339 in the system zone, as is the stamp it is compared with, so a
+/// plain prefix compare works. 0 when the API cannot be read.
+fn fresh_escape_flows(ctx: &Ctx) -> u32 {
+    let Some(body) = lifecycle::clash_curl(ctx, "GET", "/connections", None).filter(|b| !b.is_empty()) else { return 0 };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else { return 0 };
+    let since = crate::sh_date_v(&format!("-{}S", rowt_core::watch::FLOW_WINDOW_SECS), "+%Y-%m-%dT%H:%M:%S");
+    if since.len() != 19 {
+        return 0;
+    }
+    count_fresh_flows(&v, &since)
+}
+
+/// The filter behind `fresh_escape_flows`, over the clash API's `/connections`
+/// body: escape lane (no block/direct/corp outbound in the chain, as `rowt
+/// connections` classifies it), opened at or after `since` (a 19-character
+/// `YYYY-MM-DDTHH:MM:SS` stamp in the same zone as `start`), bytes received.
+fn count_fresh_flows(v: &serde_json::Value, since: &str) -> u32 {
+    let Some(conns) = v.get("connections").and_then(|c| c.as_array()) else { return 0 };
+    conns.iter().filter(|c| {
+        let chains: Vec<&str> = c.get("chains").and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|t| t.as_str()).collect()).unwrap_or_default();
+        let escape = !chains.iter().any(|t| matches!(*t, "block" | "direct" | "corp"));
+        let start = c.get("start").and_then(|s| s.as_str()).unwrap_or("");
+        let fresh = start.len() >= 19 && start.is_char_boundary(19) && &start[..19] >= since;
+        let received = c.get("download").and_then(|d| d.as_u64()).unwrap_or(0) > 0;
+        escape && fresh && received
+    }).count() as u32
+}
+
 // ------------------------------------------------------------------ command
 
 pub fn cmd(ctx: &Ctx, self_bin: &Path, action: &str) -> Result<String, String> {
@@ -1154,7 +1188,7 @@ fn tick(ctx: &Ctx) {
     // `Action::Journal` because that is what the shadow comparison matches
     // against; `perform` skips it below rather than running it twice.
     journal(ctx, cap);
-    let obs = observe(ctx, Some(cap), portal.clone(), portal_host.clone(), true, false);
+    let obs = observe(ctx, Some(cap), portal.clone(), portal_host.clone(), true, false, 0);
     let g = guard(&obs, &st, &cfg);
     perform_planned(ctx, &g.actions);
     st = g.state;
@@ -1210,7 +1244,11 @@ fn tick(ctx: &Ctx) {
     let slow = !hb
         && st.health_fails + 1 >= cfg.health_fails
         && health_ok_within(ctx, cfg.health_timeout * 3);
-    let obs2 = observe(ctx, Some(cap), portal, portal_host, hb, slow);
+    // FLOWING is not WEDGED: only when the patient probe failed as well, ask
+    // the router whether connections opened in the last two minutes are still
+    // receiving bytes through the tunnel. Mirrors the shell's `_watch_fresh_flows`.
+    let flows = if !hb && st.health_fails + 1 >= cfg.health_fails && !slow { fresh_escape_flows(ctx) } else { 0 };
+    let obs2 = observe(ctx, Some(cap), portal, portal_host, hb, slow, flows);
     let n = netcheck(&obs2, &st, &cfg);
     perform_planned(ctx, &n.actions);
     save_state(ctx, &mut disk, &n.state);
@@ -1220,6 +1258,26 @@ fn tick(ctx: &Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `_watch_fresh_flows`'s filter: escape lane, opened at or after the stamp,
+    /// and bytes RECEIVED — a connection still dialing can already count the
+    /// client's upload, so upload alone must not count.
+    #[test]
+    fn fresh_flows_count_escape_connections_that_received_bytes_since_the_stamp() {
+        let body = serde_json::json!({"connections": [
+            {"chains": ["Hong-Server", "escape"], "start": "2026-10-19T20:30:10.5-07:00", "upload": 500, "download": 2000},
+            {"chains": ["Hong-Server", "escape"], "start": "2026-10-19T20:31:00.1-07:00", "upload": 517, "download": 0},
+            {"chains": ["direct"],                "start": "2026-10-19T20:31:30.0-07:00", "upload": 100, "download": 900},
+            {"chains": ["corp"],                  "start": "2026-10-19T20:31:30.0-07:00", "upload": 100, "download": 900},
+            {"chains": ["Hong-Server", "escape"], "start": "2026-10-19T20:20:00.0-07:00", "upload": 900, "download": 9000},
+            {"chains": ["Hong-Server", "escape"], "start": "2026-10-19T20:29:50.0-07:00", "upload": 10, "download": 1}
+        ]});
+        // Two: the first (fresh, received) and the last (opened exactly at the stamp).
+        assert_eq!(count_fresh_flows(&body, "2026-10-19T20:29:50"), 2);
+        assert_eq!(count_fresh_flows(&body, "2026-10-19T20:30:00"), 1, "the one at the stamp drops out");
+        assert_eq!(count_fresh_flows(&serde_json::json!({}), "2026-10-19T20:29:50"), 0, "no list, no flows");
+        assert_eq!(count_fresh_flows(&serde_json::json!({"connections": [{"chains": ["escape"], "start": "", "download": 5}]}), "2026-10-19T20:29:50"), 0, "no start, not fresh");
+    }
 
     /// The captive verdict decides whether the watchdog DROPS the system
     /// proxy. Getting it wrong on a flaky network strands the machine, and

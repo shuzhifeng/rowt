@@ -393,6 +393,13 @@ pub fn sh_date(fmt: &str) -> String {
     std::process::Command::new("date").arg(fmt).output().ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string()).unwrap_or_default()
 }
+/// `date -v<adj> <fmt>` — a stamp `<adj>` (e.g. `-120S`) from now, in the
+/// system zone, so it compares with timestamps the router writes in that zone.
+pub fn sh_date_v(adj: &str, fmt: &str) -> String {
+    std::process::Command::new("date").arg(format!("-v{adj}")).arg(fmt)
+        .stderr(std::process::Stdio::null()).output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string()).unwrap_or_default()
+}
 fn sh_date_r(epoch: i64, fmt: &str) -> String {
     std::process::Command::new("date").arg("-r").arg(epoch.to_string()).arg(fmt)
         .stderr(std::process::Stdio::null()).output().ok()

@@ -1,0 +1,3 @@
+`rowt status` in local mode (render-local's state) when the direct probe runs
+out of its 8 s (curl exit 28): "no answer within 8s (a slow link, or no route
+to it)" rather than plain "no route to it". See status-slow-tunnel.

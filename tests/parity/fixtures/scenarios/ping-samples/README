@@ -2,12 +2,18 @@
 their median — the monitor's method (rowt_core::latency). The recorder's usual
 canned responses are static, so all three samples of a server would agree and
 both implementations would match however they combined them. These `.seq`
-fixtures hand out one line per call instead (an empty line, or a body with no
-`delay`, is a failed sample):
+fixtures hand out one line per call instead (an empty line, or a body with
+neither `delay` nor the Timeout message, is a failed sample):
 
-  alpha  300, 100, 200     -> 200 ms   the middle value, from unsorted samples
-  beta   fail, 351, 250    -> 300 ms   two successes: their mean, 300.5 FLOORED
-  gamma  fail, fail, 120   -> 120 ms   one success is the figure
-  delta  three timeouts    -> unreachable
+  alpha    300, 100, 200       -> 200 ms   the middle value, from unsorted samples
+  beta     fail, 351, 250      -> 300 ms   two successes: their mean, 300.5 FLOORED
+  gamma    fail, fail, 120     -> 120 ms   one success is the figure
+  delta    three timeouts      -> no answer in 8s   every try ran out of time
+  epsilon  three failures      -> unreachable       the router's 503, failed outright
+  zeta     timeout, fail, timeout
+                               -> unreachable       one outright failure decides it
+
+A timeout is the router's 504 {"message":"Timeout"}: the sample outran its
+budget, which on a slow link says nothing about whether the server is up.
 
 `now` is beta, so it carries the `*`. host.pid.self makes the router read as up.

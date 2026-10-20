@@ -7,7 +7,9 @@
    - `router:` running or not;
    - `engine:` pinned, or KNOWN BAD;
    - `system proxy:` and `config:`;
-   - `via proxy:` a real fetch through the escape lane;
+   - `via proxy:` a real fetch through the escape lane, 8 s budget. `HTTP 000 … no answer
+     within 8s` is a slow link or a dead tunnel (check `rowt connections` for live
+     traffic before concluding which); `tunnel not reachable` failed outright;
    - `watchdog:` `loaded`, `NOT loaded — … rowt watch refresh`, or `not installed`,
      and whether its plist is STALE.
 2. Logs in `~/.config/rowt/log/`:

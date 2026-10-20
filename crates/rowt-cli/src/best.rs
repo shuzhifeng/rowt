@@ -44,30 +44,39 @@ fn utc(back_secs: Option<u64>) -> String {
 }
 
 /// `_latency_probe`: three samples per server, one after another, at most ten
-/// servers at a time. (tag, figure, samples answered), in input order.
-pub fn probe(ctx: &Ctx, timeout: u32, tags: &[String]) -> Vec<(String, Option<u64>, u64)> {
+/// servers at a time. (tag, figure, samples answered, samples that ran out of
+/// time), in input order.
+pub fn probe(ctx: &Ctx, timeout: u32, tags: &[String]) -> Vec<(String, Option<u64>, u64, u64)> {
     let Some(ep) = lifecycle::controller(ctx) else { return Vec::new() };
     let secret = lifecycle::clash_secret(ctx);
     let enc = crate::urlencode(&env_or("ROWT_PING_URL", "https://www.gstatic.com/generate_204"));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let out: std::sync::Mutex<Vec<Option<(String, Option<u64>, u64)>>> =
+    let out: std::sync::Mutex<Vec<Option<(String, Option<u64>, u64, u64)>>> =
         std::sync::Mutex::new(vec![None; tags.len()]);
     std::thread::scope(|scope| {
         for _ in 0..tags.len().min(10) {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(t) = tags.get(i) else { break };
-                let ok: Vec<u64> = (0..latency::SAMPLES).filter_map(|_| {
+                let mut ok: Vec<u64> = Vec::new();
+                let mut timeouts = 0u64;
+                for _ in 0..latency::SAMPLES {
                     // curl max-time must exceed the clash delay timeout, else it cuts early
                     let o = std::process::Command::new("curl")
                         .args(["--noproxy", "*", "-sS", "-m", &(timeout + 3).to_string(),
                                "-H", &format!("Authorization: Bearer {secret}"),
                                &format!("http://{ep}/proxies/{t}/delay?timeout={timeout}000&url={enc}")])
                         .stderr(std::process::Stdio::null()).output().ok();
-                    o.and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
-                        .and_then(|v| v.get("delay").and_then(|d| d.as_u64()))
-                }).collect();
-                let row = (t.clone(), latency::aggregate(&ok), ok.len() as u64);
+                    let v = o.and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
+                    // The router answers 504 {"message":"Timeout"} when a sample
+                    // outran the budget and 503 when it failed.
+                    match v.as_ref().and_then(|v| v.get("delay")).and_then(|d| d.as_u64()) {
+                        Some(ms) => ok.push(ms),
+                        None if v.as_ref().and_then(|v| v.get("message")).and_then(|m| m.as_str()) == Some("Timeout") => timeouts += 1,
+                        None => {}
+                    }
+                }
+                let row = (t.clone(), latency::aggregate(&ok), ok.len() as u64, timeouts);
                 if let Ok(mut g) = out.lock() {
                     g[i] = Some(row);
                 }
@@ -79,10 +88,10 @@ pub fn probe(ctx: &Ctx, timeout: u32, tags: &[String]) -> Vec<(String, Option<u6
 
 /// `_latency_table_update`: fold probe results into the table — those rows
 /// replaced and stamped now, the rest kept, servers gone from the pool dropped.
-pub fn table_update(ctx: &Ctx, fresh: &[(String, Option<u64>, u64)]) {
+pub fn table_update(ctx: &Ctx, fresh: &[(String, Option<u64>, u64, u64)]) {
     let now = utc(None);
     let rows: Vec<Row> = fresh.iter()
-        .map(|(t, m, n)| Row { tag: t.clone(), median: *m, ok: *n, at: now.clone() })
+        .map(|(t, m, n, _)| Row { tag: t.clone(), median: *m, ok: *n, at: now.clone() })
         .collect();
     let old = latency::table_parse(&read(&table_path(ctx)));
     let body = latency::table_render(&latency::table_merge(&old, &rows, &pool(ctx)));

@@ -59,7 +59,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.8"
+ROWT_VERSION="3.6.9"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -2588,13 +2588,19 @@ cmd_ping() {
   # shellcheck disable=SC2086 — one argument per tag
   res="$(_latency_probe "$PING_TIMEOUT" $tags)"
   printf '%s\n' "$res" | _latency_table_update
-  printf '%s\n' "$res" | awk -F'\t' 'NF >= 3 && $1 != "" {
-      if ($2 == "") printf "999999\t%s\tunreachable\n", $1; else printf "%06d\t%s\t%s ms\n", $2, $1, $2 }' \
+  # No answer at all is two different things: every try ran out of time (a
+  # slow link reads exactly like a dead server — on a ~800 ms in-flight link
+  # all 22 did, while the lane carried traffic), or a try failed outright.
+  printf '%s\n' "$res" | awk -F'\t' -v to="$PING_TIMEOUT" 'NF >= 3 && $1 != "" {
+      if ($2 != "") printf "%06d\t%s\t%s ms\n", $2, $1, $2
+      else if ($4 + 0 == 3) printf "999999\t%s\tno answer in %ss\n", $1, to
+      else printf "999999\t%s\tunreachable\n", $1 }' \
     | sort -n | while IFS=$'\t' read -r _ t disp; do
     mark="  "; [ "$t" = "$now" ] && mark="* "
     printf '%s%-20s %s\n' "$mark" "$t" "$disp"
   done
-  echo "  * = active. 'unreachable' = none of 3 tries answered in ${PING_TIMEOUT}s (down, or can't reach the test URL)."
+  echo "  * = active. 'no answer in ${PING_TIMEOUT}s' = all 3 tries ran out of time: down, or a slow link (ROWT_PING_TIMEOUT=20 $PROG ping waits longer)."
+  echo "  'unreachable' = at least one try failed outright (the server refused, or can't reach the test URL)."
 }
 
 # One server's figure from the samples that succeeded: the median of three, the
@@ -2610,8 +2616,9 @@ _latency_of() {
 }
 
 # Measure servers through the router: three samples each, one after another,
-# at most ten servers at a time. "<tag>\t<median or empty>\t<samples answered>"
-# per server. $1 = seconds per sample, the rest = tags.
+# at most ten servers at a time. "<tag>\t<median or empty>\t<samples answered>
+# \t<samples that ran out of time>" per server. $1 = seconds per sample, the
+# rest = tags.
 _latency_probe() {
   local to="$1"; shift
   local ep sec enc dir t i=0 n=0 pids=""
@@ -2621,16 +2628,18 @@ _latency_probe() {
   for t in "$@"; do
     i=$((i + 1))
     (
-      local _s ms ok="" nok=0
+      local _s ms ok="" nok=0 nto=0
       for _s in 1 2 3; do
-        # curl max-time must exceed the clash delay timeout, else it cuts early
+        # curl max-time must exceed the clash delay timeout, else it cuts early.
+        # The router answers 504 {"message":"Timeout"} when a sample outran the
+        # budget and 503 when it failed; "T" marks the first.
         ms="$(curl --noproxy '*' -sS -m "$((to + 3))" -H "Authorization: Bearer $sec" \
               "http://$ep/proxies/$t/delay?timeout=${to}000&url=$enc" 2>/dev/null \
-              | jq -r '.delay // empty' 2>/dev/null || true)"
-        case "$ms" in ''|null) ;; *) ok="$ok $ms"; nok=$((nok + 1)) ;; esac
+              | jq -r 'if .delay then .delay elif .message == "Timeout" then "T" else empty end' 2>/dev/null || true)"
+        case "$ms" in ''|null) ;; T) nto=$((nto + 1)) ;; *) ok="$ok $ms"; nok=$((nok + 1)) ;; esac
       done
       # shellcheck disable=SC2086 — the samples are word-split on purpose
-      printf '%s\t%s\t%s\n' "$t" "$(_latency_of $ok)" "$nok"
+      printf '%s\t%s\t%s\t%s\n' "$t" "$(_latency_of $ok)" "$nok" "$nto"
     ) > "$dir/$i.out" &
     pids="$pids $!"; n=$((n + 1))
     if [ "$n" -ge 10 ]; then wait $pids; pids=""; n=0; fi
@@ -5154,11 +5163,21 @@ cmd_status() {
     "$SB" check -c "$HOST_CFG" >/dev/null 2>&1 && echo "config:       host.json OK" || echo "config:       host.json INVALID (run '$PROG render')"
   fi
   if host_running; then
-    local vc; vc="$(curl -sS -m 8 -x "http://127.0.0.1:$PORT" -o /dev/null -w '%{http_code}' https://www.google.com/ 2>/dev/null || true)"; vc="${vc:-000}"
+    # 000 is no answer at all; curl's own exit 28 says its 8 s ran out, which
+    # on a slow link is not the same as a dead tunnel.
+    local vc vrc=0 why=""
+    vc="$(curl -sS -m 8 -x "http://127.0.0.1:$PORT" -o /dev/null -w '%{http_code}' https://www.google.com/ 2>/dev/null)" || vrc=$?
+    vc="${vc:-000}"
+    if [ "$vc" = 000 ]; then
+      if [ "$vrc" = 28 ] && [ "$mode" = "local" ]; then why='  — no answer within 8s (a slow link, or no route to it)'
+      elif [ "$vrc" = 28 ]; then why='  — no answer within 8s (a slow link, or the tunnel is down)'
+      elif [ "$mode" = "local" ]; then why='  — no route to it'
+      else why='  — tunnel not reachable'; fi
+    fi
     if [ "$mode" = "local" ]; then
-      echo "via proxy:    HTTP $vc (google, direct)$([ "$vc" = 000 ] && echo '  — no route to it')"
+      echo "via proxy:    HTTP $vc (google, direct)$why"
     else
-      echo "via proxy:    HTTP $vc (google, escape lane)$([ "$vc" = 000 ] && echo '  — tunnel not reachable')"
+      echo "via proxy:    HTTP $vc (google, escape lane)$why"
     fi
   fi
   # The watchdog. Loaded is the floor, the plist's generation the second word;
@@ -6659,7 +6678,7 @@ diag_body() {
   if host_running; then
     local px="socks5h://127.0.0.1:$PORT"
     _d "  direct bucket  (baidu.com):  HTTP $(curl -sS -m 10 -x "$px" -o /dev/null -w '%{http_code}' https://www.baidu.com/ 2>/dev/null)"
-    _d "  escape bucket  (google.com): HTTP $(curl -sS -m 12 -x "$px" -o /dev/null -w '%{http_code}' https://www.google.com/ 2>/dev/null)  (000 = escape tunnel not reachable)"
+    _d "  escape bucket  (google.com): HTTP $(curl -sS -m 12 -x "$px" -o /dev/null -w '%{http_code}' https://www.google.com/ 2>/dev/null)  (000 = no answer: the tunnel is down, or slower than 12s)"
     _d "  escape live     $(clash_selected 2>/dev/null || echo '?')   (clash API $(controller 2>/dev/null))"
   else _d "  (router stopped — start it: $PROG router up, then re-run diag)"; fi
   _d ""

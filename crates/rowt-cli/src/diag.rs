@@ -246,7 +246,7 @@ pub fn body(ctx: &Ctx, here: &Path) -> String {
         let px = format!("socks5h://127.0.0.1:{}", ctx.port);
         o.push(format!("  direct bucket  (baidu.com):  HTTP {}",
                        curl_code_t(&px, "https://www.baidu.com/", "10")));
-        o.push(format!("  escape bucket  (google.com): HTTP {}  (000 = escape tunnel not reachable)",
+        o.push(format!("  escape bucket  (google.com): HTTP {}  (000 = no answer: the tunnel is down, or slower than 12s)",
                        curl_code_t(&px, "https://www.google.com/", "12")));
         o.push(format!("  escape live     {}   (clash API {})",
                        lifecycle::clash_selected(ctx).unwrap_or_else(|| "?".into()), ctx.controller()));

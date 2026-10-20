@@ -1,0 +1,7 @@
+`rowt status` when the probe through the proxy gets no answer because curl's own
+8 s ran out (exit 28): on a slow link (about 800 ms round trips in flight,
+2026-10-19) the escape lane carried traffic while this line said the tunnel was
+not reachable. It now says no answer within 8s, a slow link or a dead tunnel.
+router-up's config and env, with www.google.com answering 000 / exit 28.
+Siblings: status-dead-tunnel (000, exit 7: refused, still "tunnel not
+reachable") and status-slow-local (exit 28 in local mode).

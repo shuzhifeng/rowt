@@ -292,6 +292,11 @@ PARITY_SCENARIO=router-up connections direct
 PARITY_SCENARIO=router-up conns block
 PARITY_SCENARIO=router-up connections nosuchlane
 PARITY_SCENARIO=router-up status
+# The via-proxy probe got 000: curl's exit 28 (its own 8 s ran out) is a slow
+# link or a dead tunnel, anything else is no route. #s15.
+PARITY_SCENARIO=status-slow-tunnel status
+PARITY_SCENARIO=status-dead-tunnel status
+PARITY_SCENARIO=status-slow-local status
 PARITY_SCENARIO=router-up explain example.com
 PARITY_SCENARIO=router-up router status
 
@@ -530,8 +535,9 @@ PARITY_SCENARIO=router-up ping alpha
 PARITY_UNORDERED=1 PARITY_SCENARIO=lanes-empty ping
 # Three samples per server, median printed (rowt_core::latency). ping-samples
 # serves each server a different SEQUENCE of answers — unsorted, one failure (a
-# .5 mean to floor), two failures, all timeouts — so the two sides agree only if
-# they combine samples the same way. See its README for the expected figures.
+# .5 mean to floor), two failures, all timeouts, all failures, timeouts with one
+# failure — so the two sides agree only if they combine samples the same way and
+# tell a timeout (no answer in 8s) from a failure (unreachable). See its README.
 PARITY_UNORDERED=1 PARITY_SCENARIO=ping-samples ping
 # `best`: the watchdog picks by median-of-3 from latency.tsv, the table every
 # rowt prober shares (in the config tree, so its format is compared too). Ticks

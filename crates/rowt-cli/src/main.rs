@@ -1422,11 +1422,16 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
             // monitor read too.
             let res = best::probe(&ctx, timeout, &tags);
             best::table_update(&ctx, &res);
-            let mut rows: Vec<(String, String, String)> = res.into_iter().map(|(t, m, _)| match m {
+            // No answer at all is two different things: every try ran out of
+            // time (a slow link reads exactly like a dead server — on a ~800 ms
+            // in-flight link all 22 did, while the lane carried traffic), or a
+            // try failed outright.
+            let mut rows: Vec<(String, String, String)> = res.into_iter().map(|(t, m, _, to)| match m {
                 // The sort key is the zero-padded number the shell prints, so an
                 // unreachable server sorts last by being 999999 rather than by a
                 // special case.
                 Some(ms) => (format!("{ms:06}"), t, format!("{ms} ms")),
+                None if to == rowt_core::latency::SAMPLES as u64 => ("999999".to_string(), t, format!("no answer in {timeout}s")),
                 None => ("999999".to_string(), t, "unreachable".to_string()),
             }).collect();
             // `cat "$dir"/*.out | sort -n`: glob order in, numeric sort out, and
@@ -1440,7 +1445,8 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 let mark = if t == now && !now.is_empty() { "* " } else { "  " };
                 o.push_str(&format!("{mark}{} {disp}\n", pad(&t, 20)));
             }
-            o.push_str(&format!("  * = active. 'unreachable' = none of {} tries answered in {timeout}s (down, or can't reach the test URL).", rowt_core::latency::SAMPLES));
+            o.push_str(&format!("  * = active. 'no answer in {timeout}s' = all {} tries ran out of time: down, or a slow link (ROWT_PING_TIMEOUT=20 {PROG} ping waits longer).\n", rowt_core::latency::SAMPLES));
+            o.push_str("  'unreachable' = at least one try failed outright (the server refused, or can't reach the test URL).");
             Ok(o)
         }
         // Find a proxy env that can actually reach the internet, then exec the
@@ -2050,11 +2056,17 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                     if ok { "OK".to_string() } else { format!("INVALID (run '{PROG} render')") }));
             }
             if lifecycle::host_running(&ctx).is_some() {
-                let vc = lifecycle::curl_code(&format!("http://127.0.0.1:{}", ctx.port), "https://www.google.com/");
+                // 000 is no answer at all; curl's own exit 28 says its 8 s ran
+                // out, which on a slow link is not the same as a dead tunnel.
+                let (vc, rc) = lifecycle::curl_code_rc(&format!("http://127.0.0.1:{}", ctx.port), "https://www.google.com/");
                 let lane = if mode == "local" { "google, direct" } else { "google, escape lane" };
-                let tail = if vc == "000" {
-                    if mode == "local" { "  — no route to it" } else { "  — tunnel not reachable" }
-                } else { "" };
+                let tail = match (vc == "000", rc == Some(28), mode == "local") {
+                    (false, _, _) => "",
+                    (true, true, true) => "  — no answer within 8s (a slow link, or no route to it)",
+                    (true, true, false) => "  — no answer within 8s (a slow link, or the tunnel is down)",
+                    (true, false, true) => "  — no route to it",
+                    (true, false, false) => "  — tunnel not reachable",
+                };
                 o.push(format!("via proxy:    HTTP {vc} ({lane}){tail}"));
             }
             o.push(watch::status_line());

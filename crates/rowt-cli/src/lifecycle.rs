@@ -838,12 +838,19 @@ pub fn clash_selected(ctx: &Ctx) -> Option<String> {
 
 /// An HTTP status through a proxy, "000" when it never answered.
 pub fn curl_code(proxy: &str, url: &str) -> String {
+    curl_code_rc(proxy, url).0
+}
+
+/// `curl_code` and curl's exit status, whose 28 is its own `-m 8` running out:
+/// the one way to tell a slow link from a dead one when both read 000.
+pub fn curl_code_rc(proxy: &str, url: &str) -> (String, Option<i32>) {
     let out = Command::new("curl")
         .args(["-sS", "-m", "8", "-x", proxy, "-o", "/dev/null", "-w", "%{http_code}", url])
         .stderr(Stdio::null()).output();
     match out {
-        Ok(o) if !o.stdout.is_empty() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => "000".into(),
+        Ok(o) if !o.stdout.is_empty() => (String::from_utf8_lossy(&o.stdout).trim().to_string(), o.status.code()),
+        Ok(o) => ("000".into(), o.status.code()),
+        Err(_) => ("000".into(), None),
     }
 }
 

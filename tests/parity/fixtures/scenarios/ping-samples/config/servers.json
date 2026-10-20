@@ -86,5 +86,49 @@
         "short_id": "01"
       }
     }
+  },
+  {
+    "type": "vless",
+    "tag": "epsilon",
+    "server": "203.0.113.14",
+    "server_port": 443,
+    "uuid": "00000000-0000-4000-8000-000000000005",
+    "flow": "xtls-rprx-vision",
+    "packet_encoding": "xudp",
+    "tls": {
+      "enabled": true,
+      "server_name": "alpha.example",
+      "utls": {
+        "enabled": true,
+        "fingerprint": "chrome"
+      },
+      "reality": {
+        "enabled": true,
+        "public_key": "PARITYFIXTUREPUBLICKEY",
+        "short_id": "01"
+      }
+    }
+  },
+  {
+    "type": "vless",
+    "tag": "zeta",
+    "server": "203.0.113.15",
+    "server_port": 443,
+    "uuid": "00000000-0000-4000-8000-000000000006",
+    "flow": "xtls-rprx-vision",
+    "packet_encoding": "xudp",
+    "tls": {
+      "enabled": true,
+      "server_name": "alpha.example",
+      "utls": {
+        "enabled": true,
+        "fingerprint": "chrome"
+      },
+      "reality": {
+        "enabled": true,
+        "public_key": "PARITYFIXTUREPUBLICKEY",
+        "short_id": "01"
+      }
+    }
   }
 ]

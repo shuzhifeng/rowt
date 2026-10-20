@@ -1,0 +1,3 @@
+`rowt status` when the probe through the proxy fails outright (000, curl exit 7,
+connection refused): still "tunnel not reachable". The timeout case is
+status-slow-tunnel; only curl's exit 28 tells the two apart.

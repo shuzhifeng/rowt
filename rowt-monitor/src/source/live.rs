@@ -21,8 +21,9 @@ use crate::model::*;
 use crate::source::parse::{self, ErrAgg, ErrEvent, RawConn};
 use crate::source::{FixtureSource, Source};
 
-/// Server latency results shared with the background prober: tag -> (delay ms
-/// or None if all samples failed, when the samples completed).
+/// Server latency results shared with the background prober: tag -> (delay ms,
+/// or None when no sample answered, the slow one included; when the samples
+/// completed).
 type Delays = Arc<Mutex<HashMap<String, (Option<u32>, Instant)>>>;
 
 /// Lane logs (name, lane) aggregated into the errors pane.
@@ -105,6 +106,7 @@ pub struct LiveSource {
     api_fail_streak: u32,         // consecutive ticks on which neither /connections nor /version answered
     last_conns_json: Option<Value>, // the last /connections answer, shown again through a slow tick
     last_force: Option<Instant>,  // throttle self-heal re-probes
+    force_retries: u32,           // forced rounds in a row while the active server's probe keeps failing
     last_active_traffic: Option<Instant>, // last tick the escape lane moved bytes (health override)
 
     // System-proxy state ("on"/"other"/"off"), refreshed on a background thread
@@ -183,6 +185,7 @@ impl LiveSource {
             api_fail_streak: 0,
             last_conns_json: None,
             last_force: None,
+            force_retries: 0,
             last_active_traffic: None,
             // Seed synchronously so the first frame is correct (no "off" flash).
             sysproxy: Arc::new(Mutex::new(read_system_proxy(proxy_port).to_string())),
@@ -297,7 +300,7 @@ impl LiveSource {
                 let members = read_escape_members(&cfg);
                 let secret = read_clash_secret(&cfg);
                 let (finished, round) = probe_round_rows(&members, &delays,
-                    |tag| clash_delay(port, secret.as_deref(), tag, &url, 5000));
+                    |tag, budget_ms| clash_delay(port, secret.as_deref(), tag, &url, budget_ms));
                 write_latency_table(&cfg, &round);
                 if let Ok(mut at) = last_probe.lock() { *at = finished; }
                 // recv_timeout returns Ok on a force signal, Err(Timeout) after
@@ -885,9 +888,15 @@ impl Source for LiveSource {
         if router_up {
             let recovered = !self.prev_router_up;
             let since = self.last_force.map(|t| t.elapsed());
-            if should_force_probe(probe_failed, traffic_recent, recovered, since) {
+            if recovered || !probe_failed {
+                self.force_retries = 0;
+            }
+            if should_force_probe(probe_failed, traffic_recent, recovered, since, self.force_retries, self.probe_interval) {
                 let _ = self.force_probe();
                 self.last_force = Some(Instant::now());
+                if probe_failed && !recovered {
+                    self.force_retries = self.force_retries.saturating_add(1);
+                }
             }
         }
         self.prev_router_up = router_up;
@@ -994,14 +1003,38 @@ fn request_probe(tx: Option<&SyncSender<()>>) -> Result<(), &'static str> {
     })
 }
 
+/// The budget of one fast delay sample, in ms. Three of these measure a server
+/// on an ordinary link.
+const PROBE_BUDGET_MS: u32 = 5000;
+/// The budget of the one slow sample taken when every fast sample ran out of
+/// budget: it tells a slow link (the figure comes back, seconds long) from a
+/// dead server (this one times out too). Seen 2026-10-19 on an in-flight link
+/// with ~800 ms round trips: every fast sample timed out and all 22 servers
+/// read "down" while the escape lane carried bytes; a 15 s sample read 7.2 s.
+/// The clash API parses the budget as a 16-bit number, so keep it under 32768.
+const SLOW_PROBE_BUDGET_MS: u32 = 15_000;
+
+/// One delay sample's outcome: the figure; a budget overrun (the server may
+/// just be slower than the budget — clash's 504, or our own HTTP timeout); or
+/// a failure no budget would fix (the test URL refused: 503; no such tag: 404;
+/// a zero delay).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sample {
+    Ms(u32),
+    Timeout,
+    Failed,
+}
+
 #[cfg(test)]
-fn probe_round(members: &[String], delays: &Delays, probe: impl Fn(&str) -> Option<u32> + Sync) -> Option<Instant> {
+fn probe_round(members: &[String], delays: &Delays, probe: impl Fn(&str, u32) -> Sample + Sync) -> Option<Instant> {
     probe_round_rows(members, delays, probe).0
 }
 
 /// `probe_round`, also returning each server's (tag, figure, samples answered)
-/// — the rows the prober writes into rowt's shared latency table.
-fn probe_round_rows(members: &[String], delays: &Delays, probe: impl Fn(&str) -> Option<u32> + Sync)
+/// — the rows the prober writes into rowt's shared latency table. `probe` takes
+/// the tag and a budget in ms: three fast samples, then — only when all three
+/// ran out of budget — one slow sample, whose figure stands alone.
+fn probe_round_rows(members: &[String], delays: &Delays, probe: impl Fn(&str, u32) -> Sample + Sync)
     -> (Option<Instant>, Vec<(String, Option<u32>, usize)>) {
     let next = AtomicUsize::new(0);
     let rows: Mutex<Vec<(String, Option<u32>, usize)>> = Mutex::new(Vec::new());
@@ -1009,7 +1042,13 @@ fn probe_round_rows(members: &[String], delays: &Delays, probe: impl Fn(&str) ->
         for _ in 0..members.len().min(10) {
             scope.spawn(|| {
                 while let Some(tag) = members.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    let mut samples: Vec<_> = (0..3).filter_map(|_| probe(tag)).collect();
+                    let fast: Vec<Sample> = (0..3).map(|_| probe(tag, PROBE_BUDGET_MS)).collect();
+                    let mut samples: Vec<u32> = fast.iter().filter_map(|s| match s { Sample::Ms(v) => Some(*v), _ => None }).collect();
+                    if samples.is_empty() && fast.iter().all(|s| *s == Sample::Timeout) {
+                        if let Sample::Ms(v) = probe(tag, SLOW_PROBE_BUDGET_MS) {
+                            samples.push(v);
+                        }
+                    }
                     samples.sort_unstable();
                     let ms = match samples.as_slice() {
                         [] => None,
@@ -1079,21 +1118,32 @@ fn write_latency_table(cfg: &std::path::Path, round: &[(String, Option<u32>, usi
 }
 
 /// Run one clash delay test for a server through the tunnel (like `rowt ping`):
-/// `GET /proxies/{tag}/delay`. Returns the RTT in ms, or None on failure.
-fn clash_delay(port: u16, secret: Option<&str>, tag: &str, url: &str, timeout_ms: u32) -> Option<u32> {
+/// `GET /proxies/{tag}/delay`, with `timeout_ms` as clash's budget. The RTT in
+/// ms, or why there is none: clash answers 504 when the test outran the budget
+/// and 503 when it failed outright (404 for a tag it doesn't know).
+fn clash_delay(port: u16, secret: Option<&str>, tag: &str, url: &str, timeout_ms: u32) -> Sample {
     let enc = url_encode(url);
     let path = format!("http://127.0.0.1:{}/proxies/{}/delay?timeout={}&url={}", port, tag, timeout_ms, enc);
-    // The HTTP call must outlast clash's own delay timeout.
+    // The HTTP call must outlast clash's own delay timeout, by a wide margin:
+    // a slow test's wall time has run ~5 s past the figure it reported.
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(timeout_ms as u64 + 3000))
+        .timeout(Duration::from_millis(timeout_ms as u64 + 10_000))
         .build();
     let mut req = agent.get(&path);
     if let Some(s) = secret {
         req = req.set("Authorization", &format!("Bearer {}", s));
     }
-    let v: Value = req.call().ok()?.into_json().ok()?;
-    let d = v.get("delay")?.as_u64()? as u32;
-    (d > 0).then_some(d)
+    match req.call() {
+        Ok(resp) => match resp.into_json::<Value>().ok().and_then(|v| v.get("delay")?.as_u64()) {
+            Some(d) if d > 0 => Sample::Ms(d.min(u32::MAX as u64) as u32),
+            _ => Sample::Failed,
+        },
+        Err(ureq::Error::Status(504, _)) => Sample::Timeout,
+        Err(ureq::Error::Status(_, _)) => Sample::Failed,
+        // Our own timeout, or no router to ask: the slow sample settles it
+        // either way, and fails as fast as this one did when the router is gone.
+        Err(ureq::Error::Transport(_)) => Sample::Timeout,
+    }
 }
 
 /// Percent-encode a URL for use as a query-string value (no extra deps).
@@ -1328,14 +1378,22 @@ fn health_with_traffic(active_ok: Option<bool>, traffic_recent: bool) -> Option<
 /// back) retry on a short window so a transient failure clears fast and the
 /// latency refreshes; without traffic, retry slowly. `since_last` is how long ago
 /// we last forced a probe (`None` = never).
-fn should_force_probe(probe_failed: bool, traffic_recent: bool, router_recovered: bool, since_last: Option<Duration>) -> bool {
+/// The self-heal's schedule while the active server's probe keeps failing:
+/// the first retry waits 15 s when the escape lane is moving bytes (60 s when
+/// it is not), and each retry after that — `retries` so far — waits twice as
+/// long, up to `cap` (the probe interval). A transient failure still clears
+/// within seconds; a link that stays slow for an hour gets a handful of rounds,
+/// not back-to-back rounds of the whole pool, three or four samples a server,
+/// on top of the traffic it is already struggling with.
+fn should_force_probe(probe_failed: bool, traffic_recent: bool, router_recovered: bool, since_last: Option<Duration>, retries: u32, cap: Duration) -> bool {
     if router_recovered {
         return true;
     }
     if !probe_failed {
         return false;
     }
-    let throttle = if traffic_recent { Duration::from_secs(15) } else { Duration::from_secs(60) };
+    let base = if traffic_recent { Duration::from_secs(15) } else { Duration::from_secs(60) };
+    let throttle = base.saturating_mul(1u32 << retries.min(16)).min(cap);
     since_last.is_none_or(|d| d > throttle)
 }
 
@@ -1689,22 +1747,57 @@ mod tests {
 
     #[test]
     fn probe_round_samples_three_times_and_uses_the_successful_median() {
+        use Sample::{Failed, Ms};
         for (samples, expected) in [
-            ([Some(900), Some(100), Some(200)], Some(200)),
-            ([None, Some(100), Some(200)], Some(150)),
-            ([None, Some(100), None], Some(100)),
-            ([None, None, None], None),
+            ([Ms(900), Ms(100), Ms(200)], Some(200)),
+            ([Failed, Ms(100), Ms(200)], Some(150)),
+            ([Failed, Ms(100), Failed], Some(100)),
+            ([Failed, Failed, Failed], None),
         ] {
             let delays = Arc::new(Mutex::new(HashMap::new()));
             let calls = AtomicUsize::new(0);
             let before = Instant::now();
-            let finished = probe_round(&["server".into()], &delays,
-                |_| samples[calls.fetch_add(1, Ordering::SeqCst)]);
+            let finished = probe_round(&["server".into()], &delays, |_, budget| {
+                assert_eq!(budget, PROBE_BUDGET_MS, "a failure is a verdict: no slow sample");
+                samples[calls.fetch_add(1, Ordering::SeqCst)]
+            });
             assert_eq!(calls.load(Ordering::SeqCst), 3);
             let result = delays.lock().unwrap()["server"];
             assert_eq!(result.0, expected);
             assert!(result.1 >= before);
             assert!(finished.is_some_and(|at| at >= result.1), "age starts after the round completes");
+        }
+    }
+
+    #[test]
+    fn three_fast_timeouts_earn_one_slow_sample_whose_figure_stands_alone() {
+        use Sample::{Failed, Ms, Timeout};
+        // (the three fast samples, the slow one) -> (the figure, samples taken)
+        for (fast, slow, expected, taken) in [
+            ([Timeout, Timeout, Timeout], Ms(7172), Some(7172), 4), // a slow link: seconds, not down
+            ([Timeout, Timeout, Timeout], Timeout, None, 4),        // dead at the slow budget too: down
+            ([Timeout, Timeout, Timeout], Failed, None, 4),
+            ([Timeout, Failed, Timeout], Ms(7172), None, 3),        // a failure is a verdict: no slow sample
+            ([Failed, Failed, Failed], Ms(7172), None, 3),
+            ([Timeout, Ms(100), Timeout], Ms(7172), Some(100), 3),  // an answer is the figure
+        ] {
+            let delays = Arc::new(Mutex::new(HashMap::new()));
+            let calls = AtomicUsize::new(0);
+            let (_, rows) = probe_round_rows(&["server".into()], &delays, |_, budget| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 3 {
+                    assert_eq!(budget, PROBE_BUDGET_MS);
+                    fast[n]
+                } else {
+                    assert_eq!(budget, SLOW_PROBE_BUDGET_MS, "the fourth sample is the slow one");
+                    slow
+                }
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), taken, "{fast:?} then {slow:?}");
+            assert_eq!(delays.lock().unwrap()["server"].0, expected, "{fast:?} then {slow:?}");
+            // The latency table row counts the samples that answered: the slow
+            // figure is one sample, like a single fast answer.
+            assert_eq!(rows, vec![("server".to_string(), expected, usize::from(expected.is_some()))], "{fast:?} then {slow:?}");
         }
     }
 
@@ -1718,7 +1811,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let gate = (Mutex::new(false), std::sync::Condvar::new());
         std::thread::scope(|scope| {
-            scope.spawn(|| probe_round(&members, &delays, |tag| {
+            scope.spawn(|| probe_round(&members, &delays, |tag, _| {
                 let n = {
                     let mut calls = calls.lock().unwrap();
                     let count = calls.entry(tag.to_string()).or_default();
@@ -1733,7 +1826,7 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(2));
                 active.fetch_sub(1, Ordering::SeqCst);
-                Some(100)
+                Sample::Ms(100)
             }));
             for _ in 0..10 {
                 if started_rx.recv_timeout(Duration::from_secs(1)).is_err() { break; }
@@ -1755,12 +1848,12 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let slow_calls = AtomicUsize::new(0);
         let next_started = std::thread::scope(|scope| {
-            let worker = scope.spawn(|| probe_round(&members, &delays, |tag| {
+            let worker = scope.spawn(|| probe_round(&members, &delays, |tag, _| {
                 if tag == "server-0" && slow_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
                 }
                 if tag == "server-10" { started_tx.send(()).unwrap(); }
-                Some(100)
+                Sample::Ms(100)
             }));
             let next_started = started_rx.recv_timeout(Duration::from_secs(1)).is_ok();
             let early_results = delays.lock().unwrap().clone();
@@ -1777,7 +1870,7 @@ mod tests {
     #[test]
     fn empty_probe_round_has_no_completion_time() {
         let delays = Arc::new(Mutex::new(HashMap::new()));
-        assert!(probe_round(&[], &delays, |_| panic!("empty pool")).is_none());
+        assert!(probe_round(&[], &delays, |_, _| panic!("empty pool")).is_none());
     }
 
     #[test]
@@ -1812,18 +1905,37 @@ mod tests {
     fn force_probe_is_traffic_aware() {
         use std::time::Duration;
         let s = Some; // brevity
+        let cap = Duration::from_secs(600);
         // A just-recovered router always re-probes, regardless of the rest.
-        assert!(should_force_probe(false, false, true, s(Duration::from_secs(1))));
+        assert!(should_force_probe(false, false, true, s(Duration::from_secs(1)), 0, cap));
         // Never forced when the probe is healthy/pending.
-        assert!(!should_force_probe(false, true, false, None));
+        assert!(!should_force_probe(false, true, false, None, 0, cap));
         // Failed probe + live traffic → retry on the short 15s window.
-        assert!(should_force_probe(true, true, false, s(Duration::from_secs(16))));
-        assert!(!should_force_probe(true, true, false, s(Duration::from_secs(10))), "throttled within 15s");
+        assert!(should_force_probe(true, true, false, s(Duration::from_secs(16)), 0, cap));
+        assert!(!should_force_probe(true, true, false, s(Duration::from_secs(10)), 0, cap), "throttled within 15s");
         // Failed probe, no traffic → slow 60s retry (15s is not yet due).
-        assert!(!should_force_probe(true, false, false, s(Duration::from_secs(20))));
-        assert!(should_force_probe(true, false, false, s(Duration::from_secs(61))));
+        assert!(!should_force_probe(true, false, false, s(Duration::from_secs(20)), 0, cap));
+        assert!(should_force_probe(true, false, false, s(Duration::from_secs(61)), 0, cap));
         // Never forced yet (None) → due immediately when the probe is failing.
-        assert!(should_force_probe(true, true, false, None));
+        assert!(should_force_probe(true, true, false, None, 0, cap));
+    }
+
+    #[test]
+    fn repeated_failures_back_off_to_the_probe_interval() {
+        use std::time::Duration;
+        let s = |secs: u64| Some(Duration::from_secs(secs));
+        let cap = Duration::from_secs(600);
+        // Each retry doubles the wait: 15 s, 30 s, 60 s, 120 s …
+        assert!(!should_force_probe(true, true, false, s(29), 1, cap));
+        assert!(should_force_probe(true, true, false, s(31), 1, cap));
+        assert!(!should_force_probe(true, true, false, s(119), 3, cap));
+        assert!(should_force_probe(true, true, false, s(121), 3, cap));
+        // … and never past the probe interval, which runs a round anyway.
+        assert!(!should_force_probe(true, true, false, s(599), 6, cap));
+        assert!(should_force_probe(true, true, false, s(601), 6, cap));
+        assert!(should_force_probe(true, false, false, s(601), 40, cap), "a long streak does not overflow");
+        // A recovered router still re-probes at once, whatever the streak.
+        assert!(should_force_probe(true, true, true, s(1), 6, cap));
     }
 }
 

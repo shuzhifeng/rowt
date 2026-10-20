@@ -281,7 +281,7 @@ fn draw_identity(buf: &mut Buffer, x0: u16, y0: u16, xr: u16, app: &App, present
     };
     put(buf, rv, y0 + 2, &truncate(&id.server_name, reserve), name_st);
     let (ms, ms_st) = match id.server_ms {
-        Some(v) => (format!("{} ms", v), theme::bold(theme::latency_color(v))),
+        Some(v) => (format::latency(v), theme::bold(theme::latency_color(v))),
         None => ("—".to_string(), theme::fg(theme::dim())),
     };
     put(buf, rv + 1 + reserve, y0 + 2, &ms, ms_st);
@@ -910,7 +910,7 @@ fn draw_scroll_chips(buf: &mut Buffer, x0: u16, y: u16, w: u16, app: &App, prese
             // the same as the header's latency without one.
             let (ms, lat) = match (c.down, c.ms) {
                 (true, _) => ("down".to_string(), bg(theme::fg(theme::dim()))),
-                (false, Some(v)) => (format!("{:>3} ms", v), bg(theme::fg(theme::latency_color(v)))),
+                (false, Some(v)) => (format!("{:>6}", format::latency(v)), bg(theme::fg(theme::latency_color(v)))),
                 (false, None) => ("—".to_string(), bg(theme::fg(theme::dim()))),
             };
             let name_st = if picked {
@@ -1059,7 +1059,7 @@ fn draw_chips(buf: &mut Buffer, x0: u16, y: u16, w: u16, app: &App, present: boo
             let bg = |st: Style| if picked { st.bg(theme::selection_bg()) } else { st };
             let (ms, color) = match (c.down, c.ms) {
                 (true, _) => ("down".to_string(), theme::dim()),
-                (false, Some(v)) => (format!("{v:>3} ms"), theme::latency_color(v)),
+                (false, Some(v)) => (format!("{:>6}", format::latency(v)), theme::latency_color(v)),
                 (false, None) => ("—".to_string(), theme::dim()),
             };
             let prefix = if c.active { "▶ " } else { "" };

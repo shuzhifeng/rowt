@@ -256,7 +256,7 @@ fn oversized_unicode_name_keeps_latency_inside_the_frame() {
     let (buf, hit) = draw(&app, 96, 30);
     let (r, _) = hit.chips[0];
     let text: String = (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect();
-    assert!(!text.contains('…') && text.contains("1234 ms"), "{text}");
+    assert!(!text.contains('…') && text.contains("1.2 s"), "{text}");
     assert_eq!(buf[(95, r.y)].symbol(), "│");
     assert_eq!(hit.strip_rows, 1);
 }
@@ -272,7 +272,7 @@ fn oversized_server_name_shows_its_prefix_and_uses_the_full_name() {
     let (buf, hit) = draw(&app, 40, 11);
     let (r, i) = hit.chips[0];
     let text: String = (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect();
-    assert_eq!(text, format!("{} 1234 ms", &name[..28]));
+    assert_eq!(text, format!("{}  1.2 s", &name[..29]));
     assert!(!text.contains('…') && !text.contains("vwxyz"), "{text}");
     app.update(Action::SelectServer(i));
     app.update(Action::UseServer);
@@ -289,7 +289,7 @@ fn oversized_unicode_name_is_clipped_without_ellipsis_and_preserves_latency() {
     let visible = text.replace(' ', "");
     assert!(visible.starts_with("▶东京"), "{text}");
     assert!(visible.starts_with("▶东京中间中间中间中间中间中"), "{text}");
-    assert!(visible.ends_with("1234ms"), "{text}");
+    assert!(visible.ends_with("1.2s"), "{text}");
     assert!(!visible.contains('…') && !visible.contains("末尾"), "{text}");
     assert_eq!(buf[(39, r.y)].symbol(), "│");
 }
@@ -322,4 +322,18 @@ fn selection_stays_visible_on_resize_and_page_is_clamped_when_pool_shrinks() {
     let (_, hit) = draw(&app, 96, 30);
     assert_eq!(hit.strip_page, 0);
     assert_eq!(hit.chips.len(), 1);
+}
+
+#[test]
+fn a_seconds_long_latency_fits_the_header_beside_the_longest_name_at_96_columns() {
+    // The header budgets `NNN ms` after a name of up to 15 cells; a slow-link
+    // figure reads in seconds so it is no wider, and the frame's edge holds.
+    let mut app = app();
+    app.snap.identity.server_name = "a-fifteen-chars".into();
+    app.snap.identity.name_reserve = 15;
+    app.snap.identity.server_ms = Some(12345);
+    let (buf, _) = draw(&app, 96, 30);
+    let row: String = (0..96).map(|x| buf[(x, 2)].symbol()).collect();
+    assert!(row.contains("server  a-fifteen-chars 12.3 s"), "{row}");
+    assert_eq!(buf[(95, 2)].symbol(), "│", "{row}");
 }

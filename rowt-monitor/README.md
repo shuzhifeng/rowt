@@ -180,7 +180,9 @@ lane / window-tab to activate, a server chip to select it in place, or `sys prox
   rest ordered by latency; pending readings follow, then failed servers.
   Focus with `Tab`, select with `←→`, and page with `↑↓`/`jk`, `PgUp`/`PgDn`,
   or the mouse wheel. All servers are listed: `—` means pending, and `down`
-  means the probe failed. Down servers can be selected but cannot be used with `u`.
+  means the probe failed even with a slow 15-second budget (a slow link reads
+  as seconds, `7.2 s`, not as down). Down servers can be selected but cannot be
+  used with `u`.
   Probes run every 10 minutes; `r` starts a round when idle. The caption shows
   the age of the last completed round. See [Probing](DESIGN.md#54-server-health--the-prober)
   for measurement details.

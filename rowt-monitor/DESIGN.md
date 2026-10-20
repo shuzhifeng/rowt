@@ -359,9 +359,14 @@ shared map; the UI reads the latest.
 - **Sampling:** each node is measured three times sequentially, with at most
   10 workers. Each worker publishes a completed node and takes the next;
   results appear on the next UI data tick. Latency is the median of successful
-  samples (the mean for two, the value for one); all failing means down.
-  Each request has a 5-second timeout. `probe 2m ago` measures time since the
-  last full round completed; `probe —` means no round has completed yet.
+  samples (the mean for two, the value for one). Each request has a 5-second
+  budget; clash answers 504 when the test outran it and 503 when it failed
+  outright. When all three samples ran out of budget, one more is taken with a
+  15-second budget and its figure stands alone — so a high-latency link (an
+  in-flight one measured 7.2 s) reads as seconds, not as every server down.
+  Down means failed at the slow budget too, or a 503. `probe 2m ago` measures
+  time since the last full round completed; `probe —` means no round has
+  completed yet.
 - **Target:** `https://www.gstatic.com/generate_204` (overridable via
   `ROWT_PING_URL`). Google's endpoint is blocked when direct, so it 204s only
   *through* a working escape — this tests real escape reachability, matching
@@ -377,13 +382,16 @@ shared map; the UI reads the latest.
 - **Force / self-heal.** When idle, `r` forces a re-probe; a pool-membership change requests
   one automatically; and — key for network switches — the monitor forces a
   re-probe when the **router transitions down→up** (reload / Wi-Fi change) and
-  keeps re-probing ~every 60s while the active server is failing, so a stale
-  `ERROR` from a pre-switch probe clears within seconds instead of waiting for
-  the 10-min cycle.
+  keeps re-probing while the active server is failing — after 15 s when the
+  escape lane is moving bytes, 60 s when it is not, then twice as long each
+  time up to the probe interval — so a stale `ERROR` from a pre-switch probe
+  clears within seconds instead of waiting for the 10-min cycle, while a link
+  that stays slow is not hammered with back-to-back rounds of the whole pool.
 - **Freshness.** A result is valid for 2× the interval (+margin); older than that
   is treated as *pending* (prober likely dead), never as "down". (Was a fixed
   90s, which emptied the strip between 10-min probes.)
-- **Display.** `up` = last probe succeeded, `down` = tested and failed, pending =
+- **Display.** `up` = last probe succeeded (a second or more reads as `7.2 s`),
+  `down` = tested and failed, pending =
   no fresh reading (shown as `—`, counted as neither up nor down). All pool
   members appear immediately, including before the first probe and while the
   router is down, the active one first and marked `▶` when known (§6);

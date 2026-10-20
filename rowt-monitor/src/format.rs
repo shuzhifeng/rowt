@@ -57,6 +57,32 @@ pub fn age_short(secs: u64) -> String {
     }
 }
 
+/// A probe latency for the header and the strip: `42 ms` under a second, and
+/// `7.2 s` from one second up — the figure the slow sample produces on a
+/// high-latency link, kept short enough to sit beside a 15-character name in
+/// the 96-column header.
+pub fn latency(ms: u32) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", f64::from(ms) / 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::latency;
+
+    #[test]
+    fn under_a_second_stays_in_ms_and_a_second_or_more_reads_in_seconds() {
+        assert_eq!(latency(42), "42 ms");
+        assert_eq!(latency(999), "999 ms");
+        assert_eq!(latency(1000), "1.0 s");
+        assert_eq!(latency(7172), "7.2 s");
+        assert_eq!(latency(12345), "12.3 s");
+    }
+}
+
 #[cfg(test)]
 mod age_tests {
     use super::age_short;

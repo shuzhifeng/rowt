@@ -55,7 +55,8 @@ pub struct Observation {
     /// (b): does the default gateway answer an echo? A gateway that replies
     /// while the probe host does not says the local link is up and something
     /// UPSTREAM is gating us — a walled garden. Nothing answering at all is a
-    /// dead uplink, and the two want opposite responses from the watchdog.
+    /// dead uplink. Both hold recovery (since 2026-10-26); the answer picks
+    /// the words of the hold's log line.
     pub gateway_ok: bool,
     /// On `captive`: the portal's login page, as the probe saw it — the
     /// redirect target when it was redirected, else the probe URL itself (a
@@ -233,7 +234,7 @@ fn suspect_whitelisted_portal(obs: &Observation, st: &State) -> bool {
     obs.captive == Some(CaptiveState::Clear) && !obs.health_ok && moved_recently(obs, st)
 }
 
-fn hold_for_network(obs: &Observation, st: &State, fails: u32, cfg: &Config) -> bool {
+fn hold_for_network(obs: &Observation, fails: u32, cfg: &Config) -> bool {
     // (a), the floor. With the check off every verdict is `unknown` by
     // construction, so the rule would read "never recover" — silently
     // disabling self-healing for anyone who turned portal detection off, which
@@ -251,16 +252,18 @@ fn hold_for_network(obs: &Observation, st: &State, fails: u32, cfg: &Config) -> 
     if fails >= cfg.health_fails.saturating_mul(HOLD_MULTIPLE) {
         return false;
     }
-    // (b) + (c). `unknown` on its own is ambiguous: a garden that blocks DNS, a
-    // dead uplink and a genuinely wedged tunnel all produce it, and only the
-    // first wants recovery suppressed. So require corroboration before
-    // suppressing — either the local link is demonstrably up while the probe
-    // host is not (b), or we moved recently, which is when a portal is likely
-    // and a wedge is not (c). With neither, the old behaviour stands and a
-    // reload is as good a guess as any.
-    if !obs.gateway_ok && !moved_recently(obs, st) {
-        return false;
-    }
+    // Anything else the direct probe could not reach: hold. Until 2026-10-26
+    // an `unknown` held only when corroborated — the gateway answering (b),
+    // or a move within NET_CHANGE_WINDOW (c) — and with neither the tick
+    // reloaded, "as good a guess as any". Then a corp Wi-Fi subnet with no
+    // exit (gateway silent, the move long past) took eight reloads in 80
+    // minutes, each dropping every open connection and each logged as a
+    // tunnel fault. A silent gateway under a failed direct probe is not
+    // ambiguous: neither probe passes through sing-box, so a wedged router
+    // cannot produce that pair, and the next failed probes after the network
+    // returns still catch a tunnel that is truly stuck. The hatch above bounds
+    // the one case this delays (Hong, rowt #s21). `gateway_ok` now picks only
+    // the words of the log line; (c) stays for `suspect_whitelisted_portal`.
     true
 }
 
@@ -493,17 +496,24 @@ pub fn netcheck(obs: &Observation, st: &State, cfg: &Config) -> Outcome {
                             obs.health_flows
                         )));
                         s.health_fails = 0;
-                    } else if hold_for_network(obs, &s, n, cfg) {
-                        // The 2026-09-14 hotel, exactly: captive=unknown, three
-                        // failed tunnel probes, a reload that could not possibly
-                        // succeed because the machine had no path to anything —
-                        // and it burned the 600s cooldown and logged a failure
-                        // that reads as a tunnel problem.
-                        a.push(Action::Log(format!(
-                            "tunnel wedged ({n} consecutive probe failures) — but the captive probe reached nothing either \
-                             (captive={}), so the NETWORK is the suspect and a reload cannot fix an uplink; holding off recovery",
-                            obs.captive.map(|c| c.as_str()).unwrap_or("none")
-                        )));
+                    } else if hold_for_network(obs, n, cfg) {
+                        // The 2026-09-14 hotel and the 2026-10-26 subnet with
+                        // no exit: a reload that could not possibly succeed
+                        // because the machine had no path to anything — and it
+                        // burned the 600s cooldown and logged a failure that
+                        // reads as a tunnel problem. Say what the two direct
+                        // probes saw, in the words `rowt status` uses for the
+                        // same measurement (`diag::uplink_verdict`). Mirrors
+                        // `_watch_health`, word for word.
+                        let nic = obs.iface.as_deref().unwrap_or("the NIC");
+                        let cap = obs.captive.map(|c| c.as_str()).unwrap_or("none");
+                        a.push(Action::Log(if obs.gateway_ok {
+                            format!("{nic} reaches its gateway but nothing beyond it ({n} consecutive probe failures, captive={cap}) \
+                                     — the network's exit is gating us, not the tunnel; a reload cannot fix this, holding off recovery")
+                        } else {
+                            format!("nothing answers over {nic}, not even its gateway ({n} consecutive probe failures, captive={cap}) \
+                                     — the network is down or walled, not the tunnel; a reload cannot fix this, holding off recovery")
+                        }));
                     } else {
                         // Once per streak, not once per tick: the streak only
                         // grows from here while a cooldown holds recovery off.
@@ -943,7 +953,8 @@ mod tests {
         let r = wedged(&o, &Config::default());
         assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover(_))),
                 "a reload cannot fix an uplink");
-        assert!(logs(&r).iter().any(|l| l.contains("NETWORK is the suspect")));
+        assert!(logs(&r).iter().any(|l| l.starts_with("en0 reaches its gateway but nothing beyond it (3 consecutive probe failures, captive=unknown)")),
+                "{:?}", logs(&r));
     }
 
     /// `unknown` is only evidence when someone actually looked. With
@@ -962,25 +973,31 @@ mod tests {
         assert!(r.actions.iter().any(|a| matches!(a, Action::Recover(_))));
     }
 
-    /// (b) and (c) are what make `unknown` mean something. With neither — the
-    /// gateway silent too, and no recent move — nothing distinguishes a garden
-    /// from a dead uplink or a genuinely wedged tunnel, so the old behaviour
-    /// stands and a reload is as good a guess as any.
+    /// The 2026-10-26 subnet with no exit: the direct probe reached nothing and
+    /// the gateway did not answer either, long after the last move. Until then
+    /// this was "nothing to corroborate the unknown, reload anyway", and eight
+    /// reloads in 80 minutes fixed nothing. Neither probe passes through
+    /// sing-box, so a wedged router cannot produce that pair: hold, and say
+    /// what the NIC and its gateway answered.
     #[test]
-    fn an_unknown_with_nothing_to_corroborate_it_still_recovers() {
+    fn a_silent_gateway_under_a_failed_direct_probe_holds_too() {
         let mut o = running();
         o.health_ok = false;
         o.captive = Some(CaptiveState::Unknown);
         o.gateway_ok = false;
         let r = wedged(&o, &Config::default());
-        assert!(r.actions.iter().any(|a| matches!(a, Action::Recover(_))));
+        assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover(_))),
+                "a reload cannot fix a dead first hop");
+        assert!(logs(&r).iter().any(|l| l.starts_with("nothing answers over en0, not even its gateway (3 consecutive probe failures, captive=unknown)")
+                                       && l.contains("not the tunnel")),
+                "{:?}", logs(&r));
     }
 
-    /// (c) on its own is enough: the gateway may be silent because the portal
-    /// blackholes everything, but a network we joined minutes ago is far likelier
-    /// to be showing us a login page than to have wedged the tunnel.
+    /// A move no longer decides the hold (the verdict does); it only ever
+    /// corroborated a silent gateway, which now holds on its own. Recent or
+    /// stale, the outcome is the same hold.
     #[test]
-    fn a_recent_move_corroborates_the_garden_on_its_own() {
+    fn a_move_recent_or_stale_no_longer_changes_the_hold() {
         let mut o = running();
         o.health_ok = false;
         o.captive = Some(CaptiveState::Unknown);
@@ -999,11 +1016,12 @@ mod tests {
         }
         let r = netcheck(&o, &st, &cfg);
         assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover(_))));
-        // …and the same move, long enough ago, stops corroborating anything.
+        // …and the same move, long enough ago, holds just the same now.
         let mut stale = st.clone();
         stale.last_net_change = o.now - NET_CHANGE_WINDOW - 1;
         let r2 = netcheck(&o, &stale, &cfg);
-        assert!(r2.actions.iter().any(|a| matches!(a, Action::Recover(_))));
+        assert!(!r2.actions.iter().any(|a| matches!(a, Action::Recover(_))));
+        assert!(logs(&r2).iter().any(|l| l.starts_with("nothing answers over en0")), "{:?}", logs(&r2));
     }
 
     /// And the floor under the floor: a probe host that has become permanently
@@ -1011,23 +1029,26 @@ mod tests {
     /// recovery for good.
     #[test]
     fn a_hold_gives_up_once_the_network_story_has_run_long_enough() {
-        let mut o = running();
-        o.health_ok = false;
-        o.captive = Some(CaptiveState::Unknown);
-        o.gateway_ok = true;
-        let cfg = Config::default();
-        let mut st = State { last_net_id: Some(o.net_id.clone()), ..Default::default() };
-        let mut recovered = None;
-        for tick in 1..=(cfg.health_fails * HOLD_MULTIPLE + 2) {
-            let r = netcheck(&o, &st, &cfg);
-            if r.actions.iter().any(|a| matches!(a, Action::Recover(_))) {
-                recovered = Some(tick);
-                break;
+        // Gateway answering or silent alike: the hatch is what bounds both.
+        for gateway_ok in [true, false] {
+            let mut o = running();
+            o.health_ok = false;
+            o.captive = Some(CaptiveState::Unknown);
+            o.gateway_ok = gateway_ok;
+            let cfg = Config::default();
+            let mut st = State { last_net_id: Some(o.net_id.clone()), ..Default::default() };
+            let mut recovered = None;
+            for tick in 1..=(cfg.health_fails * HOLD_MULTIPLE + 2) {
+                let r = netcheck(&o, &st, &cfg);
+                if r.actions.iter().any(|a| matches!(a, Action::Recover(_))) {
+                    recovered = Some(tick);
+                    break;
+                }
+                st = r.state;
             }
-            st = r.state;
+            assert_eq!(recovered, Some(cfg.health_fails * HOLD_MULTIPLE),
+                       "gateway_ok={gateway_ok}: recovery must resume at the multiple, neither sooner nor never");
         }
-        assert_eq!(recovered, Some(cfg.health_fails * HOLD_MULTIPLE),
-                   "recovery must resume at the multiple, neither sooner nor never");
     }
 
     #[test]

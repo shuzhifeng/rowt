@@ -59,7 +59,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.10"
+ROWT_VERSION="3.6.11"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -5554,7 +5554,9 @@ _watch_shadow() {
       --argjson lastnetchg "${_SH_LASTNETCHG0:-0}" \
       --argjson gwok "${_SH2_GWOK:-false}" \
       --argjson now "${_SH2_NOW:-$(date +%s)}" \
-      '{obs:{proxy_intent:"", captive:"clear", active_service:$svc, proxy_any_on:true,
+      --arg cap "${_SH_CAP:-clear}" \
+      --argjson capoff "$([ "${ROWT_CAPTIVE_CHECK:-1}" = 1 ] && echo false || echo true)" \
+      '{obs:{proxy_intent:"", captive:$cap, captive_check_disabled:$capoff, active_service:$svc, proxy_any_on:true,
              host_running:true, intent:"up", boot_matches:true, iface:$ifc,
              proxy_pointing_ok:$pointing, proxy_bypass_ok:$bypass,
              bound_iface:$cur, net_id:$nid, health_ok:$health, health_slow:$slow, health_flows:$flows, now:$now, gateway_ok:$gwok,
@@ -5773,16 +5775,27 @@ _watch_gateway_alive() { # $1=gateway
 }
 
 # Should recovery be held because the NETWORK, not the tunnel, is the problem?
-# Mirrors `rowt_core::watch::hold_for_network`; watch-diff compares the two, so
-# the conditions AND their order have to match.
+# Mirrors `rowt_core::watch::hold_for_network`; watch-shadow compares the two,
+# so the conditions AND their order have to match.
 #
 # Recovery is for a tunnel wedged while the network works. That needs POSITIVE
 # evidence the physical path is fine, and a `clear` verdict is exactly it: a
 # direct, unproxied fetch of a known host succeeded. "not captive" is not the
 # same claim — `unknown` means we reached nothing at all, and no amount of
 # restarting sing-box fixes a broken uplink.
-# (c): did the network change recently enough for a portal to be the likelier
-# explanation than a wedged tunnel?
+#
+# Until 2026-10-26 an `unknown` held only when corroborated — the gateway
+# answering a ping, or a move within 15 min — and with neither it reloaded,
+# "as good a guess as any". Then a corp Wi-Fi subnet with no exit (gateway
+# silent, the move long past) took eight reloads in 80 minutes, each dropping
+# every open connection and each logged as a tunnel fault. A silent gateway
+# under a failed direct probe is not ambiguous: neither probe passes through
+# sing-box, so a wedged router cannot produce that pair, and the next failed
+# probes after the network returns still catch a tunnel that is truly stuck.
+# So every non-clear verdict holds, bounded by the hatch below (Hong, #s21);
+# the gateway's answer now picks only the words of the log line.
+# (c) stays for `suspect_whitelisted_portal`: did the network change recently
+# enough for a portal to be the likelier explanation than a wedged tunnel?
 _watch_moved_recently() { # $1=now
   local t; t="$(cat "$WATCH_NETCHANGE" 2>/dev/null || echo 0)"
   case "$t" in ''|*[!0-9]*) return 1 ;; esac
@@ -5790,7 +5803,7 @@ _watch_moved_recently() { # $1=now
   [ "$(( ${1:-0} - t ))" -lt "$NET_CHANGE_WINDOW" ]
 }
 
-_watch_hold_for_network() { # $1=captive verdict  $2=failures  $3=gateway_ok(0|1)  $4=now
+_watch_hold_for_network() { # $1=captive verdict  $2=failures
   # The floor: with the check off every verdict is `unknown` by construction,
   # so keying on the verdict alone would read "never recover" and silently
   # disable self-healing for anyone who switched portal detection off.
@@ -5802,10 +5815,8 @@ _watch_hold_for_network() { # $1=captive verdict  $2=failures  $3=gateway_ok(0|1
   # for good. Only reachable while the tunnel is ALSO failing, so a dead probe
   # host on a healthy tunnel never gets here.
   if [ "${2:-0}" -ge "$(( HEALTH_FAILS * HOLD_MULTIPLE ))" ]; then return 1; fi
-  # (b) + (c): `unknown` alone is ambiguous — a garden that blocks DNS, a dead
-  # uplink and a genuinely wedged tunnel all produce it, and only the first
-  # wants recovery suppressed. Corroborate before suppressing.
-  if [ "${3:-0}" != 1 ] && ! _watch_moved_recently "${4:-0}"; then return 1; fi
+  # Anything else the direct probe could not reach: hold. See the note above
+  # for why a silent gateway is no longer the exception.
   return 0
 }
 
@@ -5866,8 +5877,10 @@ _watch_health() { # $1=iface  $2=captive verdict
     _wact "log escape tunnel probe failed ($fails/$HEALTH_FAILS)"
     return 0
   fi
-  # (b): only probed when it could matter — the rule short-circuits on a clear
-  # verdict, so a healthy tick pays no ping. rowt-rs applies the same condition.
+  # (b): only probed when it could matter — the hold short-circuits on a clear
+  # verdict, so a healthy tick pays no ping. Since 2026-10-26 the answer picks
+  # the words of the hold's log line, not the decision. rowt-rs applies the
+  # same condition.
   local gwok=0 gw now; now="${_SH2_NOW:-$(date +%s)}"
   if [ "$cap" != clear ]; then
     gw="$(_watch_gateway "${1:-}")"
@@ -5901,11 +5914,18 @@ _watch_health() { # $1=iface  $2=captive verdict
     rm -f "$WATCH_HEALTH"
     return 0
   fi
-  if _watch_hold_for_network "$cap" "$fails" "$gwok" "$now"; then
-    # The 2026-09-14 hotel, exactly: the reload could not possibly succeed, and
-    # it burned the 600s cooldown and logged a failure that reads as a tunnel
-    # problem.
-    local m="tunnel wedged ($fails consecutive probe failures) — but the captive probe reached nothing either (captive=${cap:-none}), so the NETWORK is the suspect and a reload cannot fix an uplink; holding off recovery"
+  if _watch_hold_for_network "$cap" "$fails"; then
+    # The 2026-09-14 hotel and the 2026-10-26 subnet with no exit: the reload
+    # could not possibly succeed, and it burned the 600s cooldown and logged a
+    # failure that reads as a tunnel problem. Say what the two direct probes
+    # saw, in the words `rowt status` uses for the same measurement
+    # (`_uplink_verdict`). Mirrors rowt_core::watch, word for word.
+    local m
+    if [ "$gwok" = 1 ]; then
+      m="${1:-the NIC} reaches its gateway but nothing beyond it ($fails consecutive probe failures, captive=${cap:-none}) — the network's exit is gating us, not the tunnel; a reload cannot fix this, holding off recovery"
+    else
+      m="nothing answers over ${1:-the NIC}, not even its gateway ($fails consecutive probe failures, captive=${cap:-none}) — the network is down or walled, not the tunnel; a reload cannot fix this, holding off recovery"
+    fi
     _watch_log "$m"
     _wact "log $m"
     return 0

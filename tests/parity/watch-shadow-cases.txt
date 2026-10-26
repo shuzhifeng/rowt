@@ -50,3 +50,9 @@ ROWT_CAPTIVE_RETRY=0,0 ROWT_CAPTIVE_URL=http://127.0.0.1:9/x watch tick | probes
 # a request out, so the verdict comes entirely from the DNS-free fallback; this
 # is the case that took six real minutes to detect before that existed.
 PARITY_SCENARIO=captive-no-dns watch tick | captive portal detected — dropping system proxy
+# A Wi-Fi with no exit (2026-10-26, rowt #s19/#s21): the router is up, the
+# tunnel probe fails for the third tick, the captive probe reaches nothing and
+# the gateway is silent (no netstat answer, so no ping). Phase two must HOLD and
+# say what the NIC and its gateway answered, in rowt status's own words — not
+# reload, which is what this world got before.
+PARITY_SCENARIO=watch-no-exit ROWT_CAPTIVE_URL=http://127.0.0.1:9/x watch tick | nothing answers over en0, not even its gateway

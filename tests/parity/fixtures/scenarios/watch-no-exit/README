@@ -1,0 +1,15 @@
+watch-no-exit — the 2026-10-26 corp Wi-Fi subnet with no internet exit.
+
+The router is up (host.pid.self), the system proxy points at it, and the
+machine has NOT moved (watch.net already holds this sandbox's net id, so phase
+two reaches the health check instead of logging a move). watch.health seeds a
+streak of two, so this tick is the third failed tunnel probe: the clash delay
+URL has no fixture, the slower confirmation probe fails the same way, and the
+connection list is empty (no fresh flow to veto a wedge). The captive probe is
+pointed at http://127.0.0.1:9/x (unknown), and `netstat -rn -f inet` has no
+fixture, so the NIC has no gateway to ping: a silent first hop.
+
+Expected: the tick HOLDS and logs "nothing answers over en0, not even its
+gateway (3 consecutive probe failures, captive=unknown) — …", not a reload.
+Before 2026-10-26 this exact world reloaded ("nothing to corroborate the
+unknown"), which is what the shadow case pins.

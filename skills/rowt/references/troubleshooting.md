@@ -10,6 +10,14 @@
    - `via proxy:` a real fetch through the escape lane, 8 s budget. `HTTP 000 … no answer
      within 8s` is a slow link or a dead tunnel (check `rowt connections` for live
      traffic before concluding which); `tunnel not reachable` failed outright;
+   - `uplink:` (printed only after a failed `via proxy:`): the same path with the
+     router out of it — the captive-probe host fetched unproxied over the physical
+     NIC, then a ping at that NIC's gateway. It names one of three faults: the
+     **tunnel** (`rowt restart`, or another server), a **login page** (`rowt proxy
+     off`, log in, `rowt proxy on`), or the **network itself** (nothing answers over
+     the NIC, or only its gateway does). A restart cannot fix the last one — rejoin
+     the Wi-Fi or switch networks. 2026-10-26: a corp Wi-Fi subnet with no exit read
+     as a dead tunnel through eight watchdog reloads and two restarts;
    - `watchdog:` `loaded`, `NOT loaded — … rowt watch refresh`, or `not installed`,
      and whether its plist is STALE.
 2. Logs in `~/.config/rowt/log/`:

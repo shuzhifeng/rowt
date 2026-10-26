@@ -468,6 +468,19 @@ as the only VPN, "direct" just meant "off my tunnel". escape splits that
     deletes it), there is no API to store a median, and the group skips re-testing
     any server whose figure is younger than its interval — so it also switches on
     whatever single sample another prober wrote last.
+- **A network with no exit (not rowt's to fix).** `restart` and `reload`
+  recreate sing-box and the system-proxy setting; they leave the Wi-Fi
+  association, the DHCP lease and the route table alone. When those are the
+  broken part — 2026-10-26, a corp Wi-Fi subnet whose internet exit was down
+  for 85 minutes: eight watchdog reloads and two hands-on restarts each
+  brought the router up and changed nothing, a hop to a hotspot and back
+  (which landed on another subnet) fixed it in a minute — no rowt command can
+  help, and every tunnel-shaped message is a wrong lead. So `rowt status`
+  follows a failed `via proxy:` with an `uplink:` line measured with the
+  router out of the path (the captive probe URL fetched unproxied over the
+  physical NIC, then a ping at its gateway) that names the tunnel, a login
+  page, or the network, and says when a restart cannot fix it. `rowt doctor`
+  reaches the same verdict as `NET_DOWN`.
 - **Corp VPN down.** `corp` traffic (no bound socket) follows the routing table;
   with corp down there's no route to intranet ranges, so those connections fail
   until you reconnect — expected.

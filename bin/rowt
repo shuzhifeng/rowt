@@ -59,7 +59,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.9"
+ROWT_VERSION="3.6.10"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -5129,6 +5129,53 @@ cmd_explain() {
 
 # At-a-glance state + config validity. (It absorbed an old 'doctor'; today's
 # 'doctor' looks at the machine AROUND rowt instead — see cmd_doctor.)
+# `via proxy: HTTP 000` names the symptom. Whose fault it is — the tunnel, a
+# login page, or the network itself — is what the person needs next, because
+# the fixes point three ways and only the first is a rowt command.
+# 2026-10-26, corp Wi-Fi: the Mac joined a subnet whose internet exit was
+# broken. Eight watchdog reloads and two hands-on restarts each brought the
+# router up and changed nothing: `restart` recreates sing-box and the system
+# proxy and leaves the Wi-Fi association, the lease and the routes — the parts
+# that were broken. A hop to a hotspot and back fixed it in a minute. Every
+# line on this screen said "tunnel"; nothing said the NIC itself reached
+# nothing.
+#
+# So, only once the proxy check has failed: the watchdog's own two
+# measurements with the router out of the path — the captive probe URL fetched
+# unproxied and bound to the physical NIC (6 s), then one echo at that NIC's
+# gateway — and a verdict in those terms. Same argv as `_captive_probe_once`
+# and `_watch_gateway_alive`, so watch.log and this line describe one thing.
+# Mirrors `diag::uplink_verdict` in rowt-rs, word for word.
+_uplink_verdict() { # $1=mode
+  local ifc url host code rc=0 gw why
+  ifc="$(detect_iface 2>/dev/null || true)"
+  if [ -z "$ifc" ]; then
+    echo "no physical interface is up — offline; the router has nothing to ride on"; return 0
+  fi
+  url="${ROWT_CAPTIVE_URL:-http://captive.apple.com/hotspot-detect.html}"; host="$(_url_host "$url")"
+  code="$(curl -s --noproxy '*' --interface "$ifc" --max-time 6 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)" || rc=$?
+  if [ "$rc" = 0 ] && [ -n "$code" ] && [ "$code" != 000 ]; then
+    case "$code" in
+      30[0-9]|511) echo "$ifc reaches a login page, not the internet ($host answered HTTP $code) — a portal is in the way: $PROG proxy off, log in, then $PROG proxy on" ;;
+      *) if [ "${1:-}" = local ]; then
+           echo "$ifc reaches the internet on its own ($host answered HTTP $code); only google is unreachable direct from here (a firewall in the way, or google itself) — $PROG up host puts a tunnel in the path"
+         else
+           echo "$ifc reaches the internet on its own ($host answered HTTP $code), so the fault is the tunnel: $PROG restart, or another server ($PROG use best)"
+         fi ;;
+    esac
+    return 0
+  fi
+  if [ "$rc" = 0 ]; then why="no answer"; else why="$(_curl_why "$rc")"; fi
+  gw="$(_watch_gateway "$ifc")"
+  if [ -z "$gw" ]; then
+    echo "$ifc has no default route — the network is not up yet; nothing a $PROG restart can change"
+  elif _watch_gateway_alive "$gw"; then
+    echo "$ifc reaches its gateway but nothing beyond it ($host: $why) — the network's exit is broken, not the router; a $PROG restart cannot fix this: rejoin the Wi-Fi or switch networks"
+  else
+    echo "nothing answers over $ifc, not even its gateway — the NETWORK is down, not the router; a $PROG restart cannot fix this: rejoin the Wi-Fi or switch networks"
+  fi
+}
+
 cmd_status() {
   local mode; mode="$(sget mode)"; mode="${mode:-?}"
   if [ "$mode" = "local" ]; then
@@ -5179,6 +5226,8 @@ cmd_status() {
     else
       echo "via proxy:    HTTP $vc (google, escape lane)$why"
     fi
+    # 000 says the router did not deliver; it does not say whose fault that is.
+    [ "$vc" != 000 ] || echo "uplink:       $(_uplink_verdict "$mode")"
   fi
   # The watchdog. Loaded is the floor, the plist's generation the second word;
   # a status that said nothing here looked healthy through an hour with no agent

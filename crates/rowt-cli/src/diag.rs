@@ -318,6 +318,69 @@ pub fn mask_url(l: &str) -> String {
     l.to_string()
 }
 
+/// `via proxy: HTTP 000` names the symptom; this names whose fault it is — the
+/// tunnel, a login page, or the network itself — because the fixes point three
+/// ways and only the first is a rowt command. `_uplink_verdict`, word for word.
+///
+/// 2026-10-26, corp Wi-Fi: the Mac joined a subnet whose internet exit was
+/// broken. Eight watchdog reloads and two hands-on restarts each brought the
+/// router up and changed nothing — `restart` recreates sing-box and the system
+/// proxy and leaves the Wi-Fi association, the lease and the routes, the parts
+/// that were broken — and every line on the status screen said "tunnel".
+///
+/// Only run once the proxy check has failed. The two measurements are the
+/// watchdog's own, with the router out of the path: the captive probe URL
+/// fetched unproxied and bound to the physical NIC (6 s), then one echo at that
+/// NIC's gateway — the same argv, so watch.log and this line describe one thing.
+pub fn uplink_verdict(p: &impl Platform, mode: &str) -> String {
+    let Some(ifc) = p.detect_iface() else {
+        return "no physical interface is up — offline; the router has nothing to ride on".into();
+    };
+    let url = env_or("ROWT_CAPTIVE_URL", "http://captive.apple.com/hotspot-detect.html");
+    let host = crate::watch::url_host(&url).unwrap_or_default();
+    let out = Command::new("curl")
+        .args(["-s", "--noproxy", "*", "--interface", &ifc, "--max-time", "6", "-o", "/dev/null", "-w", "%{http_code}", &url])
+        .stderr(Stdio::null()).output();
+    let (code, rc) = match out {
+        Ok(o) => (String::from_utf8_lossy(&o.stdout).trim().to_string(), o.status.code()),
+        Err(_) => (String::new(), None),
+    };
+    let reached = rc == Some(0) && !code.is_empty() && code != "000";
+    // The gateway is only asked when the probe reached nothing — the shell
+    // does the same, or the two would disagree about the argv.
+    let gateway = if reached { None } else { Some(p.gateway(&ifc).map(|g| p.gateway_alive(&g))) };
+    uplink_words(&ifc, &host, mode, reached.then_some(code.as_str()), rc, gateway)
+}
+
+/// The verdict itself, from what the probes said. `code` is the HTTP status
+/// when the direct fetch reached something; `gateway` is `None` when it was not
+/// asked, `Some(None)` when the NIC has no default route, `Some(Some(alive))`
+/// otherwise. Pure, so the words are testable.
+fn uplink_words(ifc: &str, host: &str, mode: &str, code: Option<&str>, rc: Option<i32>, gateway: Option<Option<bool>>) -> String {
+    const PROG: &str = crate::PROG;
+    if let Some(code) = code {
+        return if (code.len() == 3 && code.starts_with("30") && code.as_bytes()[2].is_ascii_digit()) || code == "511" {
+            format!("{ifc} reaches a login page, not the internet ({host} answered HTTP {code}) — a portal is in the way: {PROG} proxy off, log in, then {PROG} proxy on")
+        } else if mode == "local" {
+            format!("{ifc} reaches the internet on its own ({host} answered HTTP {code}); only google is unreachable direct from here (a firewall in the way, or google itself) — {PROG} up host puts a tunnel in the path")
+        } else {
+            format!("{ifc} reaches the internet on its own ({host} answered HTTP {code}), so the fault is the tunnel: {PROG} restart, or another server ({PROG} use best)")
+        };
+    }
+    let why = match rc {
+        Some(0) => "no answer".to_string(),
+        Some(rc) => crate::watch::curl_why(rc),
+        // The shell cannot fail to run curl at all; the nearest thing it
+        // would report is the exit status it never got.
+        None => crate::watch::curl_why(127),
+    };
+    match gateway {
+        Some(None) => format!("{ifc} has no default route — the network is not up yet; nothing a {PROG} restart can change"),
+        Some(Some(true)) => format!("{ifc} reaches its gateway but nothing beyond it ({host}: {why}) — the network's exit is broken, not the router; a {PROG} restart cannot fix this: rejoin the Wi-Fi or switch networks"),
+        _ => format!("nothing answers over {ifc}, not even its gateway — the NETWORK is down, not the router; a {PROG} restart cannot fix this: rejoin the Wi-Fi or switch networks"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +398,45 @@ mod tests {
     fn a_url_too_short_to_mask_is_left_alone() {
         // The sed only rewrites when 10 characters follow the scheme.
         assert_eq!(mask_url("https://a.b"), "https://a.b");
+    }
+
+    #[test]
+    fn a_dead_first_hop_blames_the_network_not_the_router() {
+        // 2026-10-26: curl timed out, netstat had a gateway, ping got nothing.
+        let w = uplink_words("en0", "captive.apple.com", "host", None, Some(28), Some(Some(false)));
+        assert!(w.starts_with("nothing answers over en0, not even its gateway — the NETWORK is down, not the router"), "{w}");
+        assert!(w.contains("rowt restart cannot fix this: rejoin the Wi-Fi or switch networks"), "{w}");
+    }
+
+    #[test]
+    fn a_live_gateway_with_no_exit_names_the_exit_and_the_curl_reason() {
+        let w = uplink_words("en0", "captive.apple.com", "host", None, Some(28), Some(Some(true)));
+        assert!(w.starts_with("en0 reaches its gateway but nothing beyond it (captive.apple.com: timed out)"), "{w}");
+        assert!(w.contains("not the router"), "{w}");
+    }
+
+    #[test]
+    fn a_reachable_internet_blames_the_tunnel_unless_there_is_none() {
+        let w = uplink_words("en0", "captive.apple.com", "host", Some("200"), Some(0), None);
+        assert!(w.contains("so the fault is the tunnel: rowt restart, or another server (rowt use best)"), "{w}");
+        let l = uplink_words("en0", "captive.apple.com", "local", Some("200"), Some(0), None);
+        assert!(l.contains("only google is unreachable direct from here"), "{l}");
+    }
+
+    #[test]
+    fn a_redirect_or_511_is_a_portal() {
+        for code in ["302", "307", "511"] {
+            let w = uplink_words("en0", "captive.apple.com", "host", Some(code), Some(0), None);
+            assert!(w.contains("a portal is in the way: rowt proxy off, log in, then rowt proxy on"), "{code}: {w}");
+        }
+        // 403 is a corp web filter as often as a portal: the internet answered.
+        let w = uplink_words("en0", "captive.apple.com", "host", Some("403"), Some(0), None);
+        assert!(w.contains("reaches the internet on its own"), "{w}");
+    }
+
+    #[test]
+    fn no_default_route_is_a_network_still_coming_up() {
+        let w = uplink_words("en0", "captive.apple.com", "host", None, Some(7), Some(None));
+        assert_eq!(w, "en0 has no default route — the network is not up yet; nothing a rowt restart can change");
     }
 }

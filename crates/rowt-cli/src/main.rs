@@ -2068,6 +2068,11 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                     (true, false, false) => "  — tunnel not reachable",
                 };
                 o.push(format!("via proxy:    HTTP {vc} ({lane}){tail}"));
+                // 000 says the router did not deliver; it does not say whose
+                // fault that is (`_uplink_verdict`).
+                if vc == "000" {
+                    o.push(format!("uplink:       {}", diag::uplink_verdict(&p, &mode)));
+                }
             }
             o.push(watch::status_line());
             Ok(o.join("\n"))

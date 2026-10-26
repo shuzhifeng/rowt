@@ -104,7 +104,7 @@ fn captive_log(logdir: &Path, msg: &str) {
 
 /// curl's exit status is the discriminator worth keeping; the same few names
 /// the shell gives them, so the two files read identically.
-fn curl_why(rc: i32) -> String {
+pub(crate) fn curl_why(rc: i32) -> String {
     match rc {
         6 => "could not resolve host".into(),
         7 => "could not connect".into(),
@@ -552,7 +552,7 @@ fn probe_verdict(body: &str, url: &str) -> (CaptiveState, Option<String>, Option
 }
 
 /// The host of a URL — no port, no query, no fragment. `_url_host`.
-fn url_host(url: &str) -> Option<String> {
+pub(crate) fn url_host(url: &str) -> Option<String> {
     // A scheme is required: without one there is no authority to read, and
     // `javascript:alert(1)` would otherwise yield a "host" of `javascript`.
     let rest = url.split_once("://").map(|(_, r)| r)?;

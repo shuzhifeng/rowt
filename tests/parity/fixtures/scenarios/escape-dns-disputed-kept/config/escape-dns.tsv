@@ -1,0 +1,2 @@
+# rowt escape-server names, resolved by DoH: name, verdict, addresses given to sing-box, source, refused (addr=reason@source), disputed (addr@source), UTC time
+entry-a.example	ok	192.0.2.10	223.5.5.5+1.12.12.12	-	-	2000-01-01 00:00:00

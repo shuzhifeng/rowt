@@ -68,6 +68,25 @@ system_profiler security osascript defaults sing-box"
 die() { echo "parity: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Every stand-in router make_sandbox starts is written down here, so the run
+# stops the ones still alive when it ends: by the pid it recorded, and only
+# while that pid is still a `sleep 300` (a case may have stopped it already,
+# and the pid been reused). Disowned and outside any case's session, they
+# would otherwise outlive the run by five minutes.
+ROUTER_PIDS="$(mktemp "${TMPDIR:-/tmp}/parity-routers.XXXXXX")" || die "mktemp failed"
+stop_routers() {
+  local pid
+  [ -f "$ROUTER_PIDS" ] || return 0
+  while read -r pid; do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if [ "$(ps -p "$pid" -o command= 2>/dev/null || true)" = "sleep 300" ]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done < "$ROUTER_PIDS"
+  rm -f "${ROUTER_PIDS:?}"
+}
+trap stop_routers EXIT
+
 # Time-box a case AND take down what it spawned, in a session it cannot escape.
 # Used as: perl -e "$TMO" <seconds> <cmd> [args…]
 #
@@ -163,12 +182,13 @@ make_sandbox() { # $1=outdir  [$2=scenario]
   # `_router_stop` reads that pidfile and kills it. The harness shot itself, the
   # case died with rc 143, and it read as a timeout. A throwaway process is a
   # truthful stand-in for a router: it can be signalled, and nothing cares when
-  # it is. It lives in the harness's process group, so it cannot outlive the run.
+  # it is. Its pid goes to ROUTER_PIDS too, so the run stops it at exit.
   if [ -f "$cfg/host.pid.self" ]; then
     # Detached from the harness's stdio as well: it outlives the case, and an
     # inherited pipe would keep a caller's `| tail` waiting for a process that
     # has nothing to say.
     sleep 300 >/dev/null 2>&1 </dev/null & echo "$!" > "$cfg/host.pid"
+    echo "$!" >> "$ROUTER_PIDS"
     # Off the job table, or reaping it prints "Terminated: 15" into a gate's
     # output the moment a case actually stops the router.
     disown 2>/dev/null || true

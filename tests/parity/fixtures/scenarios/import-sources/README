@@ -1,0 +1,11 @@
+A manual set four imports deep, for `server import --replace`. manual-sources.tsv
+says an earlier import of a file named server-dump.json brought in alpha,
+retired and shared, and a Shadowrocket apply brought in shared too; byhand has
+no line (added with `server add`).
+
+Re-importing tests/parity/fixtures/server-dump.json (alpha, gamma) with
+--replace must drop alpha and retired, keep shared (another source still
+claims it) and byhand (no source), add alpha and gamma back, and record
+file:server-dump.json -> alpha, gamma beside shadowrocket -> shared. Without
+--replace nothing is dropped. `server rm retired` and `server clear` must prune
+the lines of the servers they remove.

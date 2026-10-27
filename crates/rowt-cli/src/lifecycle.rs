@@ -181,12 +181,25 @@ pub fn host_running(ctx: &Ctx) -> Option<i32> {
 
 // ---------------------------------------------------------------- render
 
+/// `_auto_interval`: ROWT_AUTO_INTERVAL, else the saved `use auto --every`, else 20m.
+pub fn auto_interval(ctx: &Ctx) -> String {
+    rowt_core::render::auto_interval(std::env::var("ROWT_AUTO_INTERVAL").ok().as_deref(),
+                                     &ctx.sget("auto_interval"))
+}
+
+/// The urltest's settings: the interval above, ROWT_AUTO_TOLERANCE and
+/// ROWT_AUTO_INTERRUPT (the shell's group_jq reads the same three).
+pub fn urltest(ctx: &Ctx) -> rowt_core::render::UrlTest {
+    rowt_core::render::UrlTest::new(auto_interval(ctx), std::env::var("ROWT_AUTO_TOLERANCE").ok().as_deref(),
+                                    std::env::var("ROWT_AUTO_INTERRUPT").ok().as_deref())
+}
+
 fn escape_outbounds(ctx: &Ctx) -> Result<(Value, String), String> {
     let servers: Vec<Value> =
         serde_json::from_str(&read(&ctx.cfg.join("servers.json"))).unwrap_or_default();
     // `best` renders as a selector defaulting to its pick (`_escape_sel`).
     let selected = crate::best::escape_sel(ctx);
-    let interval = env_or("ROWT_AUTO_INTERVAL", "20m");
+    let auto = urltest(ctx);
     match ctx.mode().as_str() {
         // No tunnel at all: the escape lane's rules point at `direct` instead.
         "local" => Ok((json!([]), format!("127.0.0.1:{}", ctx.clash_port))),
@@ -204,7 +217,10 @@ fn escape_outbounds(ctx: &Ctx) -> Result<(Value, String), String> {
         // anyway: `cli-diff` compares the argv trace, and collapsing the two
         // would be a behavior change smuggled in as a tidy-up. Listed in
         // PORTING.md §6.7 to fix on the shell side, where it belongs.
-        _ => Ok((group(&servers, &Mac.detect_iface().unwrap_or_default(), &selected, &interval),
+        // Members whose server name rowt checked resolve through dns-escape.
+        _ => Ok((rowt_core::escapedns::guard_members(
+                     &group(&servers, &Mac.detect_iface().unwrap_or_default(), &selected, &auto),
+                     &crate::escape_dns::guarded(&ctx.cfg)),
                  format!("127.0.0.1:{}", ctx.clash_port))),
     }
 }
@@ -247,6 +263,7 @@ pub fn build_host(ctx: &Ctx) -> Result<Value, String> {
             block_exact: parse_list(&blk_src, Filter::Exact),
         },
         escape_outbound: if local { "direct".into() } else { "escape".into() },
+        escape_hosts: ctx.cfg.join("escape-hosts").to_string_lossy().into_owned(),
         geo: Geo {
             escape: geosites_of(&esc_src).into_iter().filter(|n| cached(n)).collect(),
             block: geosites_of(&blk_src).into_iter().filter(|n| cached(n)).collect(),
@@ -275,18 +292,27 @@ pub fn cmd_render(ctx: &Ctx) -> Result<String, String> {
     if mode != "local" && !has_servers {
         return Err("no servers — run: rowt server add '<vless://...>' or rowt sub add <url>".into());
     }
+    // `die`, as the shell's cmd_render does: an ABORT line in the audit log.
+    let tolerance = std::env::var("ROWT_AUTO_TOLERANCE").ok();
+    if rowt_core::render::auto_tolerance(tolerance.as_deref()).is_none() {
+        crate::die(&ctx.cfg, &format!("ROWT_AUTO_TOLERANCE wants whole milliseconds from 0 to 99999 (got '{}')",
+                                      tolerance.unwrap_or_default()));
+    }
     // Before the render, not after: the render VALIDATES what it produced by
     // running `sing-box check` on it, so a missing binary would surface as
     // "generated host.json failed validation" — a config problem, on a machine
     // whose only problem is that it has not downloaded the router yet.
     crate::fetch::ensure_singbox(&ctx.cfg, &crate::here_dir(), false)?;
     eprintln!("==> rendering configs (mode={mode}, port={}, servers={servers_n})", ctx.port);
+    // The escape servers' names, re-checked over DoH when stale, so this
+    // render guards what it can (escape_dns; the shell's cmd_render, same spot).
+    crate::escape_dns::before_render(ctx);
     let host = build_host(ctx)?;
 
     let servers: Vec<Value> =
         serde_json::from_str(&read(&ctx.cfg.join("servers.json"))).unwrap_or_default();
     let selected = crate::best::escape_sel(ctx);
-    let guest = group(&servers, "", &selected, &env_or("ROWT_AUTO_INTERVAL", "20m"));
+    let guest = group(&servers, "", &selected, &urltest(ctx));
     let vm = render_vm(&guest, "0.0.0.0", (ctx.port + 1) as u64,
                        &format!("0.0.0.0:{}", ctx.clash_port + 1),
                        &clash_secret(ctx), &env_or("ROWT_LOG_LEVEL", "warn"));
@@ -672,8 +698,53 @@ pub fn stop_collector(ctx: &Ctx) {
     }
 }
 
+fn follow_running(ctx: &Ctx) -> bool {
+    match read(&ctx.cfg.join("follow.pid")).trim().parse::<i32>() {
+        Ok(p) => p > 0 && unsafe { libc::kill(p, 0) } == 0,
+        Err(_) => false,
+    }
+}
+
+/// `_follow_running`, for `status`.
+pub fn follower_running(ctx: &Ctx) -> bool {
+    follow_running(ctx)
+}
+
+/// `_start_follow` — `auto`'s failover follower (`watch follow`), tied to the
+/// router like the collector: started once the router is healthy, in `auto`
+/// only. It is this binary, never a `rowt` found on PATH.
+pub fn start_follow(ctx: &Ctx) {
+    if env_or("ROWT_AUTO_FOLLOW", "1") != "1" || ctx.sget("selected") != "auto"
+        || ctx.mode() == "local" || follow_running(ctx) {
+        return;
+    }
+    let Ok(me) = std::env::current_exe() else { return };
+    fs::create_dir_all(ctx.logdir()).ok();
+    let Ok(log) = fs::OpenOptions::new().create(true).append(true)
+        .open(ctx.logdir().join("watch.log")) else { return };
+    let Ok(log2) = log.try_clone() else { return };
+    let mut cmd = Command::new(me);
+    cmd.arg("watch").arg("follow")
+        .stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log2));
+    ignore_hangup(&mut cmd);
+    own_session(&mut cmd);
+    if let Ok(c) = cmd.spawn() {
+        let _ = fs::write(ctx.cfg.join("follow.pid"), format!("{}\n", c.id()));
+    }
+}
+
+/// `_stop_follow` — only the pid it recorded, never a pattern.
+pub fn stop_follow(ctx: &Ctx) {
+    let pf = ctx.cfg.join("follow.pid");
+    if let Ok(p) = read(&pf).trim().parse::<i32>() {
+        if p > 0 { unsafe { libc::kill(p, libc::SIGTERM) }; }
+    }
+    let _ = fs::remove_file(&pf);
+}
+
 pub fn router_stop(ctx: &Ctx) {
     stop_collector(ctx);
+    stop_follow(ctx);
     if let Some(pid) = host_running(ctx) {
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
@@ -836,6 +907,13 @@ pub fn clash_selected(ctx: &Ctx) -> Option<String> {
     v.get("now")?.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
 }
 
+/// `clash_auto_pick` — the server sing-box's urltest `auto` is on, live.
+pub fn clash_auto_pick(ctx: &Ctx) -> Option<String> {
+    let body = clash_curl(ctx, "GET", "/proxies/auto", None)?;
+    let v: Value = serde_json::from_str(&body).ok()?;
+    v.get("now")?.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+}
+
 /// An HTTP status through a proxy, "000" when it never answered.
 pub fn curl_code(proxy: &str, url: &str) -> String {
     curl_code_rc(proxy, url).0
@@ -898,6 +976,7 @@ pub fn router_up(ctx: &Ctx) -> Result<String, String> {
     let pid = child.id();
     if router_ready(ctx, 5, &mut child) {
         start_collector(ctx);
+        start_follow(ctx);
         return Ok(format!("  ✓ running (pid {pid})"));
     }
     eprintln!("error: router did not come up healthy within 5s (exited or API wedged) — see {}",
@@ -911,6 +990,7 @@ pub fn router_up(ctx: &Ctx) -> Result<String, String> {
     let pid = child.id();
     if router_ready(ctx, 5, &mut child) {
         start_collector(ctx);
+        start_follow(ctx);
         return Ok(format!("  ✓ running (pid {pid})  [plain log]"));
     }
     let _ = child.try_wait();

@@ -1,0 +1,5 @@
+The import-review file with each entry's `_source` written the short way
+(`sr`, `verge`), as an older rowt recorded whatever `--from` was given. Applied,
+its servers must be recorded under `shadowrocket` and `clash-verge` in
+manual-sources.tsv, the names `--from shadowrocket` and `--from clash-verge`
+write, so a later `--replace` from either spelling finds them.

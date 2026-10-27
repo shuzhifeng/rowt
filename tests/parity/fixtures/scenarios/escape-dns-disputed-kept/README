@@ -1,0 +1,4 @@
+The same disagreement as escape-dns-disputed, but neither candidate passes the
+probe (an empty sing-box-fetch-pass) and escape-dns.tsv holds a last good
+answer for entry-a (192.0.2.10, dated 2000 so the render asks again). Neither
+source's word is taken: 192.0.2.10 stays, verdict `disputed`.

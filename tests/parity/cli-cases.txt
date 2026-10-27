@@ -430,6 +430,28 @@ sub import /nonexistent/subs.txt
 PARITY_SCENARIO=import-review server import --apply
 PARITY_SCENARIO=import-review sub import --apply
 PARITY_SCENARIO=import-review server import --detect
+# --replace (#s321): what each import brought in is recorded in
+# manual-sources.tsv (part of the compared tree), and --replace drops what the
+# last import from the same source brought in before it merges. The first one
+# on a machine has nothing recorded and only adds; import-sources is four
+# imports deep (see its README). --replace with no dump and no --apply, or with
+# the extract step, is a usage error.
+PARITY_SCENARIO=import-review server import --apply --replace
+PARITY_SCENARIO=import-review sub import --apply --replace
+server import --replace tests/parity/fixtures/server-dump.json
+PARITY_SCENARIO=import-sources server import --replace tests/parity/fixtures/server-dump.json
+PARITY_SCENARIO=import-sources server import tests/parity/fixtures/server-dump.json --replace
+PARITY_SCENARIO=import-sources server import tests/parity/fixtures/server-dump.json
+PARITY_SCENARIO=import-sources server rm retired
+PARITY_SCENARIO=import-sources server clear
+server import --replace
+server import --from shadowrocket --replace
+# One name per client: `sr`/`verge` are recorded as shadowrocket/clash-verge.
+PARITY_SCENARIO=import-review-aliases server import --apply --replace
+server import --from sr
+# The bundle carries escape-dns.txt and manual-sources.tsv (config-bundle.tgz
+# has both; --replace restores them, 0600 for the second).
+PARITY_SCENARIO=import-sources config list
 # An empty list dumps a bare NEWLINE — `printf '%s\n' ""` — not nothing. Each
 # case gets a fresh sandbox, so emptiness has to come from a scenario rather
 # than from a `clear` in the case before it.
@@ -447,6 +469,61 @@ PARITY_SCENARIO=lanes-empty use
 PARITY_TIMEOUT=45 use alpha
 use auto
 use nosuchtag
+# `use auto --every` (#s321): saved as auto_interval in state and rendered into
+# the urltest; out of 30s..30m, not a duration, or on anything but auto, it is
+# refused before anything is written.
+use auto --every 3m
+use auto --every=1m30s
+use auto --every 10s
+use auto --every 45m
+use auto --every soon
+use auto --every
+use alpha --every 3m
+use --every 3m
+# `--every default` forgets the saved interval (from PR #4): back to 20m.
+PARITY_SCENARIO=render-auto-every use auto --every default
+# The urltest's other knobs (from PR #4): tolerance, default 100 ms, refused
+# unless whole milliseconds; the opt-in interrupt, which status names.
+ROWT_AUTO_TOLERANCE=250 ROWT_AUTO_INTERRUPT=1 PARITY_SCENARIO=render-auto-every render
+ROWT_AUTO_TOLERANCE=fast render
+ROWT_AUTO_INTERRUPT=1 PARITY_SCENARIO=auto-status status
+# Already auto and the render changes nothing: the router is not restarted.
+PARITY_SCENARIO=use-auto-unchanged use auto --every 3m
+PARITY_SCENARIO=use-auto-unchanged use auto
+# status in auto with the router up: the pick, the interval and its source,
+# the follower, the last switch.
+PARITY_SCENARIO=auto-status status
+# The follower the router starts in auto (internal). With the router down it
+# has nothing to follow and exits at once, silently — on both sides. Its loop
+# against a live clash API is tests/test_auto_follow.py.
+watch follow
+# Escape servers named by domain (#s321): the render asks the DoH sources
+# (canned answers), refuses sinkhole, private, fake-IP and outside-allow-list
+# addresses, writes escape-dns.tsv and escape-hosts, and points the checked
+# members at dns-escape. One implementation (rowt-rs _escape-dns) serves both
+# sides, so these hold the CALLERS to the same points: the trace places the
+# DoH calls inside the render, and the tree must match.
+PARITY_SCENARIO=escape-dns render
+PARITY_SCENARIO=escape-dns status
+PARITY_SCENARIO=render-escape-dns status
+PARITY_SCENARIO=render-escape-dns render
+PARITY_SCENARIO=escape-dns-off render
+PARITY_SCENARIO=escape-dns-off status
+# Every source is asked about every name, and when they disagree no one
+# source's word is taken: the delay probe through a twin of the server settles
+# it (only the real entry passes), else the last good answer stays, else the
+# system resolver's unrefused answer (dig, in the trace). Documentation ranges:
+# 203.0.113.66 stands for the sinkhole, 198.51.100.7 for the real entry.
+PARITY_SCENARIO=escape-dns-disputed render
+PARITY_SCENARIO=escape-dns-disputed-kept render
+PARITY_SCENARIO=escape-dns-disputed-kept status
+PARITY_SCENARIO=escape-dns-disputed-system render
+# An answer that differs from the verified last good one must pass the probe
+# first, however many sources give it (moved: it passes; held: it does not);
+# and a system-resolver tie-break is used but never becomes the last good one.
+PARITY_SCENARIO=escape-dns-moved render
+PARITY_SCENARIO=escape-dns-held render
+PARITY_SCENARIO=escape-dns-system-untrusted render
 PARITY_SCENARIO=render-local use alpha
 # A name nobody documents: error to stderr, a blank line and the usage to
 # stdout, exit 1 — and, because the shell's catch-all calls `exit` from inside

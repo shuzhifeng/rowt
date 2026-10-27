@@ -1,0 +1,18 @@
+Escape servers named by domain (#s321), and DoH answers for them:
+
+  entry-a  223.5.5.5 answers 198.51.100.66, a `refuse` range in escape-dns.txt
+           (the local override), so it has no say; 1.12.12.12 answers
+           192.0.2.10 and .11 — used, no probe.
+  entry-b  223.5.5.5 answers through a CNAME with 192.0.2.20 and 203.0.113.99;
+           escape-dns.txt allows only 192.0.2.0/24 for it, so .99 is refused
+           and .20 used (1.12.12.12 has no answer for it: one source). The server is written `Entry-B.example` on purpose:
+           names compare in lower case.
+  entry-c  223.5.5.5 answers 10.10.10.10 (private), 1.12.12.12 198.18.0.5
+           (fake-IP range): refused with nothing kept, so its member resolves
+           through dns-escape and gets no address — it fails closed instead
+           of dialing a sinkhole.
+  beta     an address literal: never resolved, never guarded.
+
+`render` must write escape-dns.tsv and escape-hosts, warn about each refused
+answer, give entry-a/b/c the dns-escape domain_resolver and add the hosts
+server; `status` (from a fresh sandbox) says none is checked yet.

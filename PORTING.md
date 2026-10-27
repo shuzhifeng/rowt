@@ -353,6 +353,21 @@ which until that moment was a gate artifact whose stdout went nowhere. Two
 parsers written to match each other is precisely what no differential gate can
 see.
 
+The same rule decides where new logic goes when the shell and rowt-rs both need
+it and no reference implementation exists to diff against. The escape-server
+name check (`rowt_core::escapedns`, #s321: DoH, refusal, the hosts file sing-box
+reads) exists once, in Rust; bin/rowt reaches it as the hidden
+`rowt-rs _escape-dns <refresh|guarded|status>` — answered ahead of the preamble,
+like `_splitter` — and rowt-rs calls it in process at the same points (the
+render, the watchdog tick, `status`). `cli-diff` then holds the two CALLERS to
+the same places (the DoH calls sit inside the render's trace on both sides),
+and the logic itself is held by unit tests and `tests/test_escape_dns.py`, not
+by a comparison it could only win. Without rowt-rs the shell simply skips it.
+`auto`'s failover follower (`watch follow`, `rowt_core::follow`) and
+`server import --replace`'s provenance (`manual-sources.tsv`) went the usual
+way instead — written twice and compared — because each has a shell-shaped
+half (a sidecar the router starts; jq over manual.json) that cli-diff can see.
+
 `vless-parse.py` (421 lines) landed first of that group, as
 `rowt-core::sharelink` behind `parity vless-diff`; `import-merge.py` (172)
 followed as `rowt-core::importmerge` behind `parity merge-diff`;

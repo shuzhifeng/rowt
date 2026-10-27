@@ -39,6 +39,7 @@ fn vars(cfg: &Path) -> Vec<(&'static str, String)> {
         ("AUTO_INTERVAL", env("ROWT_AUTO_INTERVAL", "20m")),
         ("BEST_INTERVAL", env("ROWT_BEST_INTERVAL", "600")),
         ("BEST_TOLERANCE", env("ROWT_BEST_TOLERANCE", "50")),
+        ("AUTO_TOLERANCE", env("ROWT_AUTO_TOLERANCE", "100")),
         ("SHELL", env("SHELL", "")),
     ];
     v

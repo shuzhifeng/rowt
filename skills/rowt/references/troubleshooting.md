@@ -56,6 +56,24 @@ SIGHUP; since 3.6.7 the three start in a session of their own, so no group signa
 reaches them. On an older rowt, run those commands in the foreground and never over
 a daemon's SSH; the watchdog restarts a dead router within its 120 s tick either way.
 
+**A server named by domain stops answering, or `rowt status` shows `escape dns:` with REFUSED or DISAGREE.**
+rowt resolves escape servers' names itself over DoH, asking both AliDNS and DNSPod. It
+refuses answers no public server has (private, loopback, link-local, CGNAT, reserved,
+fake-IP `198.18.0.0/15`, plus the box's own `refuse` ranges in
+`~/.config/rowt/escape-dns.txt`). When the two sources DISAGREE it believes neither,
+and an answer that differs from the last good address is not believed either: the
+new addresses are fetched through the server itself, and only one that answers is
+used (`MOVED`); otherwise the last good address stays (`held`), else the system
+resolver's. The status
+lines name each refused address and each disagreement, and what sing-box was given.
+A disagreement on a network that hijacks DNS is the check working. A server that
+really lives on a private or tailnet address behind a name needs an `allow <name>
+<cidr>` line there (or an address literal); `off` turns the check off. Put a sinkhole
+you have seen here in `refuse` only on this box. When a provider moves its entry
+addresses, the watchdog follows within about 5 minutes with no restart once both
+sources agree; `ROWT_ESCAPE_DNS_MAX_AGE=0 rowt render` asks again at once, and the
+running router picks the new address up by itself.
+
 **Fan loud, battery draining, everything green.** This is the spin: sing-box at 100–200%
 CPU with little traffic.
 

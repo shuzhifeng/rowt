@@ -1,0 +1,5 @@
+# rowt: which import brought each manual server in, for 'server import --replace' (source, tag, type:server:port)
+file:server-dump.json	alpha	vless:203.0.113.10:443
+file:server-dump.json	retired	vless:203.0.113.13:443
+file:server-dump.json	shared	vless:203.0.113.14:443
+shadowrocket	shared	vless:203.0.113.14:443

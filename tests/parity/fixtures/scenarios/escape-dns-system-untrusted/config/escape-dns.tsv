@@ -1,0 +1,2 @@
+# rowt escape-server names, resolved by DoH: name, verdict, addresses given to sing-box, source, refused (addr=reason@source), disputed (addr@source), UTC time
+entry-a.example	disputed	203.0.113.66	system resolver	-	203.0.113.66@223.5.5.5,198.51.100.7@1.12.12.12	2000-01-01 00:00:00

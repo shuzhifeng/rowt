@@ -57,6 +57,10 @@ pub struct HostInput {
     /// local mode, where no tunnel exists. The rules are still emitted either
     /// way — they carry precedence over broader block entries and the ad set.
     pub escape_outbound: String,
+    /// The hosts file the guarded escape members resolve through
+    /// (`escapedns`); the `dns-escape` server is rendered only when a member
+    /// names it.
+    pub escape_hosts: String,
 }
 
 /// Parse one lane list exactly as `list_json` does.
@@ -159,9 +163,80 @@ pub fn geosites_of(contents: &str) -> Vec<String> {
         .collect()
 }
 
+/// How often `auto`'s urltest re-tests every server: `ROWT_AUTO_INTERVAL` when it
+/// is set, else what `use auto --every` saved in state, else 20m — the shell's
+/// `_auto_interval`. Read at every render, so a reload keeps the saved value.
+pub fn auto_interval(env: Option<&str>, saved: &str) -> String {
+    match env.filter(|v| !v.is_empty()) {
+        Some(v) => v.to_string(),
+        None if !saved.is_empty() => saved.to_string(),
+        None => "20m".to_string(),
+    }
+}
+
+/// The urltest's settings: how often a round runs, how many ms faster another
+/// server must test before a round moves the pick (`ROWT_AUTO_TOLERANCE`,
+/// default 100), and whether a switch also closes the connections left on the
+/// old pick (`ROWT_AUTO_INTERRUPT=1`, opt-in). The last two came from PR #4.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UrlTest {
+    pub interval: String,
+    pub tolerance: u64,
+    pub interrupt: bool,
+}
+
+impl UrlTest {
+    /// From the environment's raw values and the saved `--every`, as the shell
+    /// reads them. A tolerance that is not whole milliseconds renders as the
+    /// default; the render refuses it first (`auto_tolerance`).
+    pub fn new(interval: String, tolerance: Option<&str>, interrupt: Option<&str>) -> Self {
+        UrlTest {
+            interval,
+            tolerance: auto_tolerance(tolerance).unwrap_or(100),
+            interrupt: interrupt == Some("1"),
+        }
+    }
+}
+
+/// `ROWT_AUTO_TOLERANCE` as the shell's `_auto_tolerance` reads it: unset or
+/// empty is 100; one to five digits is that many ms; anything else is `None`.
+pub fn auto_tolerance(env: Option<&str>) -> Option<u64> {
+    match env.filter(|v| !v.is_empty()) {
+        None => Some(100),
+        Some(v) if v.len() <= 5 && v.bytes().all(|b| b.is_ascii_digit()) => v.parse().ok(),
+        Some(_) => None,
+    }
+}
+
+/// Seconds in a `use auto --every` duration: whole numbers with `s`, `m` or `h`,
+/// run together the way Go writes them (`90s`, `3m`, `1m30s`, `1h`). `None` for
+/// anything else — the shell's `_duration_secs` prints nothing for the same.
+pub fn duration_secs(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let (mut total, mut n, mut digits) = (0u64, 0u64, false);
+    for c in s.chars() {
+        match c {
+            '0'..='9' => {
+                n = n.checked_mul(10)?.checked_add(c as u64 - '0' as u64)?;
+                digits = true;
+            }
+            's' | 'm' | 'h' if digits => {
+                let unit = match c { 'h' => 3600, 'm' => 60, _ => 1 };
+                total = total.checked_add(n.checked_mul(unit)?)?;
+                n = 0;
+                digits = false;
+            }
+            _ => return None,
+        }
+    }
+    if digits { None } else { Some(total) }
+}
+
 /// The escape outbound group: members (optionally interface-bound), then either
 /// a urltest + selector (`auto`) or a plain selector pinned to one server.
-pub fn group(servers: &[Value], iface: &str, selected: &str, interval: &str) -> Value {
+pub fn group(servers: &[Value], iface: &str, selected: &str, auto: &UrlTest) -> Value {
     let members: Vec<Value> = servers
         .iter()
         .map(|s| {
@@ -178,10 +253,15 @@ pub fn group(servers: &[Value], iface: &str, selected: &str, interval: &str) -> 
 
     let mut out = members.clone();
     if selected == "auto" {
-        out.push(json!({
+        let mut urltest = json!({
             "type": "urltest", "tag": "auto", "outbounds": tags,
-            "url": "https://www.gstatic.com/generate_204", "interval": interval
-        }));
+            "url": "https://www.gstatic.com/generate_204", "interval": auto.interval,
+            "tolerance": auto.tolerance
+        });
+        if auto.interrupt {
+            urltest["interrupt_exist_connections"] = json!(true);
+        }
+        out.push(urltest);
         let mut sel_outbounds = vec![json!("auto")];
         sel_outbounds.extend(tags.iter().cloned());
         out.push(json!({
@@ -281,10 +361,15 @@ pub fn render_host(i: &HostInput) -> Value {
         rules.push(json!({"ip_cidr": i.private_cidrs, "outbound": "corp"}));
     }
 
-    let dns_servers = json!([
+    let mut dns_servers = json!([
         {"type": "local", "tag": "local"},
         {"type": "https", "tag": "dns-direct", "server": i.dns_direct, "detour": "direct"}
     ]);
+    if crate::escapedns::uses_guard(&i.escapes) {
+        if let Some(a) = dns_servers.as_array_mut() {
+            a.push(crate::escapedns::hosts_server(&i.escape_hosts));
+        }
+    }
     // Corp names must resolve through the corp resolver or they answer with a
     // public IP and leave the tunnel — so an EXACT corp entry needs this rule
     // just as much as a suffix one. `domain` sits first, mirroring the route
@@ -385,6 +470,58 @@ pub fn render_vm(escapes: &Value, listen: &str, port: u64, clash: &str, secret: 
 mod tests {
     use super::*;
 
+    /// The env knob wins, then the saved `--every`, then 20m — and an EMPTY
+    /// env value counts as unset, as `${ROWT_AUTO_INTERVAL:-}` does.
+    #[test]
+    fn the_auto_interval_prefers_env_then_state_then_the_default() {
+        assert_eq!(auto_interval(Some("90s"), "3m"), "90s");
+        assert_eq!(auto_interval(Some(""), "3m"), "3m");
+        assert_eq!(auto_interval(None, "3m"), "3m");
+        assert_eq!(auto_interval(None, ""), "20m");
+    }
+
+    #[test]
+    fn durations_read_the_way_go_writes_them() {
+        assert_eq!(duration_secs("3m"), Some(180));
+        assert_eq!(duration_secs("90s"), Some(90));
+        assert_eq!(duration_secs("1m30s"), Some(90));
+        assert_eq!(duration_secs("1h"), Some(3600));
+        for bad in ["", "3", "m", "3x", "1.5m", "-3m", "3m ", " 3m", "3M"] {
+            assert_eq!(duration_secs(bad), None, "{bad:?}");
+        }
+    }
+
+    fn auto(interval: &str) -> UrlTest {
+        UrlTest::new(interval.to_string(), None, None)
+    }
+
+    #[test]
+    fn the_urltest_carries_the_interval_it_is_given() {
+        let servers = vec![json!({"type": "vless", "tag": "a", "server": "192.0.2.1", "server_port": 443})];
+        let g = group(&servers, "", "auto", &auto("3m"));
+        assert_eq!(g[1]["type"], "urltest");
+        assert_eq!(g[1]["interval"], "3m");
+        assert_eq!(g[1]["tolerance"], 100);
+        assert!(g[1].get("interrupt_exist_connections").is_none(), "interrupting is opt-in");
+    }
+
+    #[test]
+    fn tolerance_and_interrupt_come_from_their_knobs() {
+        let servers = vec![json!({"type": "vless", "tag": "a", "server": "192.0.2.1", "server_port": 443})];
+        let g = group(&servers, "", "auto", &UrlTest::new("20m".into(), Some("250"), Some("1")));
+        assert_eq!(g[1]["tolerance"], 250);
+        assert_eq!(g[1]["interrupt_exist_connections"], true);
+        let keys: Vec<&String> = g[1].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["type", "tag", "outbounds", "url", "interval", "tolerance", "interrupt_exist_connections"],
+                   "the shell's key order");
+        assert!(UrlTest::new("20m".into(), None, Some("yes")) == auto("20m"), "only 1 turns it on");
+        for (raw, want) in [(None, Some(100)), (Some(""), Some(100)), (Some("0"), Some(0)), (Some("007"), Some(7)),
+                            (Some("99999"), Some(99999)), (Some("100000"), None), (Some("1e3"), None),
+                            (Some("-5"), None), (Some(" 50"), None)] {
+            assert_eq!(auto_tolerance(raw), want, "{raw:?}");
+        }
+    }
+
     #[test]
     fn list_parsing_matches_the_shell_pipeline() {
         let src = "# comment\n\nexample.com\n   spaced.example.org\ngeosite:google\n10.0.0.0/8\n  \n";
@@ -471,7 +608,7 @@ mod tests {
     #[test]
     fn selector_falls_back_when_the_selection_is_unknown() {
         let servers = vec![json!({"tag": "alpha"}), json!({"tag": "beta"})];
-        let g = group(&servers, "en0", "ghost", "20m");
+        let g = group(&servers, "en0", "ghost", &auto("20m"));
         let sel = g.as_array().unwrap().last().unwrap();
         assert_eq!(sel["default"], json!("alpha"));
         assert_eq!(g[0]["bind_interface"], json!("en0"));
@@ -479,7 +616,7 @@ mod tests {
 
     #[test]
     fn an_empty_server_list_selects_block() {
-        let g = group(&[], "en0", "ghost", "20m");
+        let g = group(&[], "en0", "ghost", &auto("20m"));
         assert_eq!(g.as_array().unwrap().last().unwrap()["default"], json!("block"));
     }
 

@@ -1,0 +1,6 @@
+[
+  {"type": "vless", "tag": "alpha", "server": "203.0.113.10", "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000001"},
+  {"type": "vless", "tag": "retired", "server": "203.0.113.13", "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000004"},
+  {"type": "vless", "tag": "shared", "server": "203.0.113.14", "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000005"},
+  {"type": "vless", "tag": "byhand", "server": "203.0.113.15", "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000006"}
+]

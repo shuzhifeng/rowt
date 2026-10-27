@@ -141,36 +141,29 @@ fn merge_domains(existing: &str, j: &Value) -> String {
 /// win), the subscription URLs are appended and sorted unique, and the client's
 /// proxy domains are appended to the escape lane under a marker comment with
 /// duplicates dropped.
-pub fn apply(ctx: &Ctx, file: &Path) -> Result<String, String> {
+pub fn apply(ctx: &Ctx, file: &Path, replace: bool) -> Result<String, String> {
     let cfg = &ctx.cfg;
     let j: Value = serde_json::from_str(&read(file)).unwrap_or(Value::Null);
 
-    // `jq -s '.[0] + ((.[1].servers // []) | map(del(._source)))'` — the review
-    // file's `_source` tag is an editing aid and never reaches manual.json or
-    // sing-box.
-    let manual_path = cfg.join("manual.json");
-    if !std::fs::metadata(&manual_path).map(|m| m.len() > 0).unwrap_or(false) {
-        std::fs::write(&manual_path, "[]\n").map_err(|e| format!("write: {e}"))?;
-    }
-    let mut all: Vec<Value> = serde_json::from_str(&read(&manual_path)).unwrap_or_default();
+    // The review file's `_source` tag is an editing aid and never reaches
+    // manual.json or sing-box — but it is what each server is recorded under
+    // (`review` without one), so `--replace` can drop what an earlier apply
+    // from the same client brought in.
+    let mut pairs: Vec<(String, Value)> = Vec::new();
     if let Some(servers) = j.get("servers").and_then(Value::as_array) {
         for s in servers {
             let mut s = s.clone();
-            if let Some(o) = s.as_object_mut() {
-                o.remove("_source");
-            }
-            all.push(s);
+            let src = match s.as_object_mut() {
+                Some(o) => match o.remove("_source") {
+                    Some(Value::String(t)) if !t.is_empty() => crate::sources::canonical(&t).to_string(),
+                    _ => "review".to_string(),
+                },
+                None => "review".to_string(),
+            };
+            pairs.push((src, s));
         }
     }
-    let combined = rowt_core::sharelink::combine(&all);
-    for w in &combined.warnings {
-        eprintln!("{w}");
-    }
-    let n_file = manual_path.with_extension("json.n");
-    std::fs::write(&n_file, rowt_core::sharelink::render(&Value::Array(combined.outbounds)))
-        .map_err(|e| format!("write: {e}"))?;
-    std::fs::rename(&n_file, &manual_path).map_err(|e| format!("mv: {e}"))?;
-    set_mode(&manual_path, 0o600);
+    crate::sources::manual_import(ctx, &pairs, replace)?;
 
     // `jq -r '.subscriptions[]?.url // empty' >> subs.txt`, then `sort -u`.
     let subs_path = cfg.join("subs.txt");
@@ -204,27 +197,17 @@ pub fn apply(ctx: &Ctx, file: &Path) -> Result<String, String> {
 /// `server import <file>` where the file is a `server dump` — an array of
 /// outbounds, merged into the manual set and deduped, so restoring a backup
 /// twice is the same as restoring it once.
-pub fn load_dump(ctx: &Ctx, file: &Path) -> Result<String, String> {
+pub fn load_dump(ctx: &Ctx, file: &Path, replace: bool) -> Result<String, String> {
     let cfg = &ctx.cfg;
     let v: Value = serde_json::from_str(&read(file)).unwrap_or(Value::Null);
     let Some(arr) = v.as_array() else {
         crate::die(cfg, &format!("not a 'server dump' (expected a JSON array): {}", file.display()));
     };
-    let manual_path = cfg.join("manual.json");
-    if !std::fs::metadata(&manual_path).map(|m| m.len() > 0).unwrap_or(false) {
-        std::fs::write(&manual_path, "[]\n").map_err(|e| format!("write: {e}"))?;
-    }
-    let mut all: Vec<Value> = serde_json::from_str(&read(&manual_path)).unwrap_or_default();
-    all.extend(arr.iter().cloned());
-    let combined = rowt_core::sharelink::combine(&all);
-    for w in &combined.warnings {
-        eprintln!("{w}");
-    }
-    let n_file = manual_path.with_extension("json.n");
-    std::fs::write(&n_file, rowt_core::sharelink::render(&Value::Array(combined.outbounds)))
-        .map_err(|e| format!("write: {e}"))?;
-    std::fs::rename(&n_file, &manual_path).map_err(|e| format!("mv: {e}"))?;
-    set_mode(&manual_path, 0o600);
+    // Recorded under `file:<the dump's file name>`, which is what `--replace`
+    // matches the next import of a file by that name against.
+    let src = format!("file:{}", file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    let pairs: Vec<(String, Value)> = arr.iter().map(|o| (src.clone(), o.clone())).collect();
+    crate::sources::manual_import(ctx, &pairs, replace)?;
     info(&format!("loaded {} server(s) from {}", arr.len(), file.display()));
     pool::rebuild(ctx)?;
     pool::after_import(ctx)
@@ -233,6 +216,9 @@ pub fn load_dump(ctx: &Ctx, file: &Path) -> Result<String, String> {
 /// The extract step: read one client and accumulate it into the review file.
 fn accumulate(ctx: &Ctx, source: &str, path: Option<&str>, file: &Path) -> Result<String, String> {
     let cfg = &ctx.cfg;
+    // One name per client (`_canonical_source`): what `_source` records, and
+    // what `--replace` matches on.
+    let source = crate::sources::canonical(source);
     let (label, add) = match source {
         "shadowrocket" | "sr" => {
             // `--path` is the importer's `--store` here (`args.store or
@@ -356,6 +342,7 @@ struct Flags {
     path: String,
     apply_it: bool,
     file: String,
+    replace: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -380,6 +367,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, FlagErr> {
         };
         match args[i].as_str() {
             "--apply" => f.apply_it = true,
+            "--replace" => f.replace = true,
             "--from" => f.source = need(&mut i)?,
             "--output" | "--input" | "-o" | "-i" => f.file = need(&mut i)?,
             "--path" => f.path = need(&mut i)?,
@@ -396,14 +384,14 @@ fn parse_flags(args: &[String]) -> Result<Flags, FlagErr> {
 }
 
 /// `server import` / `sub import` — the whole arm.
-pub fn cmd(ctx: &Ctx, args: &[String]) -> Result<String, String> {
+pub fn cmd(ctx: &Ctx, args: &[String], replace: bool) -> Result<String, String> {
     let cfg = &ctx.cfg;
     // `--detect` only counts as the FIRST argument, the way the shell tests it.
     if args.first().map(|s| s.as_str()) == Some("--detect") {
         return Ok(workflow_msg(cfg));
     }
 
-    let Flags { source, path, apply_it, file } = match parse_flags(args) {
+    let Flags { source, path, apply_it, file, replace: flag_replace } = match parse_flags(args) {
         Ok(f) => f,
         // `${1:?msg}` — a flag whose value is missing ends the shell with 1 and
         // a parameter-expansion complaint, not a usage message.
@@ -411,7 +399,7 @@ pub fn cmd(ctx: &Ctx, args: &[String]) -> Result<String, String> {
         Err(FlagErr::Unknown(x)) => crate::die(
             cfg,
             &format!(
-                "unknown option: {x}  (use --from <src> [--output <file>], or --apply [--input <file>])"
+                "unknown option: {x}  (use --from <src> [--output <file>], or --apply [--input <file>] [--replace])"
             ),
         ),
     };
@@ -426,7 +414,12 @@ pub fn cmd(ctx: &Ctx, args: &[String]) -> Result<String, String> {
         if serde_json::from_str::<Value>(&read(&target)).is_err() {
             crate::die(cfg, &format!("review file is not valid JSON: {}", target.display()));
         }
-        return apply(ctx, &target);
+        return apply(ctx, &target, replace || flag_replace);
+    }
+    if replace || flag_replace {
+        crate::die(cfg, &format!(
+            "--replace goes with --apply, or with a 'server dump' file: {} server import --replace <file>",
+            crate::PROG));
     }
     if source.is_empty() {
         crate::die(cfg, &format!(
@@ -495,6 +488,11 @@ mod tests {
         assert_eq!(f(&["--from", "--nosuchflag"]).unwrap().source, "--nosuchflag");
         // `-o=x` is not a spelling the loop knows — the `=` forms are long-only.
         assert_eq!(f(&["-o=x"]), Err(FlagErr::Unknown("-o=x".into())));
+        // `--replace` is a switch, anywhere (`sub import --apply --replace`).
+        let r = f(&["--replace", "--apply", "--input", "r.json"]).unwrap();
+        assert!(r.replace && r.apply_it);
+        assert_eq!(r.file, "r.json");
+        assert!(!f(&["--apply"]).unwrap().replace);
     }
 
     #[test]

@@ -1,0 +1,3 @@
+`use auto --every 3m` saved the interval in state, and no ROWT_AUTO_INTERVAL is
+set: the urltest must carry 3m (the env knob is the other case, interval-short,
+and `interval-env-wins` sets both, where the env must win).

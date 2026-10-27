@@ -66,9 +66,20 @@ foreground with output redirected to a file (see SKILL.md → Rules).
   by the watchdog every 10 minutes (at once if the server in use stops answering), and
   a switch only when another server is more than 50 ms faster. One noisy sample can't
   move it, and every switch is in `rowt audit` with both medians. Needs the watchdog.
-- `rowt use auto` is sing-box's own auto: the fastest live server by single samples.
+- `rowt use auto` is sing-box's own auto: the fastest live server by single samples,
+  re-tested every 20 minutes; `rowt use auto --every 3m` sets that round (30s–30m)
+  and keeps it across reloads (`--every default` forgets it). While the router runs, a follower checks the pick
+  every 15 s and moves off a dead one at once, so a lost server is left within a
+  minute whatever the round. `rowt status` shows the server auto is on
+  (`active: auto → <tag>`), the interval, the follower and its last switch.
+  Connections already open stay on the old server after a switch; set
+  `ROWT_AUTO_INTERRUPT=1` (then `rowt watch install` to bake it in) to have a
+  switch close them. It is off by default because it cuts healthy ones too.
   In the monitor, `a` toggles `best`, and turning either auto off pins the server in use.
-- Pool: `rowt server list|add|rm|clear|import|dump`. Subscriptions:
+- Pool: `rowt server list|add|rm|clear|import|dump`. Re-importing a list that has
+  dropped servers: `rowt server import --replace <dump.json>` (or `--apply --replace`)
+  first drops what the last import from the same source brought in — never a server
+  added by hand — so no `server rm` of old entries is needed. Subscriptions:
   `rowt sub list|add|rm|update|clear|import|dump`; `update` re-fetches them (`R` in
   Monitor, after `r` reprobe). The watchdog refreshes every six hours in
   `auto`/`best` while online and running. Each attempt resets the timer;

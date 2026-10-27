@@ -1,0 +1,4 @@
+The same disagreement, no candidate passes the probe, and there is no last
+good answer: the system resolver (`dig`, answering 203.0.113.66 here) breaks
+the tie, since its answer is not refused — verdict `disputed`, source `system
+resolver`, and the disagreement is said plainly on stderr.

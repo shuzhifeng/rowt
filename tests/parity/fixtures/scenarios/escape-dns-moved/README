@@ -1,0 +1,5 @@
+A provider move, verified (#s321 review): the last good answer for entry-a is
+192.0.2.10 (dated 2000, so the render asks again); both DoH sources now agree
+on 198.51.100.7. An answer that differs from the last good one must pass the
+probe through the server before it replaces it — sing-box-fetch-pass lets it —
+so it is used, verdict `moved`. One probe per real move.

@@ -1,0 +1,6 @@
+A checked escape-dns.tsv, dated 2999 so it stays fresh and no render asks
+again: entry-a ok, entry-b never answered (nothing kept), entry-c refused with
+nothing kept. The render must guard entry-a and entry-c (rowt has an opinion
+on both) and leave entry-b, and the IP-literal beta, on dns-direct — and add
+the dns-escape hosts server. `escape-dns-off` is the same with escape-dns.txt
+saying off: nothing guarded, no hosts server.

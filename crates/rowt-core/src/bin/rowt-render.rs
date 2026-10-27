@@ -83,13 +83,16 @@ fn run() -> Result<String, String> {
     let clash_port: u64 = env_or("ROWT_CLASH_PORT", "9090").parse().map_err(|_| "bad ROWT_CLASH_PORT")?;
     let vm_port = port + 1;
     let vm_clash = clash_port + 1;
-    let interval = env_or("ROWT_AUTO_INTERVAL", "20m");
+    let interval = rowt_core::render::auto_interval(std::env::var("ROWT_AUTO_INTERVAL").ok().as_deref(),
+                                                    &sget(&state, "auto_interval"));
+    let auto = rowt_core::render::UrlTest::new(interval, std::env::var("ROWT_AUTO_TOLERANCE").ok().as_deref(),
+                                               std::env::var("ROWT_AUTO_INTERRUPT").ok().as_deref());
     let log_level = env_or("ROWT_LOG_LEVEL", "warn");
 
     if args.mode == "vm" {
         // The guest's members are unbound: it has one interface and binding to
         // the host's physical NIC name would be meaningless inside the VM.
-        let escs = group(&servers, "", &selected, &interval);
+        let escs = group(&servers, "", &selected, &auto);
         let cfgv = render_vm(&escs, "0.0.0.0", vm_port, &format!("0.0.0.0:{vm_clash}"), &secret, &log_level);
         return Ok(serde_json::to_string_pretty(&cfgv).unwrap());
     }
@@ -116,8 +119,12 @@ fn run() -> Result<String, String> {
             String::new(),
         )
     } else {
+        // Members whose server name rowt checked over DoH resolve through
+        // dns-escape (rowt_core::escapedns).
+        let guarded = rowt_core::escapedns::guarded(&read(&cfg.join("escape-dns.tsv")),
+                                                    &read(&cfg.join("escape-dns.txt")));
         (
-            group(&servers, &args.iface, &selected, &interval),
+            rowt_core::escapedns::guard_members(&group(&servers, &args.iface, &selected, &auto), &guarded),
             format!("127.0.0.1:{clash_port}"),
         )
     };
@@ -184,6 +191,7 @@ fn run() -> Result<String, String> {
             block_exact: parse_list(&block_src, Filter::Exact),
         },
         escape_outbound: if local_mode { "direct".into() } else { "escape".into() },
+        escape_hosts: cfg.join("escape-hosts").to_string_lossy().into_owned(),
         geo: Geo {
             escape: lane_geo(&escape_src),
             block: lane_geo(&block_src),

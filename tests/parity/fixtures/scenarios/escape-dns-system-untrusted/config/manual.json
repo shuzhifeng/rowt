@@ -1,0 +1,5 @@
+[
+  {"type": "vless", "tag": "entry-a", "server": "entry-a.example", "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000021", "tls": {"enabled": true}},
+  {"type": "vless", "tag": "entry-d", "server": "entry-d.example", "server_port": 443, "uuid": "00000000-0000-4000-8000-000000000022", "tls": {"enabled": true, "server_name": "entry-d.example"}},
+  {"type": "vless", "tag": "beta", "server": "203.0.113.11", "server_port": 8443, "uuid": "00000000-0000-4000-8000-000000000002"}
+]

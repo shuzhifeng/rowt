@@ -32,7 +32,7 @@ fn best_timeout() -> u32 {
 
 /// `date -u '+%Y-%m-%d %H:%M:%S'`, or with `-v-NS` for a cutoff N seconds back
 /// — the same program the shell runs, so both stamps agree to the format.
-fn utc(back_secs: Option<u64>) -> String {
+pub(crate) fn utc(back_secs: Option<u64>) -> String {
     let mut c = std::process::Command::new("date");
     c.arg("-u");
     if let Some(n) = back_secs {

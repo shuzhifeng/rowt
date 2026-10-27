@@ -1,0 +1,4 @@
+The shape a network that hijacks DNS and blocks the honest DoH leaves: only
+223.5.5.5 answers for entry-a (203.0.113.66 stands for the sinkhole) and it
+differs from the last good 192.0.2.10. It does not pass the probe (an empty
+sing-box-fetch-pass), so the last good answer is held, verdict `held`.

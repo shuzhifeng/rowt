@@ -1,0 +1,4 @@
+`status` with the router up in `auto`: the escape selector is on `auto`, and the
+urltest is on beta. Status must name the pick ("auto → beta"), the saved
+`--every` interval and where it came from, the follower (not running: nothing
+started one in the sandbox), and the last switch the follower recorded.

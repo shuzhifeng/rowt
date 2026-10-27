@@ -1,0 +1,5 @@
+The refresh after a system-resolver tie-break: the previous row gave sing-box
+203.0.113.66 from the system resolver. The sources still disagree and the
+probe still settles nothing. That address is NOT the last good answer — it was
+used, never trusted — so the system resolver is asked again (dig, no answer
+here) and entry-a gets no address, verdict `disputed`.

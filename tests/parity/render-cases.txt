@@ -25,6 +25,12 @@ log-info          ROWT_LOG_LEVEL=info
 dns-elsewhere     ROWT_DNS_DIRECT=198.51.100.53
 ports-shifted     ROWT_PORT=17890 ROWT_CLASH_PORT=19090
 interval-short    ROWT_AUTO_INTERVAL=5m
+auto-every        PARITY_SCENARIO=render-auto-every
+interval-env-wins PARITY_SCENARIO=render-auto-every ROWT_AUTO_INTERVAL=5m
+# The urltest's tolerance (default 100 ms) and the opt-in interrupt (from PR #4).
+auto-tolerance-interrupt PARITY_SCENARIO=render-auto-every ROWT_AUTO_TOLERANCE=250 ROWT_AUTO_INTERRUPT=1
+escape-dns        PARITY_SCENARIO=render-escape-dns
+escape-dns-off    PARITY_SCENARIO=escape-dns-off
 geosites-pinned   PARITY_SCENARIO=render-geosites ROWT_PRIVATE_DEFAULT=direct
 local-mode        PARITY_SCENARIO=render-local
 local-precedence  PARITY_SCENARIO=render-local-precedence

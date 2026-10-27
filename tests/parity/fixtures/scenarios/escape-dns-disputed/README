@@ -1,0 +1,7 @@
+The disagreement a hijack leaves (#s321), in documentation ranges: for
+entry-a.example, 223.5.5.5 answers 203.0.113.66 (stands for the sinkhole: a
+public address no category refuses) and 1.12.12.12 answers 198.51.100.7 (the
+real entry). A fresh box, no last good answer. Both candidates are probed
+through a twin of the entry-a member (`sing-box tools fetch`, faked here), and
+sing-box-fetch-pass lets only 198.51.100.7 pass — so it is used, verdict
+`probed`. entry-d.example gets the same answer from both: used as is, no probe.

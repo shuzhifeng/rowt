@@ -165,7 +165,11 @@ fn plist_body(ctx: &Ctx, self_bin: &Path) -> String {
               // watchdog that actually acts on it. Nothing compared the plist,
               // so nothing said so.
               "ROWT_PPROF", "ROWT_CPU_SPIN_PCT", "ROWT_CPU_SPIN_BYTES",
-              "ROWT_CPU_SPIN_TICKS", "ROWT_CPU_HEAL_COOLDOWN"] {
+              "ROWT_CPU_SPIN_TICKS", "ROWT_CPU_HEAL_COOLDOWN",
+              // auto's follower and the escape-server name check: a reload or
+              // refresh the watchdog makes must see the same knobs.
+              "ROWT_AUTO_FOLLOW", "ROWT_AUTO_FOLLOW_EVERY", "ROWT_ESCAPE_DNS_MAX_AGE",
+              "ROWT_AUTO_INTERVAL", "ROWT_AUTO_TOLERANCE", "ROWT_AUTO_INTERRUPT"] {
         // bin/rowt defaults SINGBOX_VERSION into its own shell variable, so the
         // plist ALWAYS carries the pin; reading only the environment left it
         // out whenever the user had not exported one.
@@ -985,6 +989,74 @@ fn count_fresh_flows(v: &serde_json::Value, since: &str) -> u32 {
     }).count() as u32
 }
 
+// ------------------------------------------------------------------ follow
+
+/// `_follow_has_figure` — does the server have a figure in sing-box's urltest
+/// history? Read from `GET /proxies/<tag>`.
+fn follow_look(ctx: &Ctx, tag: &str) -> rowt_core::follow::Look {
+    let path = format!("/proxies/{}", rowt_core::pyurl::quote(tag, ""));
+    match lifecycle::clash_curl(ctx, "GET", &path, None) {
+        Some(body) => rowt_core::follow::look(&body),
+        None => rowt_core::follow::Look::Unknown,
+    }
+}
+
+/// `_follow_retest` — ask the group to re-test now. True when it left a live
+/// pick in place: moved to another server, or the same one answered again.
+fn follow_retest(ctx: &Ctx, pick: &str) -> bool {
+    let Some(ep) = lifecycle::controller(ctx) else { return false };
+    let secret = lifecycle::clash_secret(ctx);
+    let url = env_or("ROWT_HEALTH_URL", "https://www.gstatic.com/generate_204");
+    // The group tests each server for at most 15 s (sing-box's TCPTimeout),
+    // ten at a time; give the request a little more than that.
+    let _ = Command::new("curl")
+        .args(["--noproxy", "*", "-sS", "-m", "20",
+               "-H", &format!("Authorization: Bearer {secret}"),
+               &format!("http://{ep}/group/auto/delay?timeout=15000&url={}", rowt_core::pyurl::quote(&url, ""))])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let new = lifecycle::clash_auto_pick(ctx);
+    if let Some(n) = new.as_deref().filter(|n| *n != pick) {
+        let m = format!("auto: {pick} stopped answering — re-tested now and moved to {n}");
+        watch_log(ctx, &m);
+        crate::shell::audit(&ctx.cfg, &format!("watchdog {m}"));
+        lifecycle::sset(ctx, "auto_switch", &format!("{} {pick} -> {n}", crate::best::utc(None)));
+        return true;
+    }
+    let now_on = new.unwrap_or_else(|| pick.to_string());
+    if follow_look(ctx, &now_on) == rowt_core::follow::Look::Fresh {
+        watch_log(ctx, &format!("auto: {pick} lost its figure but answered the re-test — staying on it"));
+        return true;
+    }
+    watch_log(ctx, &format!("auto: {pick} stopped answering and no other server answered the re-test — still on {now_on}"));
+    false
+}
+
+/// `watch follow` — `auto`'s failover follower; see `rowt_core::follow` for
+/// why it exists and when it asks. Exits when the router stops, when `auto` is
+/// no longer selected, or when the config directory is gone.
+fn follow(ctx: &Ctx) {
+    let every: u64 = match env_or("ROWT_AUTO_FOLLOW_EVERY", "15").parse() {
+        Ok(n) if n >= 1 => n,
+        _ => die(&ctx.cfg, "ROWT_AUTO_FOLLOW_EVERY wants whole seconds, at least 1"),
+    };
+    let mut st = rowt_core::follow::Follow::new(every);
+    loop {
+        if !ctx.cfg.is_dir() || lifecycle::host_running(ctx).is_none() || ctx.sget("selected") != "auto" {
+            return;
+        }
+        if let Some(pick) = lifecycle::clash_auto_pick(ctx) {
+            let look = follow_look(ctx, &pick);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            if st.should_retest(look, now, every) {
+                let live = follow_retest(ctx, &pick);
+                st.after_retest(live, now, every);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(every));
+    }
+}
+
 // ------------------------------------------------------------------ command
 
 pub fn cmd(ctx: &Ctx, self_bin: &Path, action: &str) -> Result<String, String> {
@@ -1111,6 +1183,11 @@ pub fn cmd(ctx: &Ctx, self_bin: &Path, action: &str) -> Result<String, String> {
             tick(ctx);
             Ok(String::new())
         }
+        // Internal: the router starts this in `auto` (lifecycle::start_follow).
+        "follow" => {
+            follow(ctx);
+            Ok(String::new())
+        }
         _ => die(cfg, &format!("usage: {PROG} watch [install | uninstall | status]")),
     }
 }
@@ -1233,6 +1310,11 @@ fn tick(ctx: &Ctx) {
         if !ifc.is_empty() && ifc == cur {
             crate::pool::watch_subscriptions(ctx, &ifc);
             crate::best::watch_best(ctx, &ifc, &read(&health_file(ctx)));
+            // The escape servers' names, re-checked when stale: a provider's
+            // new entry addresses reach sing-box through escape-hosts, live.
+            if ctx.mode() == "host" {
+                crate::escape_dns::refresh(&ctx.cfg, crate::escape_dns::max_age());
+            }
         }
     }
     let hb = ctx.mode() == "local" || health_ok(ctx);

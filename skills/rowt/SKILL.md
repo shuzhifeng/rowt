@@ -198,7 +198,8 @@ replaced**, run `rowt fetch host` (with a working path to GitHub) or `rowt reloa
    Run `rowt use <another tag>` and re-test; don't let the user switch over until one
    passes. Then run `rowt ping` and let the user choose `rowt use <tag>` (pinned,
    never probed), `rowt use best` (rowt picks by median latency and moves off a
-   dead one; needs the watchdog), or `rowt use auto` (sing-box's urltest). With
+   dead one; needs the watchdog), or `rowt use auto` (sing-box's urltest; `--every
+   3m` sets its re-test round, and a follower leaves a dead pick within a minute). With
    `best` or `auto`, re-test your API host too.
 7. **Switch over** (the **user**, once you've handed over the resume command). If
    `AGENT_VIA_VPN`, or the proxy env points at another app, say first: "when you turn
@@ -258,7 +259,8 @@ replaced**, run `rowt fetch host` (with a working path to GitHub) or `rowt reloa
 | why that lane | `rowt explain <domain\|ip>` · `rowt escape errors` / `rowt direct errors` (candidates for escape) |
 | route a site | `rowt escape\|corp\|block\|hotspot add <entry>` (one lane per entry) · `geosite:<name>` (escape and block only) |
 | after a network change | automatic with the watchdog; otherwise `rowt reload` |
-| switch server | `rowt ping` → `rowt use <tag>` / `rowt use best` (rowt picks by median latency) / `rowt use auto` |
+| switch server | `rowt ping` → `rowt use <tag>` / `rowt use best` (rowt picks by median latency) / `rowt use auto [--every 3m]` |
+| re-import a server list that dropped entries | `rowt server import --replace <dump.json>` (or `--apply --replace`) |
 | a venue's login page | automatic with the watchdog; recurring venue: `rowt hotspot add <portal-host>` — `watch.log` names the host and prints the exact command |
 | a tailnet/overlay name fails | automatic (`corp sync` bypasses the zone); check with `rowt explain <name>` — `BYPASS` is the healthy answer, `DIRECT` with an overlay-address note means no sync has run yet |
 | abroad, no firewall | `rowt up local` (back: `rowt up host`) |
@@ -284,7 +286,8 @@ Start with `rowt doctor` plus `rowt status`, and read `~/.config/rowt/log/` (`ho
 - a hot, spinning sing-box;
 - a known-bad engine;
 - a stale watchdog;
-- a login page that never loads.
+- a login page that never loads;
+- a server named by domain refused or unreachable (`escape dns:` in `rowt status`).
 
 Working on rowt's own code or releases? That's `CLAUDE.md` in the rowt repository,
 not this skill.

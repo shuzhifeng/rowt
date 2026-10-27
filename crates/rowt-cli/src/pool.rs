@@ -444,6 +444,7 @@ pub fn remove_servers(ctx: &Ctx, tags: &[String]) -> Result<String, String> {
         }
     }
     set_mode(&manual_file(cfg), 0o600);
+    crate::sources::prune(cfg);
     rebuild(ctx)?;
     out.push_str(&after_import(ctx)?);
     Ok(out)
@@ -455,6 +456,7 @@ pub fn clear_servers(ctx: &Ctx) -> Result<String, String> {
     let manual = manual_file(&ctx.cfg);
     std::fs::write(&manual, "[]\n").map_err(|e| format!("write: {e}"))?;
     set_mode(&manual, 0o600);
+    crate::sources::prune(&ctx.cfg);
     info("manual servers cleared");
     rebuild(ctx)?;
     after_import(ctx)

@@ -566,6 +566,28 @@ are reported as skipped. `PROXY`-rule domains are merged into your escape list.
 A server that came from a subscription is removed by dropping that subscription
 (individually-dead nodes are auto-avoided by `use auto`).
 
+### Re-importing a server list (`--replace`)
+
+An import only ever **adds**. When a list you import again has dropped some
+servers — say a provider moved its entry points and your list now names them
+by domain instead of by address — add `--replace`:
+
+```sh
+./bin/rowt server import --replace servers.json   # a `server dump` file
+./bin/rowt server import --apply --replace         # a review file
+```
+
+Before merging, it drops the manual servers that the last import **from the
+same source** brought in. A dump's source is its file name (`file:servers.json`);
+a review file's is each entry's `_source` (`shadowrocket`, `clash-verge`, …).
+A server another source also brought in stays, and one you added by hand with
+`server add` is never dropped. Which import brought in which server is kept in
+`~/.config/rowt/manual-sources.tsv` (source, tag, type:server:port — no
+credentials); `server rm` and `server clear` keep it current. An import from
+before this file existed recorded nothing, so the first `--replace` from that
+source only adds; it says so, and that `rowt server clear` (every manual server)
+followed by the import starts clean.
+
 `up` runs `probe` (chooses host/vm), brings up the VM if needed, renders the
 configs, starts the router, and points the macOS system proxy at it. Then edit
 which sites escape and reload:
@@ -586,6 +608,7 @@ subscriptions) is a member of a sing-box **selector** group named `escape`.
 ./bin/rowt use JP          # pin a specific server (manual — the default)
 ./bin/rowt use best        # let rowt pick the fastest, by median latency
 ./bin/rowt use auto        # or sing-box's own auto-selection
+./bin/rowt use auto --every 3m   # …re-testing every server every 3 minutes
 ```
 
 **Manual is the default** (`use <tag>`): a plain selector that **never
@@ -604,18 +627,88 @@ stays a plain one, so switching is live; it needs the watchdog
 (`rowt watch install`) to keep re-picking.
 
 `use auto` switches to sing-box's `urltest`, which auto-picks the fastest **live**
-server by its own **single** samples and re-probes them every
-`ROWT_AUTO_INTERVAL` (default 20m). Toggling to or from auto re-renders and
-restarts (the urltest appears/disappears).
+server by its own **single** samples and re-tests every server each round.
+`use auto --every 3m` sets how often a round runs (30s to 30m) and keeps it in
+state, so every later render, reload and watchdog reload uses it; without it the
+round is 20 minutes, and `ROWT_AUTO_INTERVAL` overrides either while it is set;
+`use auto --every default` forgets the saved interval. A round moves the pick
+only to a server at least `ROWT_AUTO_TOLERANCE` ms faster (default 100; sing-box's
+own is 50), so a short `--every` does not flap on one sample's noise.
+Toggling to or from auto, or a new `--every`, re-renders and restarts (the
+urltest appears/disappears, and sing-box reads its interval only at start); a
+`use auto` that changes nothing leaves the router running.
 
-The selector lives wherever the tunnel runs (host in mode `host`, the VM in mode
-`vm`), so selection works identically for both. `sub add` remembers the URLs;
-`sub update` re-fetches them (`R` in Monitor). In `auto`/`best`, the watchdog
-also refreshes every six hours while online and running; unchanged subscriptions
-do not restart the router — and a feed that only reorders its servers counts as
-unchanged — and failed fetches keep the previous servers. Each watchdog refresh
-is in `rowt audit` with its outcome, and a restart it causes as a
-`BEGIN`/`END watchdog reload` pair.
+A round is how `urltest` re-picks for speed. It is not how it leaves a server
+that died: a connection through the pick that fails only deletes the pick's
+figure, and the group keeps dialing it until the next round. So while the router
+runs in `auto`, a small **failover follower** (`watch follow`, started and
+stopped with the router) asks the clash API every 15 s whether the pick still
+has a figure; when it has none — a failed connection, a failed watchdog probe —
+it asks the group to re-test at once, which tests only the servers without a
+fresh figure and moves to a live one. A dead pick is left within one check
+period plus the re-test, well inside a minute, whatever `--every` is. Each move
+is in `watch.log` and the audit log; `rowt status` shows the server auto is on,
+the interval and its source, the follower, and the last switch.
+`ROWT_AUTO_FOLLOW=0` turns the follower off; `ROWT_AUTO_FOLLOW_EVERY` sets its
+period in seconds (both reach the watchdog's agent, like the other `ROWT_*`
+settings). A router an older rowt started, before there was a follower, gets one at its
+next reload.
+
+When the pick changes, connections already open on the old server stay on it.
+After a failover those hang until the app gives up on them;
+`ROWT_AUTO_INTERRUPT=1` makes a switch close them, so apps reconnect through the
+new pick at once. It is off by default because it also cuts healthy connections
+when a round moves the pick only for speed; `rowt status` says when it is on.
+
+### Escape servers named by domain
+
+When a server is named by a domain (`entry.example.com`, not an address), rowt
+resolves that name itself before sing-box dials it — over DoH, asking **both**
+AliDNS (`223.5.5.5`) and DNSPod (`1.12.12.12`) and comparing what they say:
+
+- It **refuses**, by category, answers no public server has — private,
+  loopback, link-local and CGNAT addresses, the reserved and multicast blocks,
+  and `198.18.0.0/15`, the fake-IP range other proxy clients' DNS hands out. A
+  refused answer counts as no answer.
+- When the sources **agree** (or only one of them answers), that answer is used —
+  unless it differs from the last good address. Then it must first pass the
+  probe below: one resolver left alone by a network that blocks the other, or
+  both behind a network that intercepts TLS, is not taken on its word. A real
+  move passes once and is followed; a failed probe keeps the last good address.
+- When they **disagree**, no one source is believed: a hijack can answer with an
+  ordinary public address that no category catches. Each candidate address is
+  put to the delay test **through the server itself** — a copy of the server's
+  outbound dialing that address fetches `generate_204`, as the watchdog's probe
+  does — and an address is used only when it alone passes. Otherwise the last
+  good address stays; with none, the system resolver's answer, if it is not
+  refused (used, never trusted: it never becomes the last good address); with
+  nothing trustworthy, that server is not used.
+
+The answer sing-box is given goes to `~/.config/rowt/escape-hosts`, which
+sing-box reads live: when a provider moves its entry points, the watchdog's next
+check (every 5 minutes) follows them with no restart. The probe runs only for a
+name the sources disagree on: one short-lived `sing-box tools fetch` per
+candidate address, all at once — one connection to that address and one fetch
+through it — capped at `ROWT_HEALTH_TIMEOUT` + 2 seconds (10 s). A refresh with
+no disagreement costs two DoH queries per name and opens nothing else.
+`rowt status` lists every refusal and every disagreement (`escape dns:`), and
+`watch.log` says each as it happens. Knobs, in `~/.config/rowt/escape-dns.txt`:
+
+```
+refuse 192.0.2.0/24             # a sinkhole seen on THIS box: never use it here
+allow entry.example.com 203.0.113.0/24   # this name: only answers inside these
+doh https://223.5.5.5/resolve https://1.12.12.12/dns-query   # the DoH sources (JSON API)
+off                             # resolve server names the old way (dns-direct)
+```
+
+`refuse` is a local, per-box override; rowt ships no addresses in it. A server
+that really does live on a private or CGNAT address behind a name (a box on your
+LAN or tailnet) is refused by default: give it an address literal, an `allow`
+line, or turn the check `off`. Only IPv4 is checked; a name with no A record
+keeps the old resolver. In `vm` mode the servers live in the VM, which this does
+not reach. An answer is asked for again once it is older than
+`ROWT_ESCAPE_DNS_MAX_AGE` seconds (300); `ROWT_ESCAPE_DNS_MAX_AGE=0 rowt render`
+asks now.
 
 ## Do apps need proxy config?
 
@@ -745,7 +838,7 @@ Every command has detailed help: `rowt <command> --help` (or `rowt help <command
 | `report` | full offline diagnostic (deps, configs, per-server reachability, DNS, through-proxy tests, log + audit tail) → `~/.config/rowt/diag-*.txt`, **secrets masked**, for sharing. |
 | `audit [-n N\|all\|path\|clear]` | the **mutation trail** — one line per state-changing op, whether you ran it or the `watch` agent did, with `BEGIN`/`END`/`ABORT`, timing, and a `by=<parent>(<tty>)` field that says whether it was hands-on (`by=zsh`) or the watchdog (`by=launchd`). `BEGIN` is written before the work, so even a command that hangs leaves a trace. Read-only commands aren't recorded. Every **lane membership change** is in it too, as `LANE <from> -> <to> (<n>): <entries>` — an add, an `rm`, every entry of an `import`, a monitor route, a `corp sync` — and an edit made to a lane file outside rowt is logged as `outside rowt` at the next command or watchdog tick. `direct` means "in no lane"; entries are written exactly as in the lane file, so reversing a line is `rowt <lane> add|rm` of the same text. → `~/.config/rowt/log/audit.log`. |
 | `metrics [status\|top\|path\|query]` | **per-domain traffic history** — a `collector` sidecar records bytes in/out per domain/lane into a tiered SQLite store (5s → 1y). `status` shows liveness; `top [secs]` the heaviest domains; `path` the store path + schema; `query "<SQL>"` a read-only SQL passthrough. Surfaced interactively in `monitor` via the `v` flip. See [Traffic metrics](#traffic-metrics). |
-| `config [list\|export\|import]` | **back up / move the whole setup** to another machine — or, with `export --to shadowrocket`, hand it to Shadowrocket on your iPhone (see [Your rules on the iPhone](#your-rules-on-the-iphone-shadowrocket)). `export [--no-servers]` bundles the source-of-truth files (server pool, subscriptions, escape/corp/block/hotspot lane rules) into a `.tgz` — `--no-servers` omits the pool, so the lane rules are safe to share or commit. `import <file>` **merges** the bundle's lane lists into yours by default (union, deduped, single-lane; entries the bundle would pull into another lane are listed and confirmed first) and leaves your server pool as-is; `--replace` overwrites the matching files instead — a whole-bundle restore. Either re-renders after. Skips the machine-specific `host.json`/`state`/binary — those regenerate via `render`/`up`. Bundle holds credentials: move it encrypted. |
+| `config [list\|export\|import]` | **back up / move the whole setup** to another machine — or, with `export --to shadowrocket`, hand it to Shadowrocket on your iPhone (see [Your rules on the iPhone](#your-rules-on-the-iphone-shadowrocket)). `export [--no-servers]` bundles the source-of-truth files (server pool, subscriptions, escape/corp/block/hotspot lane rules, `escape-dns.txt`, `manual-sources.tsv`) into a `.tgz` — `--no-servers` omits the pool and those two (they name servers), so the lane rules are safe to share or commit. `import <file>` **merges** the bundle's lane lists into yours by default (union, deduped, single-lane; entries the bundle would pull into another lane are listed and confirmed first) and leaves your server pool as-is; `--replace` overwrites the matching files instead — a whole-bundle restore. Either re-renders after. Skips the machine-specific `host.json`/`state`/binary — those regenerate via `render`/`up`. Bundle holds credentials: move it encrypted. |
 | `monitor` | **full-screen TUI** (`htop`-style) — the live view of everything at once: connections + throughput, errors/blocked over a rolling window, and server health, plus confirmed, reversible controls (server switch, lane routing, proxy toggle). See [Monitor (TUI)](#monitor-tui). |
 | `run <command> [args…]` | run a command through whatever proxy path actually reaches the internet — probes, in order, the current shell proxy env → the macOS system proxy → rowt's port (if the router is up and the system proxy is off) → direct, and execs the command with the first where the target host answers (default `https://www.google.com/`; override `ROWT_RUN_TARGET`). Aborts without running if none work. Handy for CLI tools (`claude`, `git`, `npm`…) that ignore the system proxy: `rowt run claude`. |
 
@@ -756,14 +849,14 @@ Every command has detailed help: `rowt <command> --help` (or `rowt help <command
 | `server list` | list servers (`*` = active). |
 | `server add '<vless://\|vmess://\|anytls://\|hysteria2://\|ss://\|trojan://\|tuic://…>' [more…]` | add manual server(s) from link(s), deduped. |
 | `server rm <tag>` / `server clear` | remove a manual server / clear all manual. |
-| `server import [--from shadowrocket\|clash-verge\|v2box\|flclash] [--apply]` | import servers **and** subs from another client via an editable, source-independent review file. |
-| `server import <file.json>` | restore manual servers from a `server dump` (round-trips). |
+| `server import [--from shadowrocket\|clash-verge\|v2box\|flclash] [--apply [--replace]]` | import servers **and** subs from another client via an editable, source-independent review file. |
+| `server import [--replace] <file.json>` | add the manual servers in a `server dump` (round-trips). `--replace` first drops what the last import from the same source brought in (see *Re-importing a server list*). |
 | `server dump [file]` | export the manual servers as JSON (backup; has secrets). Subscription servers come from their subs — use `sub dump`. |
 | `sub list\|add <url>\|rm <n>\|update\|clear` | manage subscriptions. |
 | `sub import [--apply]` | same as `server import` (Shadowrocket). |
 | `sub import <file>` | restore subscriptions from a `sub dump` (round-trips). |
 | `sub dump [file]` | export the subscription URLs (one per line). |
-| `use <tag>` / `use best` / `use auto` | pin a server (manual, nothing probed); let rowt pick by median latency, re-checked by the watchdog (`best`); or sing-box's urltest (`auto`). |
+| `use <tag>` / `use best` / `use auto [--every D]` | pin a server (manual, nothing probed); let rowt pick by median latency, re-checked by the watchdog (`best`); or sing-box's urltest (`auto`), re-testing every D (saved; default 20m), with a follower that leaves a dead pick within a minute. |
 | `ping [tag]` | **parallel** latency test through the tunnel (fastest first, `*`=active). Each server is sampled **three times** and the **median** is shown — the same figure `rowt monitor` shows (two answers give their mean, one gives itself). With no answer the row says which kind: `no answer in 8s` when every try ran out of time (a slow link reads exactly like a dead server, so it says nothing about which; raise `ROWT_PING_TIMEOUT`), `unreachable` when a try failed outright. One sample over a lossy link spikes or fails on its own. `auto` still switches on sing-box's own figure, the latest single sample. `ROWT_PING_URL` (default Google's `generate_204`) / `ROWT_PING_TIMEOUT` (8s per sample). |
 | `probe` | with corp VPN up, test all servers (default route vs physical NIC) and pick `host` or `vm`. |
 
@@ -1049,7 +1142,10 @@ lima/rowt-vm.yaml        bridged Lima VM template (mode vm)
 ```
 
 The live, user-editable copies of the `*-domains.txt` lists live at
-`~/.config/rowt/`; the repo files are just first-run templates. The hotspot
+`~/.config/rowt/`; the repo files are just first-run templates. Beside them,
+rowt writes `escape-hosts` and `escape-dns.tsv` (the checked addresses of
+servers named by domain, and why) and `manual-sources.tsv` (which import
+brought in which manual server); `escape-dns.txt` is yours, optional. The hotspot
 lane (`hotspot-domains.txt`, the captive-portal hosts that bypass the proxy)
 has no template — `rowt hotspot add` creates it.
 

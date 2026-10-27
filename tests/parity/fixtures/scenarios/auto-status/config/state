@@ -1,0 +1,6 @@
+mode=host
+selected=auto
+auto_interval=3m
+auto_switch=2026-10-26 08:00:00 alpha -> beta
+proxy_intent=on
+clash_secret=PARITYFIXTURESECRET00000

@@ -15,6 +15,7 @@
 
 mod corp;
 mod diag;
+mod escape_dns;
 mod fetch;
 mod help;
 mod lifecycle;
@@ -25,6 +26,7 @@ mod onboard;
 mod pool;
 mod shell;
 mod skill;
+mod sources;
 mod vm;
 mod watch;
 mod seeds {
@@ -1568,6 +1570,21 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
         // tag->tag change in manual mode switches live over the clash API.
         "use" => {
             let ctx = Ctx::new(cfg.clone());
+            // `--every D` / `--every=D` anywhere; the first other word is the tag.
+            let (mut tag, mut every): (Option<String>, Option<String>) = (None, None);
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                if a == "--every" {
+                    match it.next() {
+                        Some(v) => every = Some(v.clone()),
+                        None => die(&cfg, &format!("usage: {PROG} use auto --every <duration>   (e.g. 3m or 90s)")),
+                    }
+                } else if let Some(v) = a.strip_prefix("--every=") {
+                    every = Some(v.to_string());
+                } else if tag.is_none() {
+                    tag = Some(a.clone());
+                }
+            }
             if ctx.mode() == "local" {
                 die(&cfg, &format!("local mode has no tunnel to select from — '{PROG} up host' to bring one back"));
             }
@@ -1576,7 +1593,19 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
             if servers.is_empty() {
                 die(&cfg, "no servers imported");
             }
-            let Some(tag) = rest.first().cloned() else {
+            if let Some(e) = &every {
+                if tag.as_deref() != Some("auto") {
+                    die(&cfg, &format!("--every sets how often 'auto' re-tests its servers — use: {PROG} use auto --every <duration>"));
+                }
+                // 30m is sing-box's idle timeout for a urltest, and it refuses a
+                // longer interval; under 30s every server is probed twice a
+                // minute for nothing (a dead pick is left by the follower).
+                // `default` forgets the saved interval (from PR #4).
+                if e != "default" && !matches!(rowt_core::render::duration_secs(e), Some(30..=1800)) {
+                    die(&cfg, &format!("--every wants a duration from 30s to 30m, like 3m or 90s, or 'default' (got '{e}')"));
+                }
+            }
+            let Some(tag) = tag else {
                 return run(&cfg, "server", &["list".to_string()]);
             };
             let known = |t: &str| servers.iter().any(|s| s.get("tag").and_then(|x| x.as_str()) == Some(t));
@@ -1588,9 +1617,32 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 return best::use_best(&ctx, &prev);
             }
             lifecycle::sset(&ctx, "selected", &tag);
+            if every.as_deref() == Some("default") {
+                lifecycle::sset(&ctx, "auto_interval", "");
+            } else if let Some(e) = &every {
+                lifecycle::sset(&ctx, "auto_interval", e);
+                let env = std::env::var("ROWT_AUTO_INTERVAL").unwrap_or_default();
+                if !env.is_empty() && env != *e {
+                    eprintln!("warning: saved --every {e}, but ROWT_AUTO_INTERVAL={env} is set and wins while it is");
+                }
+            }
+            // Already auto, and the render writes exactly what the router runs
+            // from (same --every, nothing else changed): no restart. Any other
+            // change restarts — sing-box reads the urltest interval at start.
+            let configs = || -> Option<Vec<u8>> {
+                let mut b = std::fs::read(ctx.host_cfg()).ok()?;
+                b.extend(std::fs::read(ctx.vm_cfg()).unwrap_or_default());
+                Some(b)
+            };
+            let before = configs();
             lifecycle::cmd_render(&ctx)?;
             if lifecycle::host_running(&ctx).is_none() {
                 eprintln!("==> escape -> {tag} (applies on next '{PROG} router up')");
+                return Ok(String::new());
+            }
+            if prev == "auto" && tag == "auto" && before.is_some() && before == configs() {
+                eprintln!("==> escape -> auto, unchanged (re-probed every {}) — router not restarted",
+                          lifecycle::auto_interval(&ctx));
                 return Ok(String::new());
             }
             let live = prev != "auto" && tag != "auto"
@@ -1603,7 +1655,7 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 lifecycle::router_up(&ctx)?;
                 if tag == "auto" {
                     eprintln!("==> escape -> auto (fastest live server, re-probed every {})",
-                              env_or("ROWT_AUTO_INTERVAL", "20m"));
+                              lifecycle::auto_interval(&ctx));
                 } else {
                     eprintln!("==> escape -> {tag}");
                 }
@@ -1614,9 +1666,12 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
         // rendered configs, `state` and the runtime trees are machine-specific
         // and are rebuilt by render/up.
         "config" => {
+            // escape-dns.txt and manual-sources.tsv travel too: no credential
+            // in either, but both name servers, so they sit in POOL below.
             let src = ["servers.json", "manual.json", "import-review.json", "subs.txt",
                        "outbound.json", "escape-domains.txt", "corp-domains.txt",
-                       "block-domains.txt", "hotspot-domains.txt"];
+                       "block-domains.txt", "hotspot-domains.txt", "escape-dns.txt",
+                       "manual-sources.tsv"];
             match rest.first().map(|s| s.as_str()).unwrap_or("list") {
                 "list" => {
                     let mut o = format!("config bundle — '{PROG} config export' packs the present ones:");
@@ -1633,8 +1688,9 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                     // credentials, safe to share or commit) — the same set the
                     // credentials warning is about. First non-flag is the file,
                     // as the shell's `$1` was.
-                    const POOL: [&str; 5] =
-                        ["servers.json", "manual.json", "import-review.json", "subs.txt", "outbound.json"];
+                    const POOL: [&str; 7] =
+                        ["servers.json", "manual.json", "import-review.json", "subs.txt", "outbound.json",
+                         "escape-dns.txt", "manual-sources.tsv"];
                     let (no_servers, out) = export_args(&rest[1..]).unwrap_or_else(|f| die(
                         &cfg,
                         &format!("unknown flag: {f}  (usage: {PROG} config export [--to rowt|shadowrocket] [file] [--routes-only])"),
@@ -1806,13 +1862,21 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 "clear" => pool::clear_servers(&ctx),
                 // A JSON file (not --apply/--from) restores a `server dump`;
                 // anything else is the other-clients workflow.
-                "import" => match rest.get(1) {
-                    Some(f) if f != "--apply" && f != "--from" && Path::new(f).is_file() => {
-                        importer::load_dump(&ctx, Path::new(f))
+                // `--replace`, anywhere, is taken out first (`_IMPORT_REPLACE`).
+                "import" => {
+                    let mut replace = false;
+                    let mut args: Vec<String> = Vec::new();
+                    for a in &rest[1.min(rest.len())..] {
+                        if a == "--replace" { replace = true } else { args.push(a.clone()) }
                     }
-                    _ => importer::cmd(&ctx, &rest[1.min(rest.len())..]),
-                },
-                _ => die(&cfg, &format!("usage: {PROG} server [list | add <link>… | rm <tag>… | clear | import <--detect|--from SRC [--output FILE]|--apply [--input FILE]> | dump [file]]")),
+                    match args.first() {
+                        Some(f) if f != "--apply" && f != "--from" && Path::new(f).is_file() => {
+                            importer::load_dump(&ctx, Path::new(f), replace)
+                        }
+                        _ => importer::cmd(&ctx, &args, replace),
+                    }
+                }
+                _ => die(&cfg, &format!("usage: {PROG} server [list | add <link>… | rm <tag>… | clear | import <--detect|--from SRC [--output FILE]|--apply [--input FILE] [--replace]|[--replace] FILE> | dump [file]]")),
             }
         }
         "sub" => {
@@ -1887,7 +1951,7 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                     Some(f) if f != "--apply" && Path::new(f).is_file() => {
                         pool::load_sub_dump(&Ctx::new(cfg.clone()), Path::new(f))
                     }
-                    _ => importer::cmd(&Ctx::new(cfg.clone()), &rest[1.min(rest.len())..]),
+                    _ => importer::cmd(&Ctx::new(cfg.clone()), &rest[1.min(rest.len())..], false),
                 },
                 "clear" => pool::clear_subs(&Ctx::new(cfg.clone())),
                 _ => die(&cfg, &format!("usage: {PROG} sub [list | add <url>… | rm <n|url> | update | clear | import [--apply] | dump [file]]")),
@@ -1982,9 +2046,47 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
             if let Some(now) = lifecycle::clash_selected(&ctx) {
                 if ctx.sget("selected") == "best" {
                     o.push(format!("active:       {now} (best — {})", best::latency_ms(&ctx, &now)));
+                } else if now == "auto" {
+                    let pick = lifecycle::clash_auto_pick(&ctx).unwrap_or_else(|| "?".into());
+                    o.push(format!("active:       auto → {pick} (sing-box urltest's pick)"));
                 } else {
                     o.push(format!("active:       {now}"));
                 }
+            }
+            // `auto`: how often its round runs and where that came from, whether
+            // the failover follower is on, and the last move it made.
+            if ctx.sget("selected") == "auto" && mode != "local" {
+                let src = if !std::env::var("ROWT_AUTO_INTERVAL").unwrap_or_default().is_empty() {
+                    "ROWT_AUTO_INTERVAL"
+                } else if !ctx.sget("auto_interval").is_empty() {
+                    "use auto --every"
+                } else {
+                    "default"
+                };
+                let follow = env_or("ROWT_AUTO_FOLLOW", "1");
+                let fl = if follow != "1" {
+                    format!("failover follower off (ROWT_AUTO_FOLLOW={follow})")
+                } else if lifecycle::follower_running(&ctx) {
+                    format!("failover follower running (checks every {}s)", env_or("ROWT_AUTO_FOLLOW_EVERY", "15"))
+                } else if lifecycle::host_running(&ctx).is_some() {
+                    format!("failover follower NOT running (a router started before it existed gets one at its next reload) — '{PROG} reload' starts it")
+                } else {
+                    "failover follower starts with the router".to_string()
+                };
+                o.push(format!("auto:         re-tests every server every {} ({src}); {fl}",
+                               lifecycle::auto_interval(&ctx)));
+                if env_or("ROWT_AUTO_INTERRUPT", "0") == "1" {
+                    o.push("              a switch closes the connections left on the old pick (ROWT_AUTO_INTERRUPT=1)".into());
+                }
+                let sw = ctx.sget("auto_switch");
+                if !sw.is_empty() {
+                    o.push(format!("last switch:  {sw}"));
+                }
+            }
+            // The escape servers' names as rowt resolved and checked them
+            // (escape_dns): what was refused, and what sing-box was given.
+            if mode == "host" {
+                o.extend(escape_dns::status(&cfg));
             }
             if mode == "vm" {
                 o.push(format!("vm ip:        {}", ctx.sget("vm_ip")));
@@ -2198,6 +2300,12 @@ fn main() -> ExitCode {
     // wrong, and auditing it would put a BEGIN/END pair in the trail for every
     // router start — noise in the one record that exists to be readable. The
     // shell has no equivalent line because its splitter is a Python process.
+    // The escape-server name check (escape_dns), which bin/rowt reaches here so
+    // both implementations run one copy of it. Same reasoning as the splitter:
+    // a helper call is not a command, and gets no preamble and no audit line.
+    if args.first().map(|s| s.as_str()) == Some("_escape-dns") {
+        return ExitCode::from(escape_dns::helper(&args[1..]) as u8);
+    }
     if args.first().map(|s| s.as_str()) == Some("_splitter") {
         let (Some(hl), Some(ld)) = (args.get(1), args.get(2)) else {
             eprintln!("error: _splitter needs a log path and a log dir");

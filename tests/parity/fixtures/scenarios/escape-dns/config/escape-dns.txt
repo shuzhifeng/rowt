@@ -1,0 +1,3 @@
+# known sinkholes, and where entry-b may live
+refuse 198.51.100.66/32
+allow entry-b.example 192.0.2.0/24

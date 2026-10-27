@@ -66,6 +66,10 @@ class Sandbox(AbstractContextManager):
             "ROWT_CAPTIVE_CHECK": "0",
             "ROWT_CAPTIVE_RETRY": "",
             "ROWT_GEOSITE_BASE": "http://127.0.0.1:1",
+            # A router this sandbox starts must not leave `auto`'s failover
+            # follower polling after the test; tests/test_auto_follow.py turns
+            # it on where it is the subject.
+            "ROWT_AUTO_FOLLOW": "0",
             "TERM": "dumb", "LC_ALL": "C", "TZ": "UTC",
             "SUB_TEST_ROOT": str(self.root),
             "SUB_TEST_RECORDER": str(PARITY / "shims/_recorder"),
@@ -78,6 +82,24 @@ last="${!#}"
 if [ "$last" = "${SUB_TEST_FEED:-}" ]; then
   exec /usr/bin/curl "$@"
 fi
+# A fake clash API a test serves on its own port (tests/test_auto_follow.py).
+if [ -n "${SUB_TEST_CLASH:-}" ]; then
+  case "$last" in "http://127.0.0.1:$SUB_TEST_CLASH/"*) exec /usr/bin/curl "$@" ;; esac
+fi
+# Fake DoH sources (tests/test_escape_dns.py; SUB_TEST_DOH lists their ports),
+# recorded like everything else and then answered for real — without
+# `--interface`, which would bind the query to the sandbox's pretend NIC.
+for doh in ${SUB_TEST_DOH:-}; do
+  case "$last" in "http://127.0.0.1:$doh/"*)
+    printf 'curl' >> "$PARITY_TRACE"; printf ' %q' "$@" >> "$PARITY_TRACE"; echo >> "$PARITY_TRACE"
+    args=()
+    while [ "$#" -gt 0 ]; do
+      case "$1" in --interface) shift ;; *) args+=("$1") ;; esac
+      shift
+    done
+    exec /usr/bin/curl "${args[@]}" ;;
+  esac
+done
 case "$last" in
   http://127.0.0.1:9090/proxies/*/delay\?*) echo '{"delay":12}'; exit 0 ;;
 esac
@@ -88,7 +110,7 @@ printf '%s\\n' "$1" >> "$SUB_TEST_ROOT/router-events"
 case "$1" in
   version) echo 'sing-box version 1.13.14' ;;
   check) [ ! -f "$SUB_TEST_ROOT/reject-config" ] ;;
-  run) exec /bin/sleep 300 ;;
+  run) echo "$$" >> "$SUB_TEST_ROOT/engine-pids"; exec /bin/sleep 300 ;;
 esac
 """)
         feed = self.root / "feed.txt"
@@ -181,30 +203,58 @@ esac
     def pool(self):
         return json.loads((self.cfg / "servers.json").read_text())
 
+    @staticmethod
+    def command_of(pid):
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
+        return out.stdout.strip() if out.returncode == 0 else ""
+
+    def recorded_engines(self):
+        """Every fake engine `run` this sandbox saw, by the pid it wrote down.
+
+        A fake engine writes its pid to engine-pids, then execs `sleep 300`:
+        the same pid. Since 3.6.7 rowt starts its router in a session of its
+        own, so a router a reload started is in no group this sandbox created,
+        and a reload replaces host.pid — the record is what still names it."""
+        path = self.root / "engine-pids"
+        if not path.exists():
+            return []
+        return [int(line) for line in path.read_text().split() if line.isdigit()]
+
+    def stray_pids(self):
+        """This sandbox's processes still alive outside its own process groups:
+        recorded fake engines, and an `auto` follower rowt detached."""
+        found = [pid for pid in self.recorded_engines() if self.command_of(pid) == "/bin/sleep 300"]
+        follow = self.cfg / "follow.pid"
+        if follow.exists():
+            text = follow.read_text().strip()
+            if text.isdigit() and "watch follow" in self.command_of(int(text)):
+                found.append(int(text))
+        return found
+
     def __exit__(self, *args):
         self.release.set()
-        # Do not signal extinct process groups: macOS can report EPERM for
-        # these. Only groups with a live process we created need cleanup.
-        live = [p.pid for p in self.processes if p.poll() is None]
-        pidfile = self.cfg / "host.pid"
-        if pidfile.exists():
-            live.append(int(pidfile.read_text()))
-        groups = set()
-        for pid in live:
-            try:
-                groups.add(os.getpgid(pid))
-            except ProcessLookupError:
-                pass
         try:
-            for group in groups:
-                if group not in {p.pid for p in self.processes}:
-                    raise AssertionError("refusing to signal a process outside the test")
+            # Our own processes, by the groups we created (start_new_session):
+            # each Popen leads its group. Extinct groups are skipped — macOS
+            # can report EPERM for those.
+            for process in self.processes:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            # Then what rowt detached, each by the pid it recorded, and only
+            # while that pid still runs what the record says it is.
+            for pid in self.stray_pids():
                 try:
-                    os.killpg(group, signal.SIGKILL)
+                    os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
             for process in self.processes:
-                process.wait(timeout=5)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         finally:
             if self.server:
                 self.server.shutdown()

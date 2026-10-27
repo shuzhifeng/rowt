@@ -11,6 +11,8 @@ pub mod bplist;
 pub mod cksum;
 pub mod classify;
 pub mod corpview;
+pub mod escapedns;
+pub mod follow;
 pub mod foreign;
 pub mod foreignio;
 pub mod geosite;

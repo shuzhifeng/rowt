@@ -154,6 +154,67 @@ internal-only split-horizon zones. (This was the rowt < 3.1.1 bug: proxied
 corp names failed with `lookup …: SERVFAIL` in `host.log` while plain
 `ping`/`dig` — which use the system resolver — worked fine.)
 
+**The escape servers' own names are resolved by rowt, not by sing-box's DNS.**
+A member outbound's server name goes to one DNS server picked by name
+(`domain_resolver`, else `route.default_domain_resolver`), and DNS rules — the
+only place sing-box can filter an answer — never see that lookup
+(`common/dialer/dialer.go`, 1.13). So sing-box can neither refuse a poisoned
+answer for a server name nor fall back to a second resolver — and a server name
+can be answered wrong: plain DNS hijacked to a sinkhole, or a resolver still
+handing out an address the provider has retired. rowt therefore resolves those
+names itself (`rowt_core::escapedns`, one implementation that bin/rowt reaches
+as `rowt-rs _escape-dns`):
+
+- every DoH source is asked — AliDNS `/resolve` and DNSPod `/dns-query`, both
+  the JSON API over the physical NIC — one after the other, and compared;
+- an answer is refused, by category only, when no public server could have it:
+  RFC 1918, loopback, link-local, CGNAT, `0/8`, `192.0.0.0/24`, multicast,
+  `240/4`, and `198.18.0.0/15` (the fake-IP range proxy clients' DNS hands
+  out); plus any `refuse` range in `escape-dns.txt`, a local per-box override
+  that ships empty. A name with an `allow` list there takes exactly the answers
+  inside it instead — how a server that really lives on a private or tailnet
+  address is let through — and a `refuse` range still wins. A refused answer is
+  no answer;
+- sources that agree (or the one that answered) are believed — unless the
+  answer has an address the LAST GOOD answer lacks. The last good answer is
+  what was verified before: a DoH answer taken, a probe passed, or one of those
+  kept; never the system resolver's tie-break. A differing answer must pass the
+  probe below before it replaces it (verdict `moved`), or the last good answer
+  is held (`held`): one resolver left alone by a network that blocks the other,
+  or both behind one that intercepts TLS, are not taken on their word. A real
+  move costs one probe;
+- sources that disagree are not, because a hijack can answer with an ordinary
+  public address no category catches — and one resolver may repeat what the
+  network's resolver says while another does not. Each candidate is put to the
+  delay test THROUGH the server: a twin of the name's first member, dialing
+  that address with everything that followed the name kept (TLS server name, a
+  ws/http/httpupgrade Host), fetches the health URL by `sing-box tools fetch`
+  — the same request urltest and the watchdog's probe make, so a sinkhole that
+  merely accepts the connection fails it. Addresses that pass, all from one
+  source: used. None, several sources' worth, or no probe possible (no
+  sing-box yet): the last good addresses stay, and a one-source answer never
+  replaces them; with none, the system resolver's answer (`dig`) if it is not
+  refused — used, never trusted, so a later refresh asks it again rather than
+  calling it the last good answer; with nothing trustworthy, the member gets no
+  address and fails closed rather than dial a guess.
+
+The probe costs nothing in the common case. Per disputed name and refresh it
+starts one short-lived sing-box per candidate, all at once, each opening one
+connection to its address and one fetch through it, killed past
+`ROWT_HEALTH_TIMEOUT` + 2 s; measured with a real engine against a local
+acceptor and a local SOCKS server, a whole render with one disputed name took
+about a second.
+
+The answers land in `escape-hosts`, a hosts file; each checked member names a
+`hosts` DNS server (`dns-escape`) as its `domain_resolver`, with `ipv4_only` and
+`disable_cache`. sing-box re-stats that file at most every 5 s and re-reads it
+when it changes (measured on 1.13.14 with a running router: a rewrite moved the
+next connection to the new address, no restart). So a refresh — at each render,
+and by the watchdog for any name older than 5 minutes — follows a provider's new
+entry addresses live. A name rowt has never had an answer for keeps
+`dns-direct`, as before. `escape-dns.tsv` records each verdict for `rowt status`.
+Not in `vm` mode: there the members live in the guest.
+
 **A zone only a scoped resolver answers is not routed at all — it is bypassed.**
 Picking a lane for such a name picks which resolver fails: `escape` asks the VPS,
 `direct` asks AliDNS over DoH, `corp` asks `/etc/resolv.conf`'s primary, and none
@@ -467,7 +528,29 @@ as the only VPN, "direct" just meant "off my tunnel". escape splits that
     every delay test overwrites sing-box's one stored figure per server (a failure
     deletes it), there is no API to store a median, and the group skips re-testing
     any server whose figure is younger than its interval — so it also switches on
-    whatever single sample another prober wrote last.
+    whatever single sample another prober wrote last. Its interval is
+    `use auto --every` (saved in state; default 20m; `ROWT_AUTO_INTERVAL` wins).
+    A round is also the ONLY time the group re-picks (`urltest.go`: a failed dial
+    through the pick deletes its figure and nothing more), so on its own a dead
+    pick is dialed until the next round. No urltest setting separates the two:
+    `interval` paces both the round and the freshness test, `tolerance` only
+    biases the choice, and `idle_timeout` only pauses the rounds. Hence the
+    **failover follower** (`watch follow`), a sidecar the router starts in
+    `auto` and stops with itself: every 15 s it reads the pick and its figure
+    from the clash API, and when the figure is gone asks the group to re-test
+    now (`GET /group/auto/delay`), which re-tests only the servers without a
+    fresh figure and moves to a live one — a round's re-pick, early. A fruitless
+    re-test backs off (30 s doubling to 10 min). Not the watchdog tick: that runs
+    every 120 s and does far more, so it could not meet a one-minute bound; it
+    feeds the follower instead, since its failed probe of `auto` deletes the
+    pick's figure too. Checked on the engine as well as its source:
+    `tests/test_auto_follow.py` drives a real sing-box 1.13.14, where one
+    failed connection through the pick empties its history and leaves the
+    group on it, and the follower moves the group off it within the minute.
+    The urltest's `tolerance` (`ROWT_AUTO_TOLERANCE`, default 100 ms), the
+    opt-in `interrupt_exist_connections` (`ROWT_AUTO_INTERRUPT=1`),
+    `use auto --every default`, and `ROWT_AUTO_INTERVAL` reaching the
+    watchdog's agent came from PR #4 by shuzhifeng.
 - **A network with no exit (not rowt's to fix).** `restart` and `reload`
   recreate sing-box and the system-proxy setting; they leave the Wi-Fi
   association, the DHCP lease and the route table alone. When those are the

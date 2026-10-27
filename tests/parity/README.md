@@ -154,7 +154,9 @@ dies with the case instead of outliving the run.
 
 Three `.tgz` files under `fixtures/` are what `config import` is pointed at:
 `config-bundle.tgz` (a well-formed bundle, every file stored 0644 so the 0600
-the import applies to the four secret-bearing ones is visible in `fsstate`),
+the import applies to the four secret-bearing ones — and to manual-sources.tsv —
+is visible in `fsstate`; it also carries an `escape-dns.txt`, in documentation
+ranges),
 `not-a-bundle.tgz` (a readable archive carrying neither `servers.json` nor
 `escape-domains.txt`), and `bundle-no-servers.tgz` (`servers.json` is `[]`,
 which still renders — see PORTING.md §6.7). They are binary and committed, so

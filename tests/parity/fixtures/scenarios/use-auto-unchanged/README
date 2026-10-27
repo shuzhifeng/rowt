@@ -1,0 +1,7 @@
+`use auto` with the router up, already in auto, `--every 3m` already saved, and
+host.json/vm.json exactly what this state renders (committed from a render of
+it; no sandbox path appears in either). The render changes nothing, so the
+router is NOT restarted — `use auto --every 3m` run by a fleet play on every
+host must not drop its connections. A changed interval still restarts, since
+sing-box reads the urltest interval only at start; that path is not run here
+(router-up cases never restart the router, see tests/parity/README.md).

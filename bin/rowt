@@ -24,7 +24,8 @@
 # pins one server and a plain selector never health-checks its members, so
 # flaky/dead servers stay idle and can't spin the CPU. `use auto` switches to a
 # urltest that auto-picks the fastest LIVE server and re-probes them every
-# ROWT_AUTO_INTERVAL (default 20m). The selector lives wherever the tunnel runs
+# `use auto --every` (default 20m; ROWT_AUTO_INTERVAL overrides), with a follower
+# that leaves a dead pick within seconds. The selector lives wherever the tunnel runs
 # (host in mode host, the VM in mode vm).
 #
 # Servers are VLESS / VMess / AnyTLS / hysteria2 / Shadowsocks / Trojan / TUIC, from manual links
@@ -59,7 +60,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.6.11"
+ROWT_VERSION="3.7.0"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -119,6 +120,7 @@ NET_DETECT="$HERE/config/net-detect.py"          # scutil --dns -> internal/corp
 IMPORT_MERGE="$HERE/config/import-merge.py"       # accumulate a client's extract into a review file (dedup + _source)
 IMPORT_REVIEW="$CFG/import-review.json"           # editable, source-independent import (secret)
 SR_REVIEW="$IMPORT_REVIEW"                        # back-compat alias (was sr-review.json)
+_IMPORT_REPLACE=0                                 # `server import --replace` (see _manual_import)
 MANUAL="$CFG/manual.json"                        # manually-imported servers (secret)
 SUBS_FILE="$CFG/subs.txt"                        # subscription URLs, one per line
 FINAL_ROUTE="${ROWT_FINAL:-direct}"            # bucket for unlisted traffic
@@ -154,7 +156,28 @@ GFW_TIMEOUT="${ROWT_GFW_TIMEOUT:-3}"            # seconds per canary
 PING_URL="${ROWT_PING_URL:-https://www.gstatic.com/generate_204}"
 PING_TIMEOUT="${ROWT_PING_TIMEOUT:-8}"          # seconds per sample (three per server)
 LOG_LEVEL="${ROWT_LOG_LEVEL:-warn}"             # sing-box log level (info is very noisy)
-AUTO_INTERVAL="${ROWT_AUTO_INTERVAL:-20m}"       # how often 'auto' re-probes all servers
+# How often 'auto' re-probes all servers: ROWT_AUTO_INTERVAL, else the saved
+# `use auto --every`, else 20m — read at every render by _auto_interval.
+#
+# `auto`'s fast failover (see `watch follow`). sing-box's urltest only re-picks on
+# its own interval: a dial through the picked server that fails just deletes that
+# server's figure, and the group goes on using it until the next round. So while
+# the router runs in `auto`, a small follower asks the clash API every
+# AUTO_FOLLOW_EVERY seconds whether the pick still has a figure, and when it has
+# none asks the group to re-test at once — which re-tests only the servers
+# without a fresh figure and moves off the dead one. Local calls only; it never
+# probes a server itself.
+AUTO_FOLLOW="${ROWT_AUTO_FOLLOW:-1}"              # 1 = run the follower in `auto`, 0 = off
+# The urltest's other two knobs (from PR #4, by shuzhifeng). tolerance: how many
+# ms faster another server must test before a round takes the pick from the
+# one in use, so a short --every does not flap on one sample's noise (sing-box's
+# own default is 50). interrupt_exist_connections: a switch also closes the
+# connections still open on the old pick, so apps reconnect through the new one
+# at once instead of waiting on a dead server — but it cuts healthy
+# connections too when a round moves for speed, so it is opt-in.
+AUTO_TOLERANCE="${ROWT_AUTO_TOLERANCE:-100}"     # ms, 0–99999
+AUTO_INTERRUPT="${ROWT_AUTO_INTERRUPT:-0}"       # 1 = a switch closes the old pick's connections
+AUTO_FOLLOW_EVERY="${ROWT_AUTO_FOLLOW_EVERY:-15}" # seconds between its checks
 # `best`: rowt's own auto mode. The watchdog measures each server as the median
 # of three delay samples, keeps them in LATENCY_TABLE (shared with `rowt ping`
 # and the monitor), and keeps the current server unless another beats it by more
@@ -377,6 +400,38 @@ clash_curl() { # $1=method $2=path [$3=json-body]
 
 # The member the selector is currently on (auto or a server tag), live.
 clash_selected() { clash_curl GET /proxies/escape 2>/dev/null | jq -r '.now // empty' 2>/dev/null || true; }
+# The server sing-box's urltest `auto` is on right now, live (empty if unknown).
+clash_auto_pick() { clash_curl GET /proxies/auto 2>/dev/null | jq -r '.now // empty' 2>/dev/null || true; }
+
+# How often `auto`'s urltest re-tests every server. ROWT_AUTO_INTERVAL wins when
+# set; otherwise what `use auto --every` saved, so a reload or a watchdog render
+# keeps it; otherwise 20m. Read at every render.
+_auto_interval() {
+  if [ -n "${ROWT_AUTO_INTERVAL:-}" ]; then printf '%s\n' "$ROWT_AUTO_INTERVAL"; return 0; fi
+  local v; v="$(sget auto_interval)"
+  printf '%s\n' "${v:-20m}"
+}
+
+# AUTO_TOLERANCE as a JSON number: whole milliseconds, 0 to 99999. Fails for
+# anything else; cmd_render dies on that before anything uses it.
+_auto_tolerance() {
+  case "$AUTO_TOLERANCE" in ''|*[!0-9]*|??????*) return 1 ;; esac
+  echo "$(( 10#$AUTO_TOLERANCE ))"
+}
+
+# Seconds in a `use auto --every` duration — whole numbers with s, m or h, run
+# together as Go writes them (90s, 3m, 1m30s, 1h). Empty for anything else.
+_duration_secs() {
+  printf '%s' "${1:-}" | LC_ALL=C awk '
+    /^([0-9]+[smh])+$/ {
+      s = $0; t = 0
+      while (match(s, /^[0-9]+[smh]/)) {
+        n = substr(s, 1, RLENGTH - 1) + 0; u = substr(s, RLENGTH, 1)
+        t += n * (u == "h" ? 3600 : (u == "m" ? 60 : 1)); s = substr(s, RLENGTH + 1)
+      }
+      print t
+    }'
+}
 
 # Count non-comment, non-blank subscription lines (single clean integer).
 sub_count() {
@@ -1766,22 +1821,47 @@ detect_iface() {
 
 # servers.json -> [ ...members, (urltest 'auto' when $sel=="auto"), escape(selector) ]
 # $1=servers-file  $2=bind-interface-or-empty  $3=selected-default
-# $sel=="auto" builds a urltest (probes every $AUTO_INTERVAL); anything else is a
+# $sel=="auto" builds a urltest (probes every _auto_interval); anything else is a
 # plain selector that never probes its members (flaky/dead servers stay idle).
 group_jq() {
-  jq --arg if "$2" --arg sel "$3" --arg interval "$AUTO_INTERVAL" '
+  jq --arg if "$2" --arg sel "$3" --arg interval "$(_auto_interval)" \
+     --argjson tol "$(_auto_tolerance || echo 100)" --arg intr "$AUTO_INTERRUPT" '
     (if $if == "" then . else map(. + {bind_interface:$if}) end) as $m
     | ($m | map(.tag)) as $tags
     | (if $sel == "auto"                 # auto: urltest health-checks every $interval
        then $m
             + [{type:"urltest", tag:"auto", outbounds:$tags,
-                url:"https://www.gstatic.com/generate_204", interval:$interval}]
+                url:"https://www.gstatic.com/generate_204", interval:$interval, tolerance:$tol}
+               + (if $intr == "1" then {interrupt_exist_connections:true} else {} end)]
             + [{type:"selector", tag:"escape", outbounds:(["auto"] + $tags), default:"auto"}]
        else $m                           # manual: plain selector, nothing is probed
             + [{type:"selector", tag:"escape", outbounds:$tags,
                 default:(if ($tags | index($sel)) then $sel else ($tags[0] // "block") end)}]
        end)
   ' "$1"
+}
+
+# The escape servers' names, resolved by rowt over DoH and checked before
+# sing-box may dial them (#s321). sing-box resolves an outbound's server through
+# one DNS server named directly, which its DNS rules never see — so it can
+# neither refuse a poisoned answer for a server name nor compare resolvers. rowt
+# does both: it asks every DoH source (AliDNS and DNSPod, unless escape-dns.txt
+# says otherwise), refuses by category (private, loopback, link-local, CGNAT,
+# reserved, multicast, fake-IP) plus any local `refuse` range, and believes the
+# sources when they agree — but an answer that differs from the last good one
+# must pass the delay test through the server first. When they disagree — a
+# hijack can answer with an ordinary public address — the candidates are put to
+# that test, and only one that passes is taken; else the last good answer
+# stays, else the system resolver's when not refused (used, never trusted). The answers go to
+# escape-hosts, which sing-box reads live through a `hosts` DNS server
+# (dns-escape) that each checked member names as its domain_resolver;
+# escape-dns.tsv records each verdict for status.
+# One implementation, in rowt-rs (rowt_core::escapedns): this shell calls it.
+# Nothing happens without rowt-rs, or with no server named by a domain.
+_escape_dns() { # $1 = refresh | guarded | status
+  local rb; rb="$(_rust_cli)" || return 0
+  [ -n "$rb" ] || return 0
+  "$rb" _escape-dns "$1" --config-dir "$CFG"
 }
 
 # The escape-related outbounds (a JSON array) for a render target:
@@ -1792,8 +1872,13 @@ build_escape_outbounds() {
   local sel; sel="$(_escape_sel)"   # `best` renders as a selector defaulting to its pick
   case "$1" in
     host)
-      local ifc; ifc="$(detect_iface)" || die "no physical interface found"
-      group_jq "$SERVERS" "$ifc" "$sel" ;;
+      local ifc g; ifc="$(detect_iface)" || die "no physical interface found"
+      g="$(_escape_dns guarded 2>/dev/null || true)"; [ -n "$g" ] || g='[]'
+      # Members whose server name rowt checked resolve through dns-escape.
+      group_jq "$SERVERS" "$ifc" "$sel" | jq --argjson g "$g" '
+        map(if (.server | type) == "string" and ((.server | rtrimstr(".") | ascii_downcase) as $s | any($g[]; . == $s))
+            then . + {domain_resolver: {server: "dns-escape", strategy: "ipv4_only", disable_cache: true}}
+            else . end)' ;;
     vm-guest)
       group_jq "$SERVERS" "" "$sel" ;;
     vm-host)
@@ -1928,6 +2013,7 @@ assemble_host() {
     --arg ads "$ads" \
     --arg dns_direct "$dns_srv" \
     --arg esc_out "$esc_out" \
+    --arg escape_hosts "$CFG/escape-hosts" \
     --argjson esc_dom "$(domains_json)" \
     --argjson corp_dom "$(corp_domains_json)" \
     --argjson corp_cidr "$(corp_cidrs_json)" \
@@ -2006,8 +2092,13 @@ assemble_host() {
     # the dead fd (~200% CPU, traffic-independent). DoH is connection-based (a
     # wedged conn errors + re-dials instead of spinning) and encrypted; 223.5.5.5
     # serves DoH on 443 with an IP-valid cert, so no bootstrap DNS is needed.
+    #
+    # dns-escape: the hosts file of escape-server addresses rowt checked over
+    # DoH (see _escape_dns), there only when a member names it.
     ([ {type:"local", tag:"local"},
-       {type:"https", tag:"dns-direct", server:$dns_direct, detour:"direct"} ]) as $dns_servers
+       {type:"https", tag:"dns-direct", server:$dns_direct, detour:"direct"} ]
+     + (if any($escs[]; (.domain_resolver | type) == "object" and .domain_resolver.server == "dns-escape")
+        then [{type:"hosts", tag:"dns-escape", path:[$escape_hosts]}] else [] end)) as $dns_servers
     |
     # Corp names must resolve through the corp resolver or they answer with a
     # public IP and leave the tunnel — so an EXACT corp entry needs this rule
@@ -2086,8 +2177,13 @@ cmd_render() {
   # local mode needs no servers at all — that is the point of it.
   [ "$mode" = "local" ] || [ -s "$SERVERS" ] \
     || die "no servers — run: $PROG server add '<vless://...>' or $PROG sub add <url>"
+  _auto_tolerance >/dev/null \
+    || die "ROWT_AUTO_TOLERANCE wants whole milliseconds from 0 to 99999 (got '$AUTO_TOLERANCE')"
   ensure_singbox_host
   info "rendering configs (mode=$mode, port=$PORT, servers=$(jq length "$SERVERS"))"
+  # The escape servers' names, re-checked over DoH when stale, so this render
+  # guards what it can (see _escape_dns).
+  if [ "$mode" = host ]; then _escape_dns refresh || true; fi
   # Render to temp files, validate, then atomically mv into place. A plain
   # '> host.json' truncates the file to 0 bytes before writing, so a concurrent
   # reader — sing-box starting up on a restart while the watchdog re-renders —
@@ -2173,14 +2269,108 @@ cmd_import() {
   rebuild_servers; after_import
 }
 
-# Restore manual servers from a `server dump` JSON (an array of outbounds).
-# Merged into the manual set and deduped, so re-importing is idempotent.
-server_load_dump() {
-  local f="$1"
-  jq -e 'type=="array"' "$f" >/dev/null 2>&1 || die "not a 'server dump' (expected a JSON array): $f"
+# ---- where each manual server came from (for `server import --replace`) ----
+# One line per (import source, manual server): the source — `file:<name>` for a
+# `server dump`, the review file's `_source` for `--apply` — the tag the server
+# has in manual.json, and its type:server:port. Not a secret (no uuid or
+# password), but kept 0600 like the pool it describes. A server you added by
+# hand has no line, so no `--replace` ever takes it.
+SOURCES_TSV="$CFG/manual-sources.tsv"
+ESCAPE_DNS_CONF="$CFG/escape-dns.txt"            # the escape-server name check's knobs (see _escape_dns)
+SOURCES_HEADER="# rowt: which import brought each manual server in, for 'server import --replace' (source, tag, type:server:port)"
+# The one name a client's servers are recorded under: `sr` is shadowrocket and
+# `clashverge`/`verge` are clash-verge, as `--from` accepts them.
+_canonical_source() {
+  case "${1:-}" in sr) echo shadowrocket ;; clashverge|verge) echo clash-verge ;; *) printf '%s\n' "${1:-}" ;; esac
+}
+_sources_json() { # the lines as [{s,t,e}]
+  [ -f "$SOURCES_TSV" ] || { echo '[]'; return 0; }
+  awk -F'\t' '!/^#/ && NF == 3' "$SOURCES_TSV" \
+    | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {s: .[0], t: .[1], e: .[2]})'
+}
+_sources_write() { # stdin: lines; written sorted, or the file removed when there are none
+  local body; body="$(LC_ALL=C sort -u)"
+  if [ -z "$body" ]; then rm -f "$SOURCES_TSV"; return 0; fi
+  { printf '%s\n' "$SOURCES_HEADER"; printf '%s\n' "$body"; } > "$SOURCES_TSV.n" && mv "$SOURCES_TSV.n" "$SOURCES_TSV"
+  chmod 600 "$SOURCES_TSV"
+}
+# Drop the lines whose server is no longer in manual.json (`server rm`, `clear`).
+_sources_prune() {
+  [ -f "$SOURCES_TSV" ] || return 0
+  local prov lines; prov="$(_sources_json)"
+  if lines="$({ [ -s "$MANUAL" ] && cat "$MANUAL" || echo '[]'; } | jq -r --argjson prov "$prov" '
+      def ep: "\(.type):\(.server):\(.server_port)";
+      (if type == "array" then map([.tag, ep]) else [] end) as $present
+      | $prov[] | select([.t, .e] as $k | any($present[]; . == $k)) | "\(.s)\t\(.t)\t\(.e)"' 2>/dev/null)"; then
+    printf '%s\n' "$lines" | _sources_write
+  fi
+}
+# Merge an import into the manual set. $1 = a JSON array of {s: source, o:
+# outbound}; $2 = 1 for --replace. With --replace, the servers an earlier
+# import from the same source(s) brought in go first — those no other source
+# also brought in. Then the import is merged as before (existing entries first,
+# deduped by endpoint), and its servers are recorded under their source: those
+# it added, and those another import already had; never one you added by hand.
+_manual_import() {
+  local pairs="$1" replace="${2:-0}" prov srcs before
   [ -s "$MANUAL" ] || echo '[]' > "$MANUAL"
-  jq -s 'add' "$MANUAL" "$f" | "${PY_VLESS[@]}" --combine > "$MANUAL.n" && mv "$MANUAL.n" "$MANUAL"
+  prov="$(_sources_json)"
+  srcs="$(jq -c '[.[].s] | unique' "$pairs")"
+  if [ "$replace" = 1 ] && [ "$srcs" != "[]" ]; then
+    local drop names
+    drop="$(jq -c --argjson S "$srcs" '
+        (map(select(.s as $s | any($S[]; . == $s) | not) | [.t, .e])) as $others
+        | [ .[] | select(.s as $s | any($S[]; . == $s)) | [.t, .e]
+            | select(. as $k | any($others[]; . == $k) | not) ] | unique' <<<"$prov")"
+    names="$(jq -r --argjson d "$drop" '
+        def ep: "\(.type):\(.server):\(.server_port)";
+        [ .[] | select([.tag, ep] as $k | any($d[]; . == $k)) | .tag ] | join(", ")' "$MANUAL" 2>/dev/null || true)"
+    if [ -n "$names" ]; then
+      info "--replace: dropping the server(s) an earlier import from $(jq -r 'join(", ")' <<<"$srcs") brought in: $names"
+      jq --argjson d "$drop" '
+          def ep: "\(.type):\(.server):\(.server_port)";
+          map(select([.tag, ep] as $k | any($d[]; . == $k) | not))' "$MANUAL" > "$MANUAL.n" && mv "$MANUAL.n" "$MANUAL"
+    else
+      info "--replace: no earlier import from $(jq -r 'join(", ")' <<<"$srcs") recorded — nothing to drop. Servers imported before rowt recorded where they came from are not tracked; to start clean: $PROG server clear (every manual server), then import again"
+    fi
+  fi
+  before="$(mktemp)"; cp "$MANUAL" "$before"
+  jq -s '.[0] + (.[1] | map(.o))' "$MANUAL" "$pairs" | "${PY_VLESS[@]}" --combine > "$MANUAL.n" \
+    && mv "$MANUAL.n" "$MANUAL"
   chmod 600 "$MANUAL"
+  local lines
+  if lines="$(jq -r --argjson prov "$prov" --argjson S "$srcs" --argjson replace "$replace" \
+        --slurpfile before "$before" --slurpfile pairs "$pairs" '
+      def ep: "\(.type):\(.server):\(.server_port)";
+      def secret: if (.uuid // "") != "" then .uuid elif (.password // "") != "" then .password else "" end;
+      def ident: "\(ep):\(secret)";
+      . as $m
+      | ($m | map([.tag, ep])) as $present
+      | [ $prov[] | select($replace == 0 or (.s as $s | any($S[]; . == $s) | not))
+                  | select([.t, .e] as $k | any($present[]; . == $k)) ] as $kept
+      | ($kept | map([.t, .e])) as $claimed
+      | ($before[0] | map(ident)) as $old
+      | [ $pairs[0][] as $p | ($p.o | ident) as $id
+          | first($m[] | select(ident == $id)) as $e
+          | select((any($old[]; . == $id) | not) or any($claimed[]; . == [$e.tag, ($e | ep)]))
+          | {s: $p.s, t: $e.tag, e: ($e | ep)} ] as $new
+      | ($kept + $new)[] | "\(.s)\t\(.t)\t\(.e)"' "$MANUAL" 2>/dev/null)"; then
+    printf '%s\n' "$lines" | _sources_write
+  fi
+  rm -f "$before"
+}
+
+# Restore manual servers from a `server dump` JSON (an array of outbounds).
+# Merged into the manual set and deduped, so re-importing is idempotent. Its
+# servers are recorded under `file:<the dump's file name>`; $2 = 1 (--replace)
+# first drops what the last import of a file by that name brought in.
+server_load_dump() {
+  local f="$1" replace="${2:-0}" pairs
+  jq -e 'type=="array"' "$f" >/dev/null 2>&1 || die "not a 'server dump' (expected a JSON array): $f"
+  pairs="$(mktemp)"
+  jq --arg s "file:$(basename "$f")" 'map({s: $s, o: .})' "$f" > "$pairs"
+  _manual_import "$pairs" "$replace"
+  rm -f "$pairs"
   info "loaded $(jq length "$f") server(s) from $f"
   rebuild_servers; after_import
 }
@@ -2405,25 +2595,30 @@ cmd_from_shadowrocket() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --apply) apply=1 ;;
+      --replace) _IMPORT_REPLACE=1 ;;
       --from) shift; source="${1:?--from needs a source}" ;;
       --from=*) source="${1#--from=}" ;;
       --output|--input|-o|-i) shift; file="${1:?$1 needs a file path}" ;;
       --output=*|--input=*) file="${1#*=}" ;;
       --path) shift; path="${1:?--path needs a value}" ;;
       --path=*) path="${1#--path=}" ;;
-      *) die "unknown option: $1  (use --from <src> [--output <file>], or --apply [--input <file>])" ;;
+      *) die "unknown option: $1  (use --from <src> [--output <file>], or --apply [--input <file>] [--replace])" ;;
     esac
     shift
   done
   file="${file:-$IMPORT_REVIEW}"
+  # One name per client, whatever it was called on the command line: it is
+  # what each server is recorded under, and `--replace` matches on it.
+  source="$(_canonical_source "$source")"
 
   # --apply: merge the (edited) review file into the pool.
   if [ "$apply" = 1 ]; then
     [ -s "$file" ] || die "no review file at $file — run '$PROG server import --output $file --from <source>' first"
     jq -e . "$file" >/dev/null 2>&1 || die "review file is not valid JSON: $file"
-    apply_import "$file"
+    apply_import "$file" "$_IMPORT_REPLACE"
     return 0
   fi
+  [ "$_IMPORT_REPLACE" = 0 ] || die "--replace goes with --apply, or with a 'server dump' file: $PROG server import --replace <file>"
   [ -n "$source" ] || die "usage: $PROG server import --from <src> [--output <file>]   |   --apply [--input <file>]   |   --detect"
 
   # Extract step — pick the source dumper (raw; import-merge does all dedup).
@@ -2464,16 +2659,23 @@ cmd_from_shadowrocket() {
 }
 
 apply_import() {
-  local j="$1"
+  local j="$1" replace="${2:-0}" pairs
   _py_ok || die "python3 not found"
-  [ -s "$MANUAL" ] || echo '[]' > "$MANUAL"
   # Strip the review-only "_source" tag (never reaches manual.json / sing-box),
   # then dedupe the manual set in place by endpoint identity — existing servers
   # come first so they win — so re-applying a review file (or one whose entries
   # are already in the pool) is idempotent, not just deduped in servers.json.
-  jq -s '.[0] + ((.[1].servers // []) | map(del(._source)))' "$MANUAL" "$j" \
-    | "${PY_VLESS[@]}" --combine > "$MANUAL.n" && mv "$MANUAL.n" "$MANUAL"
-  chmod 600 "$MANUAL"
+  # The tag is still what each server is recorded under (`review` without one),
+  # so --replace drops what an earlier apply from the same client brought in.
+  pairs="$(mktemp)"
+  jq '[ (.servers // []) | if type == "array" then .[] else empty end
+        | if type == "object"
+          then {s: (if (._source | type) == "string" and ._source != "" then ._source else "review" end
+                    | if . == "sr" then "shadowrocket" elif . == "clashverge" or . == "verge" then "clash-verge" else . end),
+                o: del(._source)}
+          else {s: "review", o: .} end ]' "$j" > "$pairs" 2>/dev/null || echo '[]' > "$pairs"
+  _manual_import "$pairs" "$replace"
+  rm -f "$pairs"
   jq -r '.subscriptions[]?.url // empty' "$j" >> "$SUBS_FILE"
   sort -u "$SUBS_FILE" -o "$SUBS_FILE"
   # merge PROXY domains into escape-domains.txt (dedupe non-comment lines)
@@ -2493,16 +2695,23 @@ cmd_server() {
     list)      servers_list ;;
     add)       cmd_import "$@" ;;               # parse vless:// … ss:// / trojan:// / tuic:// link(s)
     rm|remove) servers_remove "$@" ;;
-    clear)     echo '[]' > "$MANUAL"; chmod 600 "$MANUAL"; info "manual servers cleared"; rebuild_servers; after_import ;;
+    clear)     echo '[]' > "$MANUAL"; chmod 600 "$MANUAL"; _sources_prune; info "manual servers cleared"; rebuild_servers; after_import ;;
     import)    # a JSON file (not --apply/--from) restores a `server dump`; else
-               # import from another client: --from shadowrocket|clash-verge|v2box|flclash
-      if [ -n "${1:-}" ] && [ "$1" != "--apply" ] && [ "$1" != "--from" ] && [ -f "$1" ]; then server_load_dump "$1"
+               # import from another client: --from shadowrocket|clash-verge|v2box|flclash.
+               # --replace, anywhere: drop what the last import from the same
+               # source brought in (see _manual_import).
+      local a; local -a args=()
+      for a in "$@"; do
+        if [ "$a" = --replace ]; then _IMPORT_REPLACE=1; else args+=("$a"); fi
+      done
+      set -- ${args[@]+"${args[@]}"}
+      if [ -n "${1:-}" ] && [ "$1" != "--apply" ] && [ "$1" != "--from" ] && [ -f "$1" ]; then server_load_dump "$1" "$_IMPORT_REPLACE"
       else cmd_from_shadowrocket "$@"; fi ;;
     dump)      # export the manual servers (JSON) for backup; subs -> 'sub dump'
       local out; out="$([ -s "$MANUAL" ] && jq . "$MANUAL" 2>/dev/null || echo '[]')"
       if [ -n "${1:-}" ]; then printf '%s\n' "$out" > "$1"; chmod 600 "$1"; echo "  dumped manual servers -> $1 (contains secrets, chmod 600)" >&2
       else printf '%s\n' "$out"; fi ;;
-    *) die "usage: $PROG server [list | add <link>… | rm <tag>… | clear | import <--detect|--from SRC [--output FILE]|--apply [--input FILE]> | dump [file]]" ;;
+    *) die "usage: $PROG server [list | add <link>… | rm <tag>… | clear | import <--detect|--from SRC [--output FILE]|--apply [--input FILE] [--replace]|[--replace] FILE> | dump [file]]" ;;
   esac
 }
 
@@ -2537,21 +2746,42 @@ servers_remove() {
     fi
   done
   chmod 600 "$MANUAL" 2>/dev/null || true
+  _sources_prune
   rebuild_servers; after_import
 }
 
 # Select the escape server:
-#   use <tag>   pin one server (manual selector; nothing is health-checked)
-#   use auto    auto-pick the fastest live server, re-probed every $AUTO_INTERVAL
+#   use <tag>                pin one server (manual selector; nothing is health-checked)
+#   use auto [--every DUR]   auto-pick the fastest live server, re-probed every
+#                            _auto_interval; --every saves that interval in state
 # Toggling auto<->manual changes the config shape (urltest present/absent), so we
 # re-render and restart; a plain tag->tag change in manual mode can switch live.
 cmd_use() {
-  local tag="${1:-}"
+  local tag="" every="" every_set=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --every)   [ "$#" -ge 2 ] || die "usage: $PROG use auto --every <duration>   (e.g. 3m or 90s)"
+                 every="$2"; every_set=1; shift ;;
+      --every=*) every="${1#--every=}"; every_set=1 ;;
+      *)         [ -n "$tag" ] || tag="$1" ;;
+    esac
+    shift
+  done
   # In local mode there is no escape selector to switch — say so plainly rather
   # than letting the clash call fail with something cryptic.
   [ "$(sget mode)" = "local" ] \
     && die "local mode has no tunnel to select from — '$PROG up host' to bring one back"
   [ -s "$SERVERS" ] || die "no servers imported"
+  if [ "$every_set" = 1 ]; then
+    [ "$tag" = auto ] || die "--every sets how often 'auto' re-tests its servers — use: $PROG use auto --every <duration>"
+    # 30m is sing-box's idle timeout for a urltest, and it refuses a longer
+    # interval; under 30s every server is probed twice a minute for nothing,
+    # since a dead pick is left by the follower, not by the round. `default`
+    # forgets the saved interval (from PR #4).
+    local secs; secs="$(_duration_secs "$every")"
+    [ "$every" = default ] || { [ -n "$secs" ] && [ "$secs" -ge 30 ] && [ "$secs" -le 1800 ]; } \
+      || die "--every wants a duration from 30s to 30m, like 3m or 90s, or 'default' (got '$every')"
+  fi
   if [ -z "$tag" ]; then servers_list; return 0; fi
   if [ "$tag" != "auto" ] && [ "$tag" != best ] && ! jq -e --arg t "$tag" 'any(.tag == $t)' "$SERVERS" >/dev/null; then
     die "unknown server '$tag' — see: $PROG server"
@@ -2559,14 +2789,31 @@ cmd_use() {
   local prev; prev="$(sget selected)"
   if [ "$tag" = best ]; then _use_best "$prev"; return 0; fi
   sset selected "$tag"
+  if [ "$every_set" = 1 ] && [ "$every" = default ]; then
+    sset auto_interval ""
+  elif [ "$every_set" = 1 ]; then
+    sset auto_interval "$every"
+    [ -z "${ROWT_AUTO_INTERVAL:-}" ] || [ "$ROWT_AUTO_INTERVAL" = "$every" ] \
+      || warn "saved --every $every, but ROWT_AUTO_INTERVAL=$ROWT_AUTO_INTERVAL is set and wins while it is"
+  fi
+  # Already auto, and the render writes exactly what the router is running from
+  # (the same --every, nothing else changed): no restart. Every other change to
+  # an auto config — a new --every included — restarts, since sing-box reads
+  # its urltest interval only at start.
+  local before=""; [ -f "$HOST_CFG" ] && before="$(cat "$HOST_CFG" "$VM_CFG" 2>/dev/null | cksum)"
   cmd_render >/dev/null
   if ! host_running; then info "escape -> $tag (applies on next '$PROG router up')"; return 0; fi
+  if [ "$prev" = auto ] && [ "$tag" = auto ] && [ -n "$before" ] \
+     && [ "$before" = "$(cat "$HOST_CFG" "$VM_CFG" 2>/dev/null | cksum)" ]; then
+    info "escape -> auto, unchanged (re-probed every $(_auto_interval)) — router not restarted"
+    return 0
+  fi
   # same mode + concrete tag -> live switch; any auto toggle -> restart to (de)activate urltest
   if [ "$prev" != "auto" ] && [ "$tag" != "auto" ] && clash_curl PUT /proxies/escape "{\"name\":\"$tag\"}" >/dev/null 2>&1; then
     info "escape -> $tag (live)"
   else
     cmd_router restart >/dev/null
-    [ "$tag" = "auto" ] && info "escape -> auto (fastest live server, re-probed every $AUTO_INTERVAL)" \
+    [ "$tag" = "auto" ] && info "escape -> auto (fastest live server, re-probed every $(_auto_interval))" \
                         || info "escape -> $tag"
   fi
 }
@@ -3236,6 +3483,7 @@ _router_ready() {
 # the proxy themselves (restart, the up-retry).
 _router_stop() {
   _stop_collector
+  _stop_follow
   local p; p="$(cat "$(host_pidfile)" 2>/dev/null || true)"
   [ -n "$p" ] && kill "$p" 2>/dev/null || true
   rm -f "$(host_pidfile)"
@@ -3277,6 +3525,28 @@ _stop_collector() {
   local bin; bin="$(_collector_bin 2>/dev/null || true)"
   [ -n "$bin" ] && pkill -f "$bin" 2>/dev/null || true
 }
+# ---- auto's failover follower (sidecar; see AUTO_FOLLOW and `watch follow`) ----
+# Tied to the router like the collector: started once it is healthy, in `auto`
+# only, and stopped with it. It is THIS script — `$HERE/bin/$PROG`, never a
+# `rowt` found on PATH, which could be another install of a different version.
+follow_pidfile() { echo "$CFG/follow.pid"; }
+_follow_running() { local p; p="$(cat "$(follow_pidfile)" 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+_start_follow() {
+  [ "$AUTO_FOLLOW" = 1 ] || return 0
+  [ "$(sget selected)" = auto ] || return 0
+  [ "$(sget mode)" != local ] || return 0
+  _follow_running && return 0
+  mkdir -p "$LOGDIR"
+  _detach "$(follow_pidfile)" "${BASH:-bash}" -c 'exec "$1" "$2" watch follow >>"$3" 2>&1' \
+    _ "${BASH:-bash}" "$HERE/bin/$PROG" "$WATCH_LOG"
+}
+# Only the pid it recorded: never a pattern, which could reach a follower some
+# other config directory started.
+_stop_follow() {
+  local p; p="$(cat "$(follow_pidfile)" 2>/dev/null || true)"
+  case "$p" in ''|*[!0-9]*) ;; *) kill "$p" 2>/dev/null || true ;; esac
+  rm -f "$(follow_pidfile)"
+}
 # Invariant guard: if the router isn't up, the system proxy must NOT be left
 # pointing at the (now dead) 127.0.0.1:$PORT. Safe to call anywhere — it only acts
 # when the router is down, so it's a no-op mid-setup while the router is running.
@@ -3291,7 +3561,7 @@ cmd_router() {
       ensure_singbox_host
       info "starting rule-router on 127.0.0.1:$PORT"
       _start_host_router 1
-      if _router_ready 5; then _start_collector; echo "  ✓ running (pid $(cat "$(host_pidfile)"))"; return 0; fi
+      if _router_ready 5; then _start_collector; _start_follow; echo "  ✓ running (pid $(cat "$(host_pidfile)"))"; return 0; fi
       # it didn't come up healthy (exited, or alive but the clash API never
       # answered = wedged). Show why, then retry ONCE after a settle, this time
       # with plain logging (rules out both a startup-network blip and the splitter).
@@ -3300,7 +3570,7 @@ cmd_router() {
       _router_stop   # clean up the failed process before retrying (proxy untouched)
       sleep 2
       _start_host_router 0
-      if _router_ready 5; then _start_collector; echo "  ✓ running (pid $(cat "$(host_pidfile)"))  [plain log]"; return 0; fi
+      if _router_ready 5; then _start_collector; _start_follow; echo "  ✓ running (pid $(cat "$(host_pidfile)"))  [plain log]"; return 0; fi
       err "router failed to come up healthy — see $HOST_LOG"; tail -8 "$HOST_LOG" >&2
       _ensure_no_limbo   # never leave the proxy pointing at a router that won't start
       return 1
@@ -5187,8 +5457,28 @@ cmd_status() {
   local now; now="$(clash_selected)"
   if [ -n "$now" ]; then
     if [ "$(sget selected)" = best ]; then echo "active:       $now (best — $(_latency_ms "$now"))"
+    elif [ "$now" = auto ]; then local pk; pk="$(clash_auto_pick)"; echo "active:       auto → ${pk:-?} (sing-box urltest's pick)"
     else echo "active:       $now"; fi
   fi
+  # `auto`: how often its round runs and where that came from, whether the
+  # failover follower is on, and the last move it made.
+  if [ "$(sget selected)" = auto ] && [ "$mode" != local ]; then
+    local src fl sw
+    if [ -n "${ROWT_AUTO_INTERVAL:-}" ]; then src="ROWT_AUTO_INTERVAL"
+    elif [ -n "$(sget auto_interval)" ]; then src="use auto --every"
+    else src="default"; fi
+    if [ "$AUTO_FOLLOW" != 1 ]; then fl="failover follower off (ROWT_AUTO_FOLLOW=$AUTO_FOLLOW)"
+    elif _follow_running; then fl="failover follower running (checks every ${AUTO_FOLLOW_EVERY}s)"
+    elif host_running; then fl="failover follower NOT running (a router started before it existed gets one at its next reload) — '$PROG reload' starts it"
+    else fl="failover follower starts with the router"; fi
+    echo "auto:         re-tests every server every $(_auto_interval) ($src); $fl"
+    [ "$AUTO_INTERRUPT" != 1 ] || echo "              a switch closes the connections left on the old pick (ROWT_AUTO_INTERRUPT=1)"
+    sw="$(sget auto_switch)"
+    [ -z "$sw" ] || echo "last switch:  $sw"
+  fi
+  # The escape servers' names as rowt resolved and checked them: what was
+  # refused, and what sing-box was given.
+  case "$(sget mode)" in ''|host) _escape_dns status 2>/dev/null || true ;; esac
   [ "$mode" = "vm" ] && echo "vm ip:        $(sget vm_ip)"
   echo "router:       $(host_running && echo "running (pid $(cat "$(host_pidfile)"))" || echo stopped) on 127.0.0.1:$PORT"
   # Which engine, and is it the pin. A brew upgrade once swapped in a 1.14.1
@@ -5854,6 +6144,71 @@ _watch_best() { # $1 = the physical interface
   _watch_log "$m"
   _audit "watchdog $m"
 }
+# `watch follow` — auto's failover follower, started with the router (see
+# AUTO_FOLLOW). sing-box's urltest leaves a server only when a ROUND re-picks:
+# a connection through the pick that fails deletes the pick's figure and is
+# logged, and the group keeps dialing the dead pick until its next round, up to
+# a whole interval later. Measured on its source (1.13: protocol/group/urltest.go
+# DialContext and urlTest). So every AUTO_FOLLOW_EVERY seconds this asks the
+# clash API whether the pick still has a figure. When it has none — a failed
+# connection, a failed watchdog probe, or a failed round — it asks the group for
+# a re-test at once (GET /group/auto/delay), which tests only the servers
+# without a fresh figure and moves the group to a live one: the same re-pick a
+# round makes, minutes early. Each look is two local requests, nothing on the
+# wire, and a re-test that found no live server waits twice as long before the
+# next (30 s, then 60 s, … up to 10 min), so an outage costs no probe storm.
+# Exits when the router stops, when `auto` is no longer selected, or when the
+# config directory is gone.
+_follow_has_figure() { # $1 = server tag → echo 1 (has a figure), 0 (none) or empty (no answer)
+  clash_curl GET "/proxies/$(_urlencode "$1")" 2>/dev/null \
+    | jq -r 'if (.history | type) == "array" then (if (.history | length) > 0 then 1 else 0 end) else empty end' 2>/dev/null || true
+}
+_follow_retest() { # $1 = the pick that lost its figure. Returns 0 when a live pick was left in place.
+  local ep sec new fig m
+  ep="$(controller 2>/dev/null || true)"; [ -n "$ep" ] || return 1
+  sec="$(clash_secret)"
+  # The group tests each server for at most 15 s (sing-box's TCPTimeout), ten
+  # at a time; give the request a little more than that.
+  curl --noproxy '*' -sS -m 20 -H "Authorization: Bearer $sec" \
+    "http://$ep/group/auto/delay?timeout=15000&url=$(_urlencode "$HEALTH_URL")" >/dev/null 2>&1 || true
+  new="$(clash_auto_pick)"
+  if [ -n "$new" ] && [ "$new" != "$1" ]; then
+    m="auto: $1 stopped answering — re-tested now and moved to $new"
+    _watch_log "$m"
+    _audit "watchdog $m"
+    sset auto_switch "$(date -u '+%Y-%m-%d %H:%M:%S') $1 -> $new"
+    return 0
+  fi
+  fig="$(_follow_has_figure "${new:-$1}")"
+  if [ "$fig" = 1 ]; then
+    _watch_log "auto: $1 lost its figure but answered the re-test — staying on it"
+    return 0
+  fi
+  _watch_log "auto: $1 stopped answering and no other server answered the re-test — still on ${new:-$1}"
+  return 1
+}
+_watch_follow() {
+  local wait=$(( AUTO_FOLLOW_EVERY * 2 )) next=0 pick fig now
+  case "$AUTO_FOLLOW_EVERY" in ''|*[!0-9]*|0) die "ROWT_AUTO_FOLLOW_EVERY wants whole seconds, at least 1" ;; esac
+  while :; do
+    [ -d "$CFG" ] || return 0
+    host_running || return 0
+    [ "$(sget selected)" = auto ] || return 0
+    pick="$(clash_auto_pick)"
+    if [ -n "$pick" ]; then
+      fig="$(_follow_has_figure "$pick")"
+      now="$(date +%s)"
+      if [ "$fig" = 1 ]; then
+        wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
+      elif [ "$fig" = 0 ] && [ "$now" -ge "$next" ]; then
+        if _follow_retest "$pick"; then wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
+        else next=$(( now + wait )); wait=$(( wait * 2 )); [ "$wait" -le 600 ] || wait=600; fi
+      fi
+    fi
+    sleep "$AUTO_FOLLOW_EVERY"
+  done
+}
+
 _watch_health() { # $1=iface  $2=captive verdict
   # Offline (no interface IP) — a restart can't help and a returning network
   # fires its own resolver-change reload, so just reset the streak and bail.
@@ -5973,7 +6328,8 @@ _watch_plist_body() {
   done
   local envxml v val
   envxml="    <key>PATH</key><string>$agent_path</string>"
-  for v in XDG_CONFIG_HOME ROWT_PORT ROWT_CLASH_PORT ROWT_FINAL ROWT_IFACE ROWT_DNS_DIRECT ROWT_DNS_LOCAL ROWT_GFW_CANARIES ROWT_GFW_TIMEOUT SINGBOX_VERSION ROWT_LOG_LEVEL ROWT_WATCH_INTERVAL ROWT_HEALTH_FAILS ROWT_HEALTH_COOLDOWN ROWT_HEALTH_TIMEOUT ROWT_HEALTH_URL ROWT_CAPTIVE_CHECK ROWT_CAPTIVE_URL ROWT_CAPTIVE_TIMEOUT ROWT_CAPTIVE_RETRY ROWT_CAPTIVE_FALLBACK ROWT_WATCH_SHADOW ROWT_RENDER_SHADOW ROWT_PPROF ROWT_CPU_SPIN_PCT ROWT_CPU_SPIN_BYTES ROWT_CPU_SPIN_TICKS ROWT_CPU_HEAL_COOLDOWN; do
+  for v in XDG_CONFIG_HOME ROWT_PORT ROWT_CLASH_PORT ROWT_FINAL ROWT_IFACE ROWT_DNS_DIRECT ROWT_DNS_LOCAL ROWT_GFW_CANARIES ROWT_GFW_TIMEOUT SINGBOX_VERSION ROWT_LOG_LEVEL ROWT_WATCH_INTERVAL ROWT_HEALTH_FAILS ROWT_HEALTH_COOLDOWN ROWT_HEALTH_TIMEOUT ROWT_HEALTH_URL ROWT_CAPTIVE_CHECK ROWT_CAPTIVE_URL ROWT_CAPTIVE_TIMEOUT ROWT_CAPTIVE_RETRY ROWT_CAPTIVE_FALLBACK ROWT_WATCH_SHADOW ROWT_RENDER_SHADOW ROWT_PPROF ROWT_CPU_SPIN_PCT ROWT_CPU_SPIN_BYTES ROWT_CPU_SPIN_TICKS ROWT_CPU_HEAL_COOLDOWN ROWT_AUTO_FOLLOW ROWT_AUTO_FOLLOW_EVERY ROWT_ESCAPE_DNS_MAX_AGE \
+           ROWT_AUTO_INTERVAL ROWT_AUTO_TOLERANCE ROWT_AUTO_INTERRUPT; do
     val="${!v:-}"; [ -n "$val" ] && envxml="$envxml
     <key>$v</key><string>$val</string>"
   done
@@ -6380,6 +6736,9 @@ cmd_watch() {
       if [ -n "$ifc" ] && [ "$ifc" = "$cur" ]; then
         _watch_subscriptions "$ifc"
         _watch_best "$ifc" || true
+        # The escape servers' names, re-checked when stale: a provider's new
+        # entry addresses reach sing-box through escape-hosts, live (_escape_dns).
+        case "$(sget mode)" in ''|host) _escape_dns refresh || true ;; esac
       fi
       svc="$(active_service 2>/dev/null || true)"
       nid="$(net_id "$ifc")"                       # e.g. "MyWifi 192.168.1.42/192.168.1.1"
@@ -6462,6 +6821,9 @@ cmd_watch() {
       cmd_reload >>"$WATCH_LOG" 2>&1 && { _watch_log "reload ok"; rm -f "$WATCH_HEALTH"; _audit "END   watchdog reload — ok"; } || { _watch_log "reload FAILED"; _audit "END   watchdog reload — FAILED"; }
       _AUDIT_OP=""
       ;;
+    follow)
+      # Internal: the router starts this in `auto` (see _start_follow).
+      _watch_follow ;;
     *) die "usage: $PROG watch [install | uninstall | status]" ;;
   esac
 }
@@ -6800,7 +7162,7 @@ o@lifecycle@metrics [status|top|path|query]@per-domain traffic history (bytes in
 o@lifecycle@config [list|export|import]@back up / move the whole setup to another machine; 'export --to shadowrocket' for an iPhone
 o@servers & selection@server <list|add|rm|clear|import|dump>@manage the server pool
 o@servers & selection@sub <list|add|rm|update|clear|import|dump>@manage subscriptions
-c@servers & selection@use <tag>|best|auto@pin a server, or let rowt pick by median latency (best), or sing-box's urltest (auto)
+c@servers & selection@use <tag>|best|auto [--every D]@pin a server, or let rowt pick by median latency (best), or sing-box's urltest (auto, re-tested every D)
 c@servers & selection@ping [tag]@parallel latency test through the tunnel, median of 3 samples each (fastest first)
 a@servers & selection@probe@detect which mode works (host vs vm) with corp VPN up
 c@routing lanes@escape <list|add|rm|import|clear|dump|errors>@edit the escape lane (VPN tunnel)
@@ -7014,6 +7376,24 @@ Shows mode, server count + selected/active server, the host-router pid/port, the
 system-proxy state, the routing buckets, sing-box config validity, and a live
 'via proxy' reachability check. For what's AROUND rowt — other VPN apps, who holds
 its ports, a PAC, what answers where — see '$PROG doctor'.
+
+In auto: the server sing-box's urltest is on, how often it re-tests (and
+whether that came from 'use auto --every'), the failover follower, and its
+last switch. When servers are named by domain: 'escape dns' — each name as
+rowt resolved it over DoH, what it refused (a private, fake-IP or sinkhole
+answer) and which address sing-box was given. Its knobs are in
+$CFG/escape-dns.txt:
+  off                       resolve server names the old way (dns-direct)
+  doh <url> [<url>…]        the DoH sources (JSON API), every one asked and
+                            compared; default https://223.5.5.5/resolve and
+                            https://1.12.12.12/dns-query
+  refuse <cidr> [<cidr>…]   ranges never to use on THIS box (a sinkhole seen
+                            here); the built-in refusals are by category only
+  allow <name> <cidr> […]   for <name>, use only answers inside these ranges
+When the sources disagree, or agree on an answer that differs from the last
+good one, the new addresses are fetched through the server itself (the
+watchdog's delay test) and only one that answers is used; otherwise the last
+good answer stays.
 EOF
 ;;
     explain|route) cat <<EOF
@@ -7081,7 +7461,8 @@ EOF
 $PROG config — back up or move your whole setup to another machine.
 
 Bundles only the SOURCE-OF-TRUTH files that '$PROG render' rebuilds from — the
-server pool, subscriptions, and the escape/corp/block lane rules. It deliberately
+server pool, subscriptions, the escape/corp/block lane rules, escape-dns.txt and
+manual-sources.tsv (which import brought which server). It deliberately
 leaves out the rendered host.json/vm.json, the machine-specific 'state' (this
 box's clash secret, mode, bound interface), and runtime bin/cache/log/metrics —
 those are regenerated on the target.
@@ -7091,7 +7472,8 @@ those are regenerated on the target.
                                  --to rowt (the default): write a .tgz (default
                                  rowt-config-<date>.tgz). --routes-only (or
                                  --no-servers) packs only the lane rules — no
-                                 server pool, no credentials; safe to share
+                                 server pool or its settings, no credentials;
+                                 safe to share
                                  --to shadowrocket: for Shadowrocket on the iPhone.
                                  The config (default rowt-shadowrocket.conf):
                                  escape -> PROXY, block -> REJECT, corp and
@@ -7136,9 +7518,16 @@ $PROG server <subcommand> — manage the server pool.
                        store, directory or DB from P instead of where the app
                        keeps it. Run once per client (same FILE) to gather
                        several, then edit FILE and apply:
-  import --apply [--input FILE]
+  import --apply [--input FILE] [--replace]
                        apply the (edited) review FILE into the pool
-  import <file.json>   restore manual servers from a 'server dump' (round-trip)
+  import [--replace] <file.json>
+                       add the manual servers in a 'server dump' (round-trip)
+  --replace            instead of adding to what an earlier import from the
+                       same source brought in, replace it: those servers are
+                       dropped first, unless another source also brought them
+                       in. A dump's source is its file name; a review file's
+                       is each entry's "_source". Servers added by hand are
+                       never dropped. Without it, an import only adds.
   dump [file]          export the manual servers as JSON (backup; has secrets).
                        Subscription servers come from their subs — see 'sub dump'.
 EOF
@@ -7161,7 +7550,7 @@ online and running. Manual updates reset this timer, including failed attempts.
 EOF
 ;;
     use) cat <<EOF
-$PROG use <tag> | use best | use auto — select the escape server.
+$PROG use <tag> | use best | use auto [--every DURATION] — select the escape server.
 
   use <tag>   pin one server. A plain selector that NEVER health-checks its
               members, so flaky/dead servers just sit idle (no CPU spin).
@@ -7174,11 +7563,25 @@ $PROG use <tag> | use best | use auto — select the escape server.
               One slow or failed sample can't cause a switch. Needs the watchdog
               ('$PROG watch install') to keep re-picking.
   use auto    switch to sing-box's urltest, which picks the fastest live server
-              by its own single samples, re-probed every ROWT_AUTO_INTERVAL
-              (default $AUTO_INTERVAL).
-Switches between pinned servers and best are live (Clash API); to or from auto
-restarts the router. Run '$PROG ping' first to see the figures. No arg = list
-servers.
+              by its own single samples and re-tests every server each round.
+              While the router runs, a follower checks the pick every
+              ROWT_AUTO_FOLLOW_EVERY seconds (default 15): when sing-box has
+              seen it fail, the group re-tests at once and moves to a live
+              server, instead of waiting for the next round. ROWT_AUTO_FOLLOW=0
+              turns the follower off.
+              A round moves the pick only to a server at least
+              ROWT_AUTO_TOLERANCE ms faster (default $AUTO_TOLERANCE). With
+              ROWT_AUTO_INTERRUPT=1 a switch also closes the connections left
+              on the old pick (off by default: it cuts healthy ones too).
+  use auto --every DURATION
+              also set how often a round runs, from 30s to 30m (3m, 90s, 1m30s),
+              and keep it: every later render and reload uses it.
+              ROWT_AUTO_INTERVAL overrides it while set; the default is 20m.
+              '--every default' forgets the saved interval.
+              '$PROG status' shows the interval and the server auto is on.
+Switches between pinned servers and best are live (Clash API); to or from auto,
+or a new --every, restarts the router; 'use auto' that changes nothing leaves
+it running. Run '$PROG ping' first to see the figures. No arg = list servers.
 EOF
 ;;
     ping) cat <<EOF
@@ -7799,8 +8202,12 @@ _export_shadowrocket() { # $1 = output path, or - for stdout; $2 = 1 for rules o
 # source-of-truth files (which `render` rebuilds from) — NOT the rendered
 # host.json/vm.json, the machine-specific `state`, or runtime bin/cache/log/metrics.
 cmd_config() {
+  # escape-dns.txt (the name check's knobs) and manual-sources.tsv (which
+  # import brought which manual server) travel too. Neither holds a credential,
+  # but both name servers, so --routes-only leaves them with the pool.
   local src=("$SERVERS" "$MANUAL" "$SR_REVIEW" "$SUBS_FILE" "$OUTBOUND" \
-             "$DOMAINS" "$CORP_DOMAINS" "$BLOCK_DOMAINS" "$HOTSPOT_DOMAINS")
+             "$DOMAINS" "$CORP_DOMAINS" "$BLOCK_DOMAINS" "$HOTSPOT_DOMAINS" \
+             "$ESCAPE_DNS_CONF" "$SOURCES_TSV")
   case "${1:-list}" in
     list)
       echo "config bundle — '$PROG config export' packs the present ones:"
@@ -7837,7 +8244,7 @@ cmd_config() {
         *) die "unknown export target: $to  (supported: rowt, shadowrocket)" ;;
       esac
       out="${out:-rowt-config-$(date +%Y%m%d-%H%M%S).tgz}"
-      local pool=" $SERVERS $MANUAL $SR_REVIEW $SUBS_FILE $OUTBOUND " names=() f
+      local pool=" $SERVERS $MANUAL $SR_REVIEW $SUBS_FILE $OUTBOUND $ESCAPE_DNS_CONF $SOURCES_TSV " names=() f
       for f in "${src[@]}"; do
         [ -f "$f" ] || continue
         [ "$no_servers" = 1 ] && case "$pool" in *" $f "*) continue ;; esac
@@ -7930,8 +8337,9 @@ $out"
         # rather than silently dropping it, so a "why didn't my servers come over"
         # has an answer in the output.
         if [ -f "$inx/servers.json" ] || [ -f "$inx/manual.json" ] || [ -f "$inx/import-review.json" ] \
-           || [ -f "$inx/subs.txt" ] || [ -f "$inx/outbound.json" ]; then
-          echo "note: the bundle also carries a server pool — NOT merged (use --replace to take the whole bundle, or 'server import' to fold servers in)."
+           || [ -f "$inx/subs.txt" ] || [ -f "$inx/outbound.json" ] \
+           || [ -f "$inx/escape-dns.txt" ] || [ -f "$inx/manual-sources.tsv" ]; then
+          echo "note: the bundle also carries a server pool or its settings — NOT merged (use --replace to take the whole bundle, or 'server import' to fold servers in)."
         fi
         # A conflict is an entry the bundle puts in a lane where you already have
         # it in a DIFFERENT one; folding it in moves it. Report ALL of them at the
@@ -7951,7 +8359,7 @@ $out"
         done
         rm -rf "$work"
       fi
-      for f in "$SERVERS" "$MANUAL" "$SR_REVIEW" "$SUBS_FILE"; do [ -f "$f" ] && chmod 600 "$f" 2>/dev/null || true; done
+      for f in "$SERVERS" "$MANUAL" "$SR_REVIEW" "$SUBS_FILE" "$SOURCES_TSV"; do [ -f "$f" ] && chmod 600 "$f" 2>/dev/null || true; done
       echo "imported$([ "$replace" = 1 ] && echo '' || echo ' (lanes merged)') into $CFG."
       # Subshell: on a fresh box render `die`s (no servers/engine yet) — and a
       # die is an exit, which `if cmd_render` could not catch, so it used to kill

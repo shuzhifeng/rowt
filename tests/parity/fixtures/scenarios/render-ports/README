@@ -1,0 +1,24 @@
+Named extra ports (`rowt port`, ports.tsv): three good rows and three the
+reader drops, written out of name order so the read has to sort them.
+
+  vm      7894  direct   catch-all out the physical NIC (first in the file)
+  lab     7893  corp     catch-all into the corp VPN
+  guest   7892  escape   catch-all to the tunnel, names resolved at the far end
+  broken  not-a-port     skipped (not a number), by the render and every reader
+  aa-late 7894  corp     skipped: vm came first in the file and keeps the port,
+                         although aa-late sorts first
+  weird   7897  block    skipped: block is no catch-all
+
+The base fixture has corp CIDRs and a direct final, so the render has a resolve
+rule: guest's catch-all and its copies of the corp-CIDR and private-range rules
+go just before it, lab's and vm's catch-alls go last. ROWT_FINAL=escape removes the
+resolve rule (guest's catch-all then goes last too); ROWT_PRIVATE_DEFAULT=direct
+leaves guest only the corp-CIDR copy. render-ports-local (escape is direct
+there) and render-ports-vm carry the same table in the other two modes.
+
+The dig fixtures are explain-resolve's, for the explain cases: pub.example
+resolves to a public address (main DIRECT: guest and lab answer differently,
+vm does not),
+corp-svc.example into the corp CIDR (main CORP: only guest, which never looks
+the name up, differs), nores.example to nothing. With no rendered host.json,
+`status` says each port is not in host.json yet; ports-status has one.

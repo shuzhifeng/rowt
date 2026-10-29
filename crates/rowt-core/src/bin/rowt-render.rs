@@ -192,6 +192,7 @@ fn run() -> Result<String, String> {
         },
         escape_outbound: if local_mode { "direct".into() } else { "escape".into() },
         escape_hosts: cfg.join("escape-hosts").to_string_lossy().into_owned(),
+        ports: rowt_core::ports::rows(&read(&cfg.join("ports.tsv"))),
         geo: Geo {
             escape: lane_geo(&escape_src),
             block: lane_geo(&block_src),

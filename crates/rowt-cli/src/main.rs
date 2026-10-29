@@ -570,6 +570,23 @@ fn cmd_explain(cfg: &Path, dest: &str) -> String {
     if !c.note.is_empty() {
         out.push_str(&format!("\n  note:    {}", c.note));
     }
+    // Named ports share every rule; a line only where one would answer
+    // differently. A port whose catch-all is escape never looks a name up, so it
+    // differs wherever no lane rule matched — even where main's resolver check
+    // sent the name to corp. A direct/corp port shares that lookup and differs
+    // only where main itself fell to its final.
+    if c.unmatched {
+        let fr = env_or("ROWT_FINAL", "direct");
+        for p in rowt_core::ports::rows(&read(&cfg.join("ports.tsv"))) {
+            let pd = rowt_core::ports::dest(&p.fin, mode == "local");
+            if p.name.is_empty() || pd == c.lane.as_str() || (p.fin != "escape" && c.lane.as_str() != fr) {
+                continue;
+            }
+            let far = if pd == "escape" && !rowt_core::classify::is_ipv4(&c.dest) { ", the name resolved at the far end" } else { "" };
+            out.push_str(&format!("\n  {}via 127.0.0.1:{} -> {} (no rule matched; this port's catch-all{far})",
+                                  pad(&format!("{}:", p.name), 9), p.port, pd.to_uppercase()));
+        }
+    }
 
     // The shell warns that opaque rule-sets may still match, whenever the ad set
     // is cached or any lane names a geosite: category. Not shown for `block`,
@@ -2096,6 +2113,23 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                     Some(pid) => format!("running (pid {pid})"),
                     None => "stopped".into(),
                 }, ctx.port));
+            // Named ports, and whether the rendered config agrees with the
+            // table. Nothing here when there are none: main alone is the line above.
+            {
+                let rows = rowt_core::ports::rows(&read(&cfg.join("ports.tsv")));
+                let rendered = rowt_core::ports::rendered(&read(&ctx.host_cfg()));
+                let fr = env_or("ROWT_FINAL", "direct");
+                for p in rows.iter().filter(|p| !p.name.is_empty()) {
+                    let prp: Vec<&str> = rendered.iter().filter(|(n, _)| *n == p.name).map(|(_, rp)| rp.as_str()).collect();
+                    o.push(format!("{}127.0.0.1:{}, unmatched -> {} (main unmatched -> {fr}){}",
+                                   pad(&format!("port {}:", p.name), 14), p.port,
+                                   rowt_core::ports::status_word(&p.fin, mode == "local"),
+                                   if prp.join("\n") == p.port { String::new() } else { format!("  — NOT in host.json yet: '{PROG} render'") }));
+                }
+                for (rn, rp) in rendered.iter().filter(|(n, _)| !n.is_empty() && !rows.iter().any(|p| p.name == *n)) {
+                    o.push(format!("{}removed — but host.json still has it on {rp}: '{PROG} render'", pad(&format!("port {rn}:"), 14)));
+                }
+            }
             // Which engine, and is it the pin — a brew upgrade once swapped in a
             // 1.14.1 that spins on this network, and nothing here said so.
             {

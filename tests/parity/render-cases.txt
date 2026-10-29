@@ -44,3 +44,11 @@ wildcard-lane     PARITY_SCENARIO=wildcard-lane
 # render just removed.
 exact-lane-local  PARITY_SCENARIO=exact-lane-local
 local-dns-override PARITY_SCENARIO=render-local ROWT_DNS_LOCAL=9.9.9.9
+# Named ports (ports.tsv; see fixtures/scenarios/render-ports/README): an escape
+# port's catch-all and its copies of the address rules land just before the
+# resolve rule, a corp port's catch-all last; a broken row renders nothing.
+ports             PARITY_SCENARIO=render-ports
+ports-no-resolve  PARITY_SCENARIO=render-ports ROWT_FINAL=escape
+ports-private-direct PARITY_SCENARIO=render-ports ROWT_PRIVATE_DEFAULT=direct
+ports-local       PARITY_SCENARIO=render-ports-local
+ports-vm          PARITY_SCENARIO=render-ports-vm

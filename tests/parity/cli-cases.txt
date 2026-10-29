@@ -651,6 +651,23 @@ PARITY_SCENARIO=explain-resolve explain nores.example
 PARITY_SCENARIO=explain-resolve ROWT_FINAL=escape explain corp-svc.example
 PARITY_SCENARIO=explain-resolve ROWT_PRIVATE_DEFAULT=direct explain lan-svc.example
 PARITY_SCENARIO=explain-resolve ROWT_PRIVATE_DEFAULT=direct explain corp-svc.example
+# Named ports (render-ports, ports-status: see their READMEs). status prints a
+# line per row, says when host.json is behind the table, and names a port the
+# table dropped; explain names a port only where it answers differently from
+# main: an escape port wherever no lane rule matched, a direct/corp port only
+# where main fell to its final.
+PARITY_SCENARIO=render-ports status
+PARITY_SCENARIO=ports-status status
+PARITY_SCENARIO=render-ports-local status
+PARITY_SCENARIO=render-ports explain pub.example
+PARITY_SCENARIO=render-ports explain corp-svc.example
+PARITY_SCENARIO=render-ports explain nores.example
+PARITY_SCENARIO=render-ports explain 203.0.113.5
+PARITY_SCENARIO=render-ports explain 198.51.100.7
+PARITY_SCENARIO=render-ports explain example.com
+PARITY_SCENARIO=render-ports ROWT_FINAL=escape explain pub.example
+PARITY_SCENARIO=render-ports-local explain pub.example
+PARITY_SCENARIO=render-ports port list
 # The watchdog's six-hour subscription refresh (PR #3), due and not due. Only a
 # FAILED fetch is reachable here (a reload with the router up would stop the
 # harness); success and the reload's audit pair are in tests/test_subscriptions.py.

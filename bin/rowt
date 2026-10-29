@@ -62,7 +62,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.8.0"
+ROWT_VERSION="3.8.1"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -8889,19 +8889,7 @@ main() {
     # write a different <string> into the same plist. Hand over the same path
     # `_watch_self` picks, so there is one answer.
     export ROWT_SELF="${ROWT_SELF:-$(_watch_self)}"
-    # Named ports are not in rowt-rs yet (rowt #s29): its render would drop
-    # them and its status/explain would not show them. While the table has
-    # rows, the arms that render or report stay in this shell — said on
-    # stderr, so nobody collects evidence about the wrong implementation —
-    # and everything else still goes to rowt-rs. Remove with #s29.
-    # Not only the arms that render or print: `use`, the pool and lane
-    # commands, `corp sync` and `vm up` all render through rowt-rs too. While
-    # the table has rows, everything runs here.
-    if [ -n "$(_ports_rows)" ]; then
-      echo "note: named ports ($PROG port list) are not in rowt-rs yet — running in the shell" >&2
-    else
-      exec "$_rb" "$@"
-    fi
+    exec "$_rb" "$@"
   fi
   _setup_py_helpers
   migrate

@@ -1,0 +1,2 @@
+render-ports' table in vm mode: the host render (escape is the VM's SOCKS
+outbound) carries the named inbounds and rules exactly as host mode does.

@@ -264,6 +264,7 @@ pub fn build_host(ctx: &Ctx) -> Result<Value, String> {
         },
         escape_outbound: if local { "direct".into() } else { "escape".into() },
         escape_hosts: ctx.cfg.join("escape-hosts").to_string_lossy().into_owned(),
+        ports: rowt_core::ports::rows(&read(&ctx.cfg.join("ports.tsv"))),
         geo: Geo {
             escape: geosites_of(&esc_src).into_iter().filter(|n| cached(n)).collect(),
             block: geosites_of(&blk_src).into_iter().filter(|n| cached(n)).collect(),

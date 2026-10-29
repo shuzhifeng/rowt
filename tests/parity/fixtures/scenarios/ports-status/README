@@ -1,0 +1,11 @@
+render-ports' table (guest 7892 escape, lab 7893 corp, vm 7894 direct, three
+rows the reader drops) against a rendered
+host.json that is out of step with it, for `status`'s port lines:
+
+  guest-in 7892   matches the table                 -> a plain line
+  lab-in   7895   the table says 7893               -> "NOT in host.json yet"
+  (no vm-in)      vm is in the table, not rendered  -> "NOT in host.json yet"
+  old-in   7899   no row of that name any more      -> "removed — but host.json still has it"
+
+The host.json is cut down to what those lines read (its inbounds); both
+implementations see the same file.

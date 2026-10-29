@@ -61,6 +61,9 @@ pub struct HostInput {
     /// (`escapedns`); the `dns-escape` server is rendered only when a member
     /// names it.
     pub escape_hosts: String,
+    /// Named extra ports (`ports.tsv`, in `ports::rows` order). Empty renders
+    /// byte-identically to a config from before they existed.
+    pub ports: Vec<crate::ports::Port>,
 }
 
 /// Parse one lane list exactly as `list_json` does.
@@ -360,6 +363,7 @@ pub fn render_host(i: &HostInput) -> Value {
     if i.private_default == "corp" {
         rules.push(json!({"ip_cidr": i.private_cidrs, "outbound": "corp"}));
     }
+    let rules = port_rules(rules, i);
 
     let mut dns_servers = json!([
         {"type": "local", "tag": "local"},
@@ -421,10 +425,13 @@ pub fn render_host(i: &HostInput) -> Value {
         "dns".into(),
         json!({"servers": dns_servers, "rules": dns_rules, "final": "dns-direct"}),
     );
-    root.insert(
-        "inbounds".into(),
-        json!([{"type": "mixed", "tag": "in", "listen": i.listen, "listen_port": i.port}]),
-    );
+    // A named port is loopback-only, like "in"; a VM reaches it through its
+    // host-side forward, never directly.
+    let mut inbounds = vec![json!({"type": "mixed", "tag": "in", "listen": i.listen, "listen_port": i.port})];
+    inbounds.extend(i.ports.iter().map(|p| {
+        json!({"type": "mixed", "tag": format!("{}-in", p.name), "listen": "127.0.0.1", "listen_port": p.listen_port()})
+    }));
+    root.insert("inbounds".into(), json!(inbounds));
     root.insert("outbounds".into(), json!(outbounds));
     root.insert("route".into(), Value::Object(route));
     if !i.clash.is_empty() {
@@ -434,6 +441,47 @@ pub fn render_host(i: &HostInput) -> Value {
         );
     }
     Value::Object(root)
+}
+
+/// Main's rules with the named ports' rules inserted — pure insertions, so
+/// main's rules are the same list, in the same order, with or without ports.
+///
+/// Every port shares every rule and differs only in what none matched. A port
+/// whose catch-all is escape hands an unmatched NAME to the far end, so its
+/// catch-all must come BEFORE the resolve rule (past it, the name would already
+/// have been looked up at dns-direct), with the address rules after the resolve
+/// repeated for it just above, since its connections to an IP still need them.
+/// With no resolve rule its catch-all simply goes last. A direct or corp
+/// catch-all shares the lookup and goes last, where main's final applies.
+fn port_rules(rules: Vec<Value>, i: &HostInput) -> Vec<Value> {
+    let inbound = |n: &str| json!([format!("{n}-in")]);
+    let tun = i.ports.iter().filter(|p| p.fin == "escape");
+    let mut out = match rules.iter().position(|r| r.get("action") == Some(&json!("resolve"))) {
+        None => {
+            let mut out = rules;
+            out.extend(tun.map(|p| json!({"inbound": inbound(&p.name), "outbound": i.escape_outbound})));
+            out
+        }
+        Some(ri) => {
+            let mut out = rules[..ri].to_vec();
+            for p in tun {
+                if !i.lists.corp_cidrs.is_empty() {
+                    out.push(json!({"inbound": inbound(&p.name), "ip_cidr": i.lists.corp_cidrs, "outbound": "corp"}));
+                }
+                if i.private_default == "corp" {
+                    out.push(json!({"inbound": inbound(&p.name), "ip_cidr": i.private_cidrs, "outbound": "corp"}));
+                }
+                out.push(json!({"inbound": inbound(&p.name), "outbound": i.escape_outbound}));
+            }
+            out.extend_from_slice(&rules[ri..]);
+            out
+        }
+    };
+    out.extend(
+        i.ports.iter().filter(|p| p.fin != "escape")
+            .map(|p| json!({"inbound": inbound(&p.name), "outbound": p.fin})),
+    );
+    out
 }
 
 /// The VM guest configuration — everything it receives is escape traffic.

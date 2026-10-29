@@ -78,6 +78,10 @@ pub struct Classification {
     /// record inside a corp CIDR or a private range did NOT change the lane.
     /// Empty whenever there is nothing to say.
     pub note: String,
+    /// No lane rule matched: an address outside every corp CIDR and private
+    /// range, or a name no list names (even one the router's lookup then sent
+    /// to corp). Where a named port can answer differently from main.
+    pub unmatched: bool,
 }
 
 impl Classification {
@@ -317,6 +321,7 @@ pub fn classify(raw_dest: &str, i: &ClassifyInput) -> Classification {
     let dest = normalize_dest(raw_dest);
     let mut ip = String::new();
     let mut note = String::new();
+    let mut unmatched = false;
     let (mut lane, mut why);
 
     if is_ipv4(&dest) {
@@ -333,6 +338,7 @@ pub fn classify(raw_dest: &str, i: &ClassifyInput) -> Classification {
                 "no corp CIDR matched; final route = {}",
                 i.final_route.as_str()
             );
+            unmatched = true;
         }
     } else if let Some((l, k, m)) = longest_domain_hit(&dest, i.escape_list, i.corp_list, i.block_list) {
         lane = l;
@@ -354,6 +360,7 @@ pub fn classify(raw_dest: &str, i: &ClassifyInput) -> Classification {
             "no block/corp/escape rule; final route = {}",
             i.final_route.as_str()
         );
+        unmatched = true;
         if !i.resolver.is_empty() {
             if ip.is_empty() {
                 note = format!("does not resolve at {}, the resolver the router uses for names no rule matched — the connection fails there (logged under the direct lane). An intranet name: '{p} corp add <suffix>' sends it to the corp lane, which resolves at the system resolver. A tailnet or other overlay zone only the OS resolves: '{p} hotspot add <suffix>' hands it to the OS.", i.resolver, p = i.prog);
@@ -372,7 +379,7 @@ pub fn classify(raw_dest: &str, i: &ClassifyInput) -> Classification {
         why = format!("{why} — local mode: the escape lane routes direct");
     }
 
-    Classification { dest, ip, lane, why, note }
+    Classification { dest, ip, lane, why, note, unmatched }
 }
 
 #[cfg(test)]

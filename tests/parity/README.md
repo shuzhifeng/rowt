@@ -253,9 +253,9 @@ reconcile and the watchdog's decision table. Each has a gate:
 
 | gate | compares | scale |
 |---|---|---|
-| `render-matrix` | rendered config, canonical JSON | 26 shapes × host + vm |
-| `classify-matrix` | `(lane, reason)` per destination | 9 shapes × 92 destinations |
-| `lanes-diff` | all three lane files + messages | 12 edits |
+| `render-matrix` | rendered config, canonical JSON | 36 shapes × host + vm |
+| `classify-matrix` | `(lane, reason)` per destination | 11 shapes × 92 destinations |
+| `lanes-diff` | all three lane files + messages | 37 edits |
 | `reconcile-diff` | stdout contract vs the Python | 210 cases, 200 randomized |
 | `netdetect-diff` | stdout BYTES vs the Python (key order is contract) | 800 generated cases |
 <!-- `overlay_domains` rides along here: the generator emits CGNAT nameservers
@@ -266,8 +266,8 @@ reconcile and the watchdog's decision table. Each has a gate:
 | `foreign-diff` | stdout + stderr + exit status, over client config TREES | 1,200 generated cases |
 | `sr-diff` | stdout + stderr + exit status, over Shadowrocket installs | 1,200 generated cases |
 | `watch-diff` | decisions, read back from watch.log + trace | 6 cases |
-| `platform-diff` | the argv the platform layer produces | 10 cases |
-| `cli-diff` | stdout, status, the config tree + rc files + LaunchAgent plist (content + mode), argv trace, audit log | 404 cases |
+| `platform-diff` | the argv the platform layer produces | 12 cases |
+| `cli-diff` | stdout, status, the config tree + rc files + LaunchAgent plist (content + mode), argv trace, audit log | 461 cases |
 
 `merge-diff` is the only gate whose primary artifact is a file written in
 place: `cmd_import` reads the accumulation straight back with jq, and a human

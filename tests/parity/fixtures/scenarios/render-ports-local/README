@@ -1,0 +1,4 @@
+render-ports' table in local mode, where there is no tunnel: guest's escape
+catch-all renders as direct. `status` prints the stored word with what it means
+here, "escape (direct in local mode)"; `explain` judges by where it goes, and
+main's final is direct too, so `explain` of an unmatched name names lab alone.

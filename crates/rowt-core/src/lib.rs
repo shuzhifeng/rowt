@@ -23,6 +23,7 @@ pub mod lanes;
 pub mod lanestate;
 pub mod latency;
 pub mod netdetect;
+pub mod ports;
 pub mod pycli;
 pub mod pyjson;
 pub mod pypath;

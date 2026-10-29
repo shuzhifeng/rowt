@@ -62,7 +62,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.8.1"
+ROWT_VERSION="3.8.2"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -1871,11 +1871,38 @@ group_jq() {
 # (dns-escape) that each checked member names as its domain_resolver;
 # escape-dns.tsv records each verdict for status.
 # One implementation, in rowt-rs (rowt_core::escapedns): this shell calls it.
-# Nothing happens without rowt-rs, or with no server named by a domain.
+# Nothing happens without rowt-rs, or with no server named by a domain — and
+# nothing happens with a rowt-rs that does not answer the call either: a build
+# from before the arm existed, found beside a newer bin/rowt (a fleet that
+# bundles its own binaries can end up there), used to print its usage page
+# into `jq --argjson` and fail the whole render (rowt #s33). The helper exits
+# 0 whatever the network did and non-zero only when it did not understand the
+# call, so that is the test; `guarded` is also held to a JSON array. When it
+# fails, the companion's own output is dropped and one line names what did
+# not answer and how it exited — once per command, which in the watchdog is
+# once per tick until the binary is put right — and `status` gets its row.
 _escape_dns() { # $1 = refresh | guarded | status
-  local rb; rb="$(_rust_cli)" || return 0
+  local rb out rc errf v why; rb="$(_rust_cli)" || return 0
   [ -n "$rb" ] || return 0
-  "$rb" _escape-dns "$1" --config-dir "$CFG"
+  errf="$(mktemp)"
+  if out="$("$rb" _escape-dns "$1" --config-dir "$CFG" 2>"$errf")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 0 ] && { [ "$1" != guarded ] || printf '%s\n' "$out" | jq -e 'type == "array"' >/dev/null 2>&1; }; then
+    cat "$errf" >&2; rm -f "$errf"
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
+  fi
+  rm -f "$errf"
+  v="$("$rb" version 2>/dev/null | head -n 1)"; v="${v:-no version}"
+  why="exit $rc"; [ "$rc" -eq 0 ] && why="exit 0 but not a JSON array"
+  if [ -z "${_ESCAPE_DNS_SAID:-}" ]; then
+    _ESCAPE_DNS_SAID=1
+    warn "rowt-rs at $rb ($v) did not answer the escape-name check ($why) — $PROG $ROWT_VERSION renders without it: escape server names are resolved through dns-direct, unchecked, until rowt-rs is reinstalled or rebuilt"
+  fi
+  case "$1" in
+    guarded) echo '[]' ;;
+    status)  printf '%-14s%s\n' "escape dns:" "not checked — rowt-rs at $rb ($v) did not answer ($why); reinstall or rebuild rowt-rs" ;;
+  esac
+  return 0
 }
 
 # The escape-related outbounds (a JSON array) for a render target:

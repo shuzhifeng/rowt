@@ -491,5 +491,86 @@ class HostsFollowDrill(unittest.TestCase):
                     p.wait(timeout=10)
 
 
+# The shell asks its companion rowt-rs for the escape-name check. A companion
+# that does not answer the call — a build from before the arm existed, found
+# beside a newer bin/rowt, as a fleet that bundles its own binaries can end up
+# with — must cost the render the check, not the render (rowt #s33). Shaped
+# like the real thing: a rowt-rs 3.5.19 prints the error on stderr and its
+# usage page on stdout, and exits 1.
+OLD_COMPANION = """#!/bin/bash
+case "$1" in
+  version) echo 'rowt 3.5.19' ;;
+  *) echo "error: unknown command: $1" >&2
+     printf '\\nrowt — split traffic three ways from one local proxy (127.0.0.1:7890)\\n  escape  domains in escape-domains.txt\\n'
+     exit 1 ;;
+esac
+"""
+
+
+class CompanionTests(unittest.TestCase):
+    def tree(self, box, companion):
+        """bin/rowt in a tree of its own, so `_rust_cli` finds what this test put beside it."""
+        tree = box.root / "tree"
+        (tree / "bin").mkdir(parents=True)
+        (tree / "config").mkdir()
+        shutil.copy(ROOT / "bin/rowt", tree / "bin/rowt")
+        for f in (ROOT / "config").glob("*.txt"):
+            shutil.copy(f, tree / "config" / f.name)
+        if companion is not None:
+            box.executable(tree / "bin/rowt-rs", companion)
+        return tree
+
+    def render(self, box, tree, path=None):
+        env = dict(box.env)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run(["bash", str(tree / "bin/rowt"), "render"], env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    def dns_tags(self, box):
+        return [s["tag"] for s in json.loads((box.cfg / "host.json").read_text())["dns"]["servers"]]
+
+    def test_a_companion_without_the_arm_costs_the_check_not_the_render(self):
+        with Sandbox("bash") as box:
+            box.executable(box.cfg / "bin/sing-box", FAKE_ENGINE)
+            tree = self.tree(box, OLD_COMPANION)
+            r = self.render(box, tree)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            # (No names to guard in this fixture, so a working companion gives
+            # the same host.json; the exit status and the lines below carry it.)
+            self.assertNotIn("dns-escape", self.dns_tags(box))
+            host = json.loads((box.cfg / "host.json").read_text())
+            self.assertFalse([o for o in host["outbounds"] if (o.get("domain_resolver") or {}).get("server") == "dns-escape"])
+            said = [line for line in r.stderr.splitlines() if "did not answer the escape-name check" in line]
+            self.assertEqual(len(said), 1, r.stderr)  # refresh and guarded both failed; one line
+            self.assertIn(str((tree / "bin/rowt-rs").resolve()), said[0])  # $HERE is cd -P resolved
+            self.assertIn("(rowt 3.5.19) did not answer the escape-name check (exit 1)", said[0])
+            self.assertNotIn("split traffic three ways", r.stdout)  # the usage page stays out of the render's output
+            self.assertNotIn("unknown command", r.stderr)  # and the companion's own complaint is dropped
+            self.assertNotIn("argjson", r.stderr)
+            # status says so in its own row instead of losing the line.
+            st = subprocess.run(["bash", str(tree / "bin/rowt"), "status"], env=box.env,
+                                capture_output=True, text=True, timeout=120)
+            rows = [line for line in st.stdout.splitlines() if line.startswith("escape dns:")]
+            self.assertEqual(len(rows), 1, st.stdout + st.stderr)
+            self.assertIn("not checked — rowt-rs at", rows[0])
+            self.assertIn("(rowt 3.5.19) did not answer (exit 1)", rows[0])
+
+    @unittest.skipUnless(shutil.which("jq"), "no jq on PATH")
+    def test_no_companion_at_all_renders_without_the_check(self):
+        with Sandbox("bash") as box:
+            box.executable(box.cfg / "bin/sing-box", FAKE_ENGINE)
+            tree = self.tree(box, None)
+            # No rowt-rust on PATH either: only the recorder shims, jq, and the OS.
+            tools = box.root / "tools"
+            tools.mkdir()
+            (tools / "jq").symlink_to(shutil.which("jq"))
+            path = os.pathsep.join([str(box.shims), str(tools), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+            r = self.render(box, tree, path)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn("dns-escape", self.dns_tags(box))
+            self.assertNotIn("escape-name check", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

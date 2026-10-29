@@ -56,11 +56,13 @@
 #      ROWT_HEALTH_FAILS  consecutive probe failures before auto-recover (default 3)
 #      ROWT_HEALTH_COOLDOWN  min seconds between auto-recoveries (default 600)
 #      ROWT_HEALTH_TIMEOUT  per-probe delay-test timeout, seconds (default 8)
+#      (named extra ports — each with its own catch-all for the clients on it — are a
+#      file, not env: 'rowt port add <N> <name> [--final …]' / 'port rm <name>' / 'port list')
 #      SINGBOX_VERSION  pinned sing-box release (default 1.13.14, >=1.12 AnyTLS)
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.7.0"
+ROWT_VERSION="3.8.0"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -178,6 +180,18 @@ AUTO_FOLLOW="${ROWT_AUTO_FOLLOW:-1}"              # 1 = run the follower in `aut
 AUTO_TOLERANCE="${ROWT_AUTO_TOLERANCE:-100}"     # ms, 0–99999
 AUTO_INTERRUPT="${ROWT_AUTO_INTERRUPT:-0}"       # 1 = a switch closes the old pick's connections
 AUTO_FOLLOW_EVERY="${ROWT_AUTO_FOLLOW_EVERY:-15}" # seconds between its checks
+# Named extra ports. One rowt serves clients that want different default
+# postures: the Mac's own apps on main (127.0.0.1:$PORT, the system proxy), a VM,
+# a container or a single app on a port of its own. Each row of ports.tsv (name,
+# port, catch-all) is one more loopback mixed inbound, "<name>-in", that runs
+# the SAME rules as main and differs only in where traffic NO rule matched goes:
+# escape (the tunnel; direct in local mode, where there is none), taken BEFORE
+# the resolve rule so an unmatched name is never looked up here and is resolved
+# at the far end; or direct / corp, taken last like main's own $FINAL_ROUTE.
+# 'rowt port add <N> <name> [--final …]' / 'port rm <name>' / 'port list'. A
+# file, not state keys, because it is a table; per machine, like state.
+PORTS_TSV="$CFG/ports.tsv"
+PORTS_HEADER="# rowt: named extra ports (name, port, catch-all) — 'rowt port add <N> <name> [--final escape|direct|corp]', 'port rm <name>', 'port list'"
 # `best`: rowt's own auto mode. The watchdog measures each server as the median
 # of three delay samples, keeps them in LATENCY_TABLE (shared with `rowt ping`
 # and the monitor), and keeps the current server unless another beats it by more
@@ -2023,6 +2037,7 @@ assemble_host() {
     --argjson block_exact "$(block_exact_json)" \
     --arg priv_default "$PRIVATE_DEFAULT" \
     --argjson private_cidrs "$PRIVATE_CIDRS" \
+    --argjson ports "$(_ports_json)" \
     '
     # route rules, first match wins. sniff first so domain rules see host names.
     #
@@ -2087,6 +2102,31 @@ assemble_host() {
          if $n_corp > 0                  then {ip_cidr:$corp_cidr, outbound:"corp"} else empty end,
          if $priv_default == "corp"      then {ip_cidr:$private_cidrs, outbound:"corp"} else empty end ]) as $rules
     |
+    # Named ports share every rule above and differ only in what none of them
+    # matched. A port whose catch-all is escape ($esc_out — direct in local mode,
+    # where no tunnel exists) takes that traffic with its NAME handed to the far
+    # end, so its catch-all must come BEFORE the resolve rule: past it, an
+    # unmatched name would already have been looked up at dns-direct and dialled
+    # by address — the lookup such a port exists to avoid. The address rules
+    # after the resolve still have to see the connections of that port to an IP, so
+    # they are repeated for it just above its catch-all (a NAME never matches
+    # them unresolved); without a resolve rule the catch-all simply goes last.
+    # A port whose catch-all is direct or corp shares the lookup and only needs
+    # its catch-all last, where the final of main applies. Rows come sorted by
+    # name, so one table always renders the same bytes. Pure insertions: the
+    # rules of main are the same list, in the same order, with or without named ports.
+    ( ($ports | map(select(.f == "escape"))) as $tun
+    | ($ports | map(select(.f != "escape"))) as $plain
+    | ($rules | map(.action == "resolve") | index(true)) as $ri
+    | ( if $ri == null then $rules + [ $tun[] | {inbound:[(.n + "-in")], outbound:$esc_out} ]
+        else $rules[:$ri]
+             + [ $tun[] | .n as $n
+                 | (if $n_corp > 0             then {inbound:[($n + "-in")], ip_cidr:$corp_cidr, outbound:"corp"} else empty end),
+                   (if $priv_default == "corp" then {inbound:[($n + "-in")], ip_cidr:$private_cidrs, outbound:"corp"} else empty end),
+                   {inbound:[($n + "-in")], outbound:$esc_out} ]
+             + $rules[$ri:] end )
+      + [ $plain[] | {inbound:[(.n + "-in")], outbound:.f} ] ) as $rules
+    |
     # dns-direct is DoH (not plain UDP): a persistent UDP DNS socket wedges on a
     # network transition and the sing-box UDPTransport.recvLoop then busy-spins on
     # the dead fd (~200% CPU, traffic-independent). DoH is connection-based (a
@@ -2109,7 +2149,10 @@ assemble_host() {
     {
       log:{level:$lvl, timestamp:true},
       dns:{servers:$dns_servers, rules:$dns_rules, final:"dns-direct"},
-      inbounds:[{type:"mixed", tag:"in", listen:$listen, listen_port:$port}],
+      # a named port is loopback-only, like "in"; a VM reaches it through its
+      # host-side forward, never directly.
+      inbounds:([{type:"mixed", tag:"in", listen:$listen, listen_port:$port}]
+                + [ $ports[] | {type:"mixed", tag:(.n + "-in"), listen:"127.0.0.1", listen_port:.p} ]),
       outbounds:($escs + [
         # corp: OS routing -> corp VPN. The domain_resolver matters: sing-box
         # >=1.12 resolves CONNECTION domains via the outbound domain_resolver
@@ -2816,6 +2859,259 @@ cmd_use() {
     [ "$tag" = "auto" ] && info "escape -> auto (fastest live server, re-probed every $(_auto_interval))" \
                         || info "escape -> $tag"
   fi
+}
+
+# The table of named ports: name<TAB>port<TAB>catch-all, sorted by name. A row
+# a hand edit broke — not three fields, a port that is not a number, a catch-all
+# that is not escape|direct|corp, a port an earlier line already uses (the row
+# already in the file wins over a hand-appended one) — is skipped rather than
+# failing every render or the router's start; `port list` says how many.
+_ports_rows() {
+  [ -f "$PORTS_TSV" ] || return 0
+  awk -F'\t' '!/^#/ && NF == 3 && $2 ~ /^[0-9]+$/ && ($3 == "escape" || $3 == "direct" || $3 == "corp") && !seen[$2]++' "$PORTS_TSV" \
+    | LC_ALL=C sort
+}
+_ports_skipped() { # how many non-comment lines of ports.tsv the reader left out
+  [ -f "$PORTS_TSV" ] || { echo 0; return 0; }
+  echo $(( $(awk '!/^#/ && NF > 0' "$PORTS_TSV" | wc -l | tr -d ' ') - $(_ports_rows | wc -l | tr -d ' ') ))
+}
+_ports_json() { # the rows as [{n, p, f}], for the render
+  _ports_rows | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {n: .[0], p: (.[1] | tonumber), f: .[2]})'
+}
+_ports_write() { # stdin: rows; written sorted, or the file removed when there are none
+  local body; body="$(LC_ALL=C sort -u | grep -v '^$' || true)"
+  if [ -z "$body" ]; then rm -f "$PORTS_TSV"; return 0; fi
+  { printf '%s\n' "$PORTS_HEADER"; printf '%s\n' "$body"; } > "$PORTS_TSV.n" && mv "$PORTS_TSV.n" "$PORTS_TSV"
+}
+_port_row() { _ports_rows | awk -F'\t' -v n="$1" '$1 == n'; }   # the row named $1, or nothing
+# name<TAB>port for every named inbound the RENDERED host.json (what the router
+# runs) carries — the table may be ahead of it until the next render.
+_port_rendered() {
+  [ -f "$HOST_CFG" ] || return 0
+  jq -r '.inbounds[]? | select(.tag != "in" and (.tag | endswith("-in"))) | "\(.tag | .[:-3])\t\(.listen_port)"' "$HOST_CFG" 2>/dev/null || true
+}
+# Where a port's catch-all actually sends traffic: escape is direct in local mode.
+_port_dest() { case "$1" in escape) [ "$(sget mode)" = local ] && echo direct || echo escape ;; *) echo "$1" ;; esac; }
+_port_check_name() {
+  case "$1" in
+    main) die "'main' is 127.0.0.1:$PORT, rowt's own port" ;;
+    escape|corp|block|direct|hotspot) die "'$1' is a lane name — pick another name for the port" ;;
+  esac
+  # LC_ALL=C: in a UTF-8 locale the range a-z can take in capitals.
+  printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[a-z0-9-]{1,32}$' || die "a port name is 1-32 of a-z, 0-9 and '-' (got '$1')"
+}
+
+# rowt port add <N> <name> [--final escape|direct|corp] | rm <name> | list —
+# named extra ports. Each is one more loopback mixed port that runs main's
+# rules and differs only in its catch-all; see the comment at PORTS_TSV.
+cmd_port() {
+  local action="${1:-list}"; [ "$#" -gt 0 ] && shift
+  case "$action" in
+    add)       _port_add "$@" ;;
+    rm|remove) _port_rm "$@" ;;
+    list|ls)   _port_list "$@" ;;
+    *) die "usage: $PROG port <add <N> <name> [--final escape|direct|corp] | rm <name> | list>" ;;
+  esac
+}
+_port_add() {
+  local usage="usage: $PROG port add <N> <name> [--final escape|direct|corp]"
+  local port="${1:-}" name="${2:-}" final="" a
+  { [ -n "$port" ] && [ -n "$name" ]; } || die "$usage"
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    a="$1"; shift
+    case "$a" in
+      --final)   [ "$#" -ge 1 ] || die "$usage"; final="$1"; shift ;;
+      --final=*) final="${a#--final=}" ;;
+      *) die "unknown argument: $a  ($usage)" ;;
+    esac
+  done
+  final="${final:-$FINAL_ROUTE}"
+  case "$final" in escape|direct|corp) ;; *) die "--final wants escape, direct or corp (got '$final')" ;; esac
+  case "$port" in *[!0-9]*) die "the port wants a number, got '$port'" ;; esac
+  port="$((10#$port))"
+  { [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; } || die "the port must be 1-65535, got $port"
+  [ "$port" -ge 1024 ] || die "ports under 1024 need root, and rowt's router runs as you — use 1024 or above"
+  _port_check_name "$name"
+  local p
+  for p in "$PORT" "$VM_PORT" "$CLASH_PORT" "$VM_CLASH"; do
+    [ "$port" = "$p" ] && die "port $port is one of rowt's own (main $PORT, vm $VM_PORT, clash $CLASH_PORT/$VM_CLASH) — pick another"
+  done
+  # Two ways back: a render that fails leaves the table as it was before this
+  # command; a router that will not start with the row drops the name,
+  # whether it was new or re-added.
+  local had without; had="$(_ports_rows)"; without="$(printf '%s\n' "$had" | awk -F'\t' -v n="$name" '$1 != n')"
+  local row; row="$(_port_row "$name")"
+  local far=""; [ "$(_port_dest "$final")" = escape ] && far=" (names resolved at the far end)"
+  if [ -n "$row" ]; then
+    # The same row again: nothing to write, so a script can run `port add` on
+    # every apply — but it still goes through the apply, which does nothing
+    # when the router already serves the port and brings it up when it does
+    # not. A different port or catch-all under the same name is a change, and
+    # `port rm` first says so.
+    if [ "$row" = "$(printf '%s\t%s\t%s' "$name" "$port" "$final")" ]; then
+      _port_apply "$had" "$without" "$port" "" "port $name is already 127.0.0.1:$port, unmatched -> $(_port_dest "$final")"
+      return
+    fi
+    die "a port named '$name' exists: 127.0.0.1:$(printf '%s' "$row" | cut -f2), unmatched -> $(printf '%s' "$row" | cut -f3) — '$PROG port rm $name' first"
+  fi
+  local taken; taken="$(_ports_rows | awk -F'\t' -v p="$port" '$2 == p {print $1}')"
+  [ -z "$taken" ] || die "port $port is already the port named '$taken'"
+  # A port someone else listens on would stop the router from starting at all
+  # (and 'router up' then turns the system proxy off). lsof names the owner
+  # when it can; as a plain user it does not see a root-owned listener, so a
+  # connect comes next; and a short run of sing-box itself, binding exactly
+  # that port, is the last word — the check sing-box does on a config never
+  # binds. The one listener allowed there is the running router (a host that
+  # upgraded from a build which already served the port).
+  local owner hp; hp="$(cat "$(host_pidfile)" 2>/dev/null || true)"
+  owner="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+  if [ -n "$owner" ] && [ "$owner" != "$hp" ]; then
+    die "127.0.0.1:$port is already in use (pid $owner, $(ps -o comm= -p "$owner" 2>/dev/null || echo '?')) — pick another"
+  fi
+  if [ -z "$owner" ]; then
+    _port_open "$port" && die "127.0.0.1:$port already answers, and not for rowt (an owner lsof cannot see — a root service?) — pick another"
+    _port_bind_probe "$port" || die "127.0.0.1:$port cannot be bound by sing-box here (held by something lsof cannot see, or blocked) — pick another"
+  fi
+  { printf '%s\n' "$without"; printf '%s\t%s\t%s\n' "$name" "$port" "$final"; } | _ports_write
+  _port_apply "$had" "$without" "$port" "" "port $name: 127.0.0.1:$port — unmatched traffic -> $(_port_dest "$final")$far; main 127.0.0.1:$PORT unchanged"
+}
+# Can sing-box bind 127.0.0.1:$1 right now? A run of the engine with that one
+# inbound, for as long as it takes to answer (well under a second), then
+# stopped. Without an engine on disk yet there is nothing to ask: say yes, the
+# first 'up' is the check then.
+_port_bind_probe() {
+  [ -x "$SB" ] || return 0
+  local cfg pid i=0 ok=1
+  cfg="$(mktemp "${TMPDIR:-/tmp}/rowt-port-probe.XXXXXX")"
+  printf '{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"probe","listen":"127.0.0.1","listen_port":%s}],"outbounds":[{"type":"direct","tag":"direct"}]}\n' "$1" > "$cfg"
+  # perl holds the engine and ends it after 5 s whatever becomes of this shell,
+  # so a rowt killed mid-probe leaves nothing on the port (an alarm on the
+  # engine itself would not do: Go ignores SIGALRM).
+  perl -e '$p = fork(); if (!$p) { exec @ARGV or exit 127 } $SIG{ALRM} = $SIG{TERM} = $SIG{INT} = sub { kill "TERM", $p; exit 0 }; alarm 5; waitpid($p, 0); exit 0' \
+    "$SB" run -c "$cfg" >/dev/null 2>&1 &
+  pid=$!
+  while [ "$i" -lt 20 ]; do
+    if _port_open "$1"; then ok=0; break; fi
+    kill -0 "$pid" 2>/dev/null || break   # the engine exited: the bind failed
+    sleep 0.1; i=$((i + 1))
+  done
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  rm -f "$cfg"
+  return "$ok"
+}
+_port_rm() {
+  local name="${1:-}"
+  { [ -n "$name" ] && [ "$#" -eq 1 ]; } || die "usage: $PROG port rm <name>"
+  [ "$name" != main ] || die "main (127.0.0.1:$PORT) is rowt's own port and stays"
+  local row; row="$(_port_row "$name")"
+  [ -n "$row" ] || { info "no port named '$name' — nothing to remove ('$PROG port list')"; return 0; }
+  local port had without; port="$(printf '%s' "$row" | cut -f2)"; had="$(_ports_rows)"
+  without="$(printf '%s\n' "$had" | awk -F'\t' -v n="$name" '$1 != n')"
+  printf '%s\n' "$without" | _ports_write
+  _port_apply "$had" "$without" "" "$port" "port $name removed (was 127.0.0.1:$port)"
+}
+_port_list() {
+  [ "$#" -eq 0 ] || die "usage: $PROG port list"
+  local running=0; host_running && running=1
+  printf '%-10s %-18s %s\n' main "127.0.0.1:$PORT" "unmatched -> $FINAL_ROUTE (the system proxy port)"
+  local pn pp pf prp note
+  while IFS=$'\t' read -r pn pp pf; do
+    [ -n "$pn" ] || continue
+    prp="$(_port_rendered | awk -F'\t' -v n="$pn" '$1 == n {print $2}')"
+    note=""
+    if [ "$prp" != "$pp" ]; then note="  — not in host.json yet: '$PROG render'"
+    elif [ "$running" = 1 ] && ! _port_open "$pp"; then note="  — not answering: '$PROG router restart'"
+    elif [ "$running" = 1 ]; then note="  (listening)"; fi
+    printf '%-10s %-18s %s\n' "$pn" "127.0.0.1:$pp" "unmatched -> $(_port_catchall "$pf")$note"
+  done <<<"$(_ports_rows)"
+  [ -n "$(_ports_rows)" ] || echo "(no named ports — '$PROG port add <N> <name> [--final escape|direct|corp]' adds one, e.g. 'port add 7892 guest --final escape' for VMs)"
+  local sk; sk="$(_ports_skipped)"
+  [ "$sk" = 0 ] || warn "$sk line(s) in $PORTS_TSV skipped: not name/port/catch-all, a port used twice, or a catch-all other than escape|direct|corp"
+}
+# The stored catch-all as `list` and `status` print it: always the word in the
+# table (a script can grep for it), with what it means here when that differs.
+_port_catchall() {
+  case "$1" in
+    escape) if [ "$(sget mode)" = local ]; then echo "escape (direct in local mode)"; else echo "escape, names resolved at the far end"; fi ;;
+    *) echo "$1" ;;
+  esac
+}
+# Does anything accept connections on 127.0.0.1:$1? A bare TCP connect, no
+# bytes: an HTTP request to a mixed port would be proxied — to itself.
+_port_open() { ( exec 3<>"/dev/tcp/127.0.0.1/$1" ) 2>/dev/null; }
+# Wait up to ~5s for 127.0.0.1:$1 to be open ($2=1) or closed ($2=0).
+_port_wait() {
+  local i=0 want="$2"
+  while [ "$i" -lt 10 ]; do
+    if _port_open "$1"; then [ "$want" = 1 ] && return 0; else [ "$want" = 0 ] && return 0; fi
+    sleep 0.5; i=$((i + 1))
+  done
+  return 1
+}
+# Re-render, then bring the RUNNING router onto the new host.json, so the port is
+# up (or gone) when this returns. An inbound cannot be added over the clash API,
+# so it is sing-box's own reload: SIGHUP makes it check the file and, if it
+# passes, close the running instance and start a new one IN THE SAME PROCESS —
+# same pid, no proxy change, well under a second (Go re-arms the handler itself,
+# although _detach starts sing-box with HUP ignored). Every open connection,
+# main's too, is closed by that, as by any restart; new ones go through at once.
+# A check that fails leaves the old instance running (sing-box logs it), so the
+# port test below then falls back to a full 'router restart'.
+_port_apply() { # $1=the table before this command (a failed render goes back to it)  $2=the table without the name at stake (a failed start goes to it)  $3=port that must open  $4=port that must close  $5=message
+  local had="$1" without="$2" want_open="$3" want_closed="$4" msg="$5" pi_before; pi_before="$(sget proxy_intent)"
+  if [ "$(sget mode)" != local ] && [ ! -s "$SERVERS" ]; then
+    info "$msg (saved; applies on the next '$PROG up')"; return 0
+  fi
+  local before; before="$(cksum < "$HOST_CFG" 2>/dev/null || true)"
+  # A render that fails (sing-box check, a bad lane entry, a bad env value)
+  # must not leave the change in the table — nor take away a row that was
+  # there: the table goes back to what it was before this command.
+  if ! ( cmd_render >/dev/null ); then
+    printf '%s\n' "$had" | _ports_write
+    die "render failed — the ports are as they were"
+  fi
+  if ! host_running; then info "$msg (router not running: applies on the next '$PROG router up')"; return 0; fi
+  # Nothing to reload when this render left host.json as it was AND the port
+  # already answers as it should. The port alone is not enough: after an
+  # upgrade the running router may serve that port from an older config, and
+  # the new host.json still has to reach it.
+  if [ "$(cksum < "$HOST_CFG" 2>/dev/null)" = "$before" ] \
+     && { [ -z "$want_open" ] || _port_open "$want_open"; } && { [ -z "$want_closed" ] || ! _port_open "$want_closed"; }; then
+    info "$msg"; return 0
+  fi
+  local pid; pid="$(cat "$(host_pidfile)")"
+  if kill -HUP "$pid" 2>/dev/null \
+     && { [ -z "$want_open" ] || _port_wait "$want_open" 1; } \
+     && { [ -z "$want_closed" ] || _port_wait "$want_closed" 0; } \
+     && host_running && _router_ready 2; then
+    info "$msg (router reloaded in place, pid $pid — open connections were reset)"
+    return 0
+  fi
+  warn "in-place reload did not take — restarting the router"
+  if cmd_router restart >/dev/null && { [ -z "$want_open" ] || _port_wait "$want_open" 1; }; then
+    info "$msg (router restarted)"; return 0
+  fi
+  # The change itself keeps the router from coming up — a port that cannot be
+  # bound after all (something no check could see took it), or a start that
+  # fails for a reason the config check does not catch. A failed start also
+  # took the system proxy off (no limbo). Take the change back, render without
+  # it, bring the router up as it was, put the proxy back, and only then say so:
+  # a row that is not served must not stay in the table, where every later
+  # 'up' would fail on it and a re-add would answer "already".
+  printf '%s\n' "$without" | _ports_write
+  ( cmd_render >/dev/null ) || true
+  local back=0
+  if host_running || cmd_router up >/dev/null; then
+    back=1
+    if [ "$pi_before" = on ] && [ "$(sget proxy_intent)" != on ]; then
+      ( cmd_proxy on >/dev/null 2>&1 ) || warn "the system proxy was switched off while the router was down and could not be put back without a password — '$PROG up' does it"
+    fi
+  fi
+  if [ "$back" = 1 ]; then
+    die "the router would not come up with that change — see '$PROG router log' — so it was undone and the router is running as before${want_open:+ (is something rowt cannot see listening on 127.0.0.1:$want_open?)}"
+  fi
+  die "the router would not come up with that change, nor after undoing it — see '$PROG status' and '$PROG router log'"
 }
 
 # Latency-test one server (or all) through the running router's clash API.
@@ -5043,6 +5339,12 @@ cmd_doctor() {
   _dr_row ports "$PORT: $o1 · $CLASH_PORT: $o2"
   case "$o1" in free|"rowt ("*) ;; *) _dr_flag PORT_BUSY "$PORT (the proxy port) is held by $o1" ;; esac
   case "$o2" in free|"rowt ("*) ;; *) _dr_flag PORT_BUSY "$CLASH_PORT (the controller port) is held by $o2" ;; esac
+  local pn pp pf o3
+  while IFS=$'\t' read -r pn pp pf; do
+    [ -n "$pn" ] || continue
+    o3="$(_dr_port_owner "$pp")"; _dr_row port "$pn $pp: $o3"
+    case "$o3" in free|"rowt ("*) ;; *) _dr_flag PORT_BUSY "$pp (the port named $pn) is held by $o3" ;; esac
+  done <<<"$(_ports_rows)"
 
   # other proxy / VPN software — one label per product (a client runs several
   # processes); rowt's own sing-box lives under …/rowt/bin and is skipped.
@@ -5301,7 +5603,7 @@ _hotspot_hit() { # $1=domain
 cmd_explain() {
   local dest="${1:-}"; [ -n "$dest" ] || die "usage: $PROG explain <domain|ip>"
   dest="$(printf '%s' "$dest" | sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s#:[0-9]+$##' | tr 'A-Z' 'a-z')"
-  local lane="" why="" ip="" ip_note="" m hit
+  local lane="" why="" ip="" ip_note="" m hit unmatched=0
   # The hotspot lane is not a routing lane: macOS takes these names off the
   # proxy before rowt is handed the connection, so no lane applies and a probe
   # THROUGH the router would say nothing about them. Answered first for that
@@ -5323,7 +5625,7 @@ cmd_explain() {
     ip="$dest"
     if m="$(_list_hit "$dest" "$CORP_DOMAINS" cidr)"; then lane=corp; why="corp CIDR '$m'"
     elif m="$(_private_hit "$dest")"; then lane=corp; why="private/overlay range '$m' — defaults to unbound (OS routing)"
-    else lane="$FINAL_ROUTE"; why="no corp CIDR matched; final route = $FINAL_ROUTE"; fi
+    else lane="$FINAL_ROUTE"; why="no corp CIDR matched; final route = $FINAL_ROUTE"; unmatched=1; fi
   elif hit="$(_longest_domain_hit "$dest")"; then
     lane="${hit%% *}"; local kind rest; rest="${hit#* }"; kind="${rest%% *}"; m="${rest#* }"
     case "$kind" in
@@ -5338,6 +5640,7 @@ cmd_explain() {
     # private/overlay range goes corp, as the address would. Ask exactly that
     # resolver, and only then (rowt_core::classify::router_resolves).
     lane="$FINAL_ROUTE"; why="no block/corp/escape rule; final route = $FINAL_ROUTE"
+    unmatched=1   # a NAME no lane rule matched: a port whose catch-all is escape never resolves it here
     local rns=""
     # The renderer's own test — its corp CIDR list non-empty, or the private default on.
     if [ "$FINAL_ROUTE" = direct ] && { [ "$(corp_cidrs_json | jq length)" -gt 0 ] || [ "$PRIVATE_DEFAULT" = corp ]; }; then
@@ -5368,6 +5671,19 @@ cmd_explain() {
   printf '%s%s  ->  %s   (%s)\n' "$dest" "${ip:+ ($ip)}" "$(printf '%s' "$lane" | tr 'a-z' 'A-Z')" "$desc"
   echo "  matched: $why"
   if [ -n "$ip_note" ]; then echo "  note:    $ip_note"; fi
+  # Named ports share every rule; a line only where one would answer differently.
+  # A port whose catch-all is escape never looks a name up, so it differs
+  # wherever no lane rule matched — even where main's resolver check sent the
+  # name to corp. A direct/corp port shares that lookup and differs only where
+  # main itself fell to its final.
+  local pn pp pf pd
+  while IFS=$'\t' read -r pn pp pf; do
+    [ -n "$pn" ] && [ "$unmatched" = 1 ] || continue
+    pd="$(_port_dest "$pf")"
+    [ "$pd" != "$lane" ] || continue
+    [ "$pf" = escape ] || [ "$lane" = "$FINAL_ROUTE" ] || continue
+    printf '  %-9s%s\n' "$pn:" "via 127.0.0.1:$pp -> $(printf '%s' "$pd" | tr 'a-z' 'A-Z') (no rule matched; this port's catch-all$([ "$pd" = escape ] && ! is_ipv4 "$dest" && echo ', the name resolved at the far end'))"
+  done <<<"$(_ports_rows)"
   # Opaque binary rule-sets (the ad-block set, and any `geosite:<name>` a lane
   # pulls) can't be inspected here, so they may route/block this beyond what the
   # hand lists show.
@@ -5481,6 +5797,18 @@ cmd_status() {
   case "$(sget mode)" in ''|host) _escape_dns status 2>/dev/null || true ;; esac
   [ "$mode" = "vm" ] && echo "vm ip:        $(sget vm_ip)"
   echo "router:       $(host_running && echo "running (pid $(cat "$(host_pidfile)"))" || echo stopped) on 127.0.0.1:$PORT"
+  # Named ports, and whether the rendered config agrees with the table. Nothing
+  # here when there are none: main alone is the line above.
+  local pn pp pf prp
+  while IFS=$'\t' read -r pn pp pf; do
+    [ -n "$pn" ] || continue
+    prp="$(_port_rendered | awk -F'\t' -v n="$pn" '$1 == n {print $2}')"
+    printf '%-14s%s\n' "port $pn:" "127.0.0.1:$pp, unmatched -> $(_port_catchall "$pf" | sed 's/, names resolved at the far end//') (main unmatched -> $FINAL_ROUTE)$([ "$prp" = "$pp" ] || echo "  — NOT in host.json yet: '$PROG render'")"
+  done <<<"$(_ports_rows)"
+  while IFS=$'\t' read -r pn pp; do
+    [ -n "$pn" ] && [ -z "$(_port_row "$pn")" ] || continue
+    printf '%-14s%s\n' "port $pn:" "removed — but host.json still has it on $pp: '$PROG render'"
+  done <<<"$(_port_rendered)"
   # Which engine, and is it the pin. A brew upgrade once swapped in a 1.14.1
   # that spins on this network, and nothing on this screen said so.
   local sbv sbline; sbv="$(sb_version "$SB" 2>/dev/null || true)"
@@ -7170,6 +7498,7 @@ o@routing lanes@corp <list|add|rm|import|clear|dump|errors|sync|suggest>@edit th
 o@routing lanes@block <list|add|rm|import|clear|dump|errors>@block lane (ad/telemetry sinkhole); 'errors' = what got blocked
 o@routing lanes@hotspot <list|add|rm|import|clear|dump>@captive-portal hosts the OS reaches WITHOUT the proxy, so a venue's login page loads while rowt is up
 o@routing lanes@direct <errors|log>@diagnose the pass-through lane; 'errors' = what failed direct (escape candidates)
+o@routing lanes@port <add|rm|list>@named extra ports: main's rules, each with its own catch-all, for the clients on it (a VM, a container, one app)
 o@proxy@proxy <status|check|on|off|env>@macOS system proxy + CLI env exports
 a@internals@render@regenerate the sing-box configs from current state
 o@internals@fetch [host|vm]@pre-download artifacts so 'up' works offline
@@ -7584,6 +7913,47 @@ or a new --every, restarts the router; 'use auto' that changes nothing leaves
 it running. Run '$PROG ping' first to see the figures. No arg = list servers.
 EOF
 ;;
+    port) cat <<EOF
+$PROG port add <N> <name> [--final escape|direct|corp] | rm <name> | list — named extra ports.
+
+One rowt can serve clients that want different default postures: the Mac's own
+apps on main (127.0.0.1:$PORT, the system proxy port), a VM, a container or a
+single app on a port of its own. Every port runs the SAME rules — block, corp
+and escape names, geosite sets, corp and private IP ranges, first match wins —
+and differs only in where traffic NO rule matched goes:
+  --final escape   through the tunnel, the destination NAME handed to the far
+                   end: nothing is looked up on this Mac (direct in local mode,
+                   where there is no tunnel)
+  --final direct   out the physical NIC, after the same local lookup main does
+  --final corp     into the corp VPN
+Without --final the port gets main's catch-all as it is now ($FINAL_ROUTE),
+stored on the row: a later ROWT_FINAL does not move it, and a later 'port add'
+of the same name must name the same catch-all or it is refused.
+
+  port add 7892 guest --final escape   a port for VMs: the tunnel unless a rule says otherwise
+  port rm guest                        remove it
+  port list                            every port, main first, and whether the router serves it
+Adding the same row again writes nothing and exits 0 (it still brings the
+router onto the port if that is missing), and removing a name that is not
+there exits 0 too, so a setup script can run both on every apply; the same
+name with another port or catch-all is refused. 'port list' prints the stored
+catch-all word — an escape port reads "escape (direct in local mode)" there —
+so a script can grep for "unmatched -> escape". A port something else holds,
+even an owner lsof cannot show, is refused before anything is written: sing-box
+itself is asked to bind it for a moment.
+
+A name is 1-32 of a-z, 0-9 and '-'; 'main' and the lane names are taken. The
+port must be free and not one of rowt's own ($PORT/$VM_PORT/$CLASH_PORT/$VM_CLASH). Named
+ports listen on 127.0.0.1 only; a VM reaches one through its host-side forward.
+The table is ports.tsv next to state — per machine, like the mode and the
+selected server; not carried by 'config export' — and 'render', the watchdog's
+re-renders and 'router up' all keep it. add/rm re-render and, when the router
+is running, reload it in place (SIGHUP: same process, no proxy change, the port
+is up when the command returns; open connections on every port are reset). Run
+as yourself, like 'use' — no sudo. 'status' lists named ports; 'explain' names
+one only where it would answer differently from main.
+EOF
+;;
     ping) cat <<EOF
 $PROG ping [tag] — latency-test servers through the tunnel.
 
@@ -7978,6 +8348,7 @@ _is_readonly() { # $1=cmd  $2=first arg
     vm)     case "${2:-status}" in up|down|restart|delete) return 1 ;; *) return 0 ;; esac ;;
     watch)  case "${2:-status}" in install|uninstall|refresh) return 1 ;; *) return 0 ;; esac ;;
     config) case "${2:-list}" in import) return 1 ;; *) return 0 ;; esac ;;
+    port)   case "${2:-list}" in add|rm|remove) return 1 ;; *) return 0 ;; esac ;;
     escape|corp|block|hotspot|direct) case "${2:-}" in ''|errors|stats|list|log) return 0 ;; *) return 1 ;; esac ;;
     server) case "${2:-}" in ''|list|ls|show) return 0 ;; *) return 1 ;; esac ;;
     sub)    case "${2:-}" in ''|list|ls|show|count) return 0 ;; *) return 1 ;; esac ;;
@@ -8401,6 +8772,7 @@ run_command() {
     server)     cmd_server "$@" ;;
     sub)        cmd_sub "$@" ;;
     use)        cmd_use "$@" ;;
+    port)       cmd_port "$@" ;;
     ping)       cmd_ping "$@" ;;
     probe)      cmd_probe "$@" ;;
     speed)      cmd_speed "$@" ;;
@@ -8517,7 +8889,19 @@ main() {
     # write a different <string> into the same plist. Hand over the same path
     # `_watch_self` picks, so there is one answer.
     export ROWT_SELF="${ROWT_SELF:-$(_watch_self)}"
-    exec "$_rb" "$@"
+    # Named ports are not in rowt-rs yet (rowt #s29): its render would drop
+    # them and its status/explain would not show them. While the table has
+    # rows, the arms that render or report stay in this shell — said on
+    # stderr, so nobody collects evidence about the wrong implementation —
+    # and everything else still goes to rowt-rs. Remove with #s29.
+    # Not only the arms that render or print: `use`, the pool and lane
+    # commands, `corp sync` and `vm up` all render through rowt-rs too. While
+    # the table has rows, everything runs here.
+    if [ -n "$(_ports_rows)" ]; then
+      echo "note: named ports ($PROG port list) are not in rowt-rs yet — running in the shell" >&2
+    else
+      exec "$_rb" "$@"
+    fi
   fi
   _setup_py_helpers
   migrate

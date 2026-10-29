@@ -24,6 +24,9 @@ fn vars(cfg: &Path) -> Vec<(&'static str, String)> {
         ("PROG", crate::PROG.to_string()),
         ("PORT", env("ROWT_PORT", "7890")),
         ("CLASH_PORT", env("ROWT_CLASH_PORT", "9090")),
+        // the VM's two ports sit one above the host's, as bin/rowt derives them
+        ("VM_PORT", (env("ROWT_PORT", "7890").parse::<u32>().unwrap_or(7890) + 1).to_string()),
+        ("VM_CLASH", (env("ROWT_CLASH_PORT", "9090").parse::<u32>().unwrap_or(9090) + 1).to_string()),
         ("CFG", c.clone()),
         ("DOMAINS", format!("{c}/escape-domains.txt")),
         ("AUDIT_LOG", format!("{c}/log/audit.log")),

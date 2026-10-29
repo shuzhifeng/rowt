@@ -86,6 +86,12 @@ foreground with output redirected to a file (see SKILL.md → Rules).
   unchanged subscriptions (a reorder included) skip reload, and failed fetches keep
   the old pool. `rowt audit` shows each watchdog refresh and any reload it caused.
 - `server dump` and `sub dump` output contains secrets.
+- `rowt port add <N> <name> [--final escape|direct|corp]` / `port rm <name>` / `port list`:
+  named extra ports for clients that want a different default than the Mac itself — a VM,
+  a container, one app. The same rules as main (7890); only the catch-all differs.
+  `--final escape` tunnels unmatched traffic with the name resolved at the far end, not by
+  dns-direct. Per machine; not in `config export`. `status` lists them; `explain` names one
+  only where it answers differently from main.
 
 ## Lanes
 

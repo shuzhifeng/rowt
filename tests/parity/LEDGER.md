@@ -44,6 +44,11 @@ from the source and are not listed.
 | `sub remove` | yes | sub_remove |
 | `sub rm` | yes | sub_rm |
 | `use` | yes | use_server |
+| `port add` | **no** | — |
+| `port list` | **no** | — |
+| `port ls` | **no** | — |
+| `port remove` | **no** | — |
+| `port rm` | **no** | — |
 | `ping` | yes | ping |
 | `probe` | yes | probe |
 | `speed` | **no** | — |

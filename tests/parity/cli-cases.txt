@@ -96,6 +96,8 @@ proxy env
 proxy env --off
 proxy check
 proxy status
+# a legacy arm rowt-rs hands to the shell; with no named ports it prints the main row and a hint.
+port list
 # The state #52 was about: socks + https point at rowt, plain HTTP does NOT.
 # `proxy check` always caught it (_proxy_pointing_ok reads all three); `proxy
 # status` did not SHOW it until the http row was added, so the command you run
@@ -246,6 +248,7 @@ help metrics
 help monitor
 help onboard
 help ping
+help port
 help probe
 help proxy
 help reload
@@ -306,6 +309,7 @@ _complete escape
 _complete up
 _complete use
 _complete ping
+_complete port
 _complete help
 _complete router
 _complete nosuchcommand

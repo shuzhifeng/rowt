@@ -481,7 +481,12 @@ conflicts with the corp VPN, the honest trade is: **rowt = coexists with
 corp, covers proxy-aware apps; Shadowrocket-direct = covers everything, but can't
 run alongside the corp client.** A middle path is mode `vm` — you can point a
 whole app or device at the VM and get tunnel-like coverage for it without
-touching the host's corp setup.
+touching the host's corp setup. In host mode a **named port** does the same
+without a VM: `rowt port add 7892 guest --final escape` gives the clients on
+7892 (a VM through its forward, a container, one app) the tunnel as their
+catch-all, with the name resolved at the far end, while 7890 — the port named
+`main` — keeps the split. Every port runs the same rules; only the catch-all
+differs (`rowt port` in the README).
 
 ## 9. Mapping a Shadowrocket config onto escape
 

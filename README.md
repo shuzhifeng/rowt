@@ -394,6 +394,47 @@ Unlisted traffic defaults to **direct**; set `ROWT_FINAL=corp` to send the
 catch-all through the corp VPN instead. Edit a list then reload:
 `rowt reload`.
 
+### Named ports (`rowt port add`)
+
+One rowt can serve clients that want a different default posture than the Mac
+itself. A VM, a container or a single app that uses this rowt as its proxy gets
+the host's routing: listed names through the tunnel, corp names into the VPN,
+and everything else **direct**, resolved by `dns-direct` and leaving from this
+machine's own address. For a coding agent in a VM that pulls from ever-new hosts
+that is three different failures (a throttled mirror, a slow download, an API
+that refuses the region), none of them in its own code; for the engineer at the
+keyboard, a full tunnel would be the wrong posture.
+
+`rowt port add 7892 guest --final escape` adds a second local port,
+`127.0.0.1:7892` (sing-box inbound `guest-in`), and the VM's forward points at it:
+
+- the **same rules** as `127.0.0.1:7890`, first match wins: block, corp and escape
+  names, geosite sets, corp CIDRs and private ranges;
+- what **none of them matched** goes where the port's `--final` says. `escape`
+  sends it through the tunnel with the **name handed to the far end** — no lookup
+  on this machine (the router's `resolve` step for unmatched names on 7890 comes
+  after this port's catch-all, so a name never reaches it; a client that dials
+  an IP still meets the corp/private ranges). `direct` and `corp` share the
+  lookup and only change the catch-all. Without `--final` the port gets main's
+  own catch-all.
+- `127.0.0.1:7890` is untouched; it is the port named `main`. In `local` mode an
+  escape catch-all goes direct as well, since there is no tunnel.
+
+`rowt port rm guest` removes it and `rowt port list` shows every port, main
+first. Adding the same row again writes nothing and exits 0 (it still brings the
+router onto the port if that is missing), and removing a name that is not there
+exits 0 too, so a setup script can run both on every apply; a port
+something else holds — even an owner `lsof` cannot show — is refused before
+anything is written, by asking sing-box itself to bind it for a moment. `rowt status` prints a line per named port, and `rowt explain <host>`
+names one only where it would answer differently from main. The table is
+`ports.tsv` in the config dir — per machine, like the mode and the selected
+server; not carried by `config export` — so `render`, the watchdog's re-renders
+and `router up` keep it. add/rm re-render and reload a running router in place
+(SIGHUP: the same sing-box process, no system-proxy change, and the port is up
+when the command returns; open connections on every port are reset by the
+reload, as by any restart). A client that resolves names itself and dials the IP
+is outside this: rowt sees only the address.
+
 ### Whole services via geosite (`geosite:<name>`)
 
 A plain suffix like `google.com` matches `google.com` and `*.google.com` — but
@@ -857,6 +898,7 @@ Every command has detailed help: `rowt <command> --help` (or `rowt help <command
 | `sub import <file>` | restore subscriptions from a `sub dump` (round-trips). |
 | `sub dump [file]` | export the subscription URLs (one per line). |
 | `use <tag>` / `use best` / `use auto [--every D]` | pin a server (manual, nothing probed); let rowt pick by median latency, re-checked by the watchdog (`best`); or sing-box's urltest (`auto`), re-testing every D (saved; default 20m), with a follower that leaves a dead pick within a minute. |
+| `port add <N> <name> [--final escape\|direct\|corp]` / `port rm <name>` / `port list` | named extra ports for the clients on them (a VM, a container, one app): the same rules as main (7890), each with its own catch-all; `--final escape` tunnels unmatched traffic with the name resolved at the far end. |
 | `ping [tag]` | **parallel** latency test through the tunnel (fastest first, `*`=active). Each server is sampled **three times** and the **median** is shown — the same figure `rowt monitor` shows (two answers give their mean, one gives itself). With no answer the row says which kind: `no answer in 8s` when every try ran out of time (a slow link reads exactly like a dead server, so it says nothing about which; raise `ROWT_PING_TIMEOUT`), `unreachable` when a try failed outright. One sample over a lossy link spikes or fails on its own. `auto` still switches on sing-box's own figure, the latest single sample. `ROWT_PING_URL` (default Google's `generate_204`) / `ROWT_PING_TIMEOUT` (8s per sample). |
 | `probe` | with corp VPN up, test all servers (default route vs physical NIC) and pick `host` or `vm`. |
 

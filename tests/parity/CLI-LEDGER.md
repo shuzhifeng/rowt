@@ -34,6 +34,7 @@ is not 'does it work' but 'whose code ran, and what proves it'.
 | `monitor` | **native** | — |
 | `onboard` | **native** | cli-diff |
 | `ping` | **native** | cli-diff |
+| `port` | legacy | cli-diff (passthrough) |
 | `probe` | **native** | cli-diff |
 | `proxy` | **native** | cli-diff |
 | `reload` | **native** | cli-diff + boot-test |
@@ -55,7 +56,7 @@ is not 'does it work' but 'whose code ran, and what proves it'.
 | `vm` | **native** | cli-diff |
 | `watch` | **native** | cli-diff |
 
-**37 of 40 command arms answered natively**; the other 3 run in the shell.
+**37 of 41 command arms answered natively**; the other 4 run in the shell.
 
 Partial arms — native for some sub-commands, legacy for the rest.
 `native()` in crates/rowt-cli/src/main.rs is the authority:

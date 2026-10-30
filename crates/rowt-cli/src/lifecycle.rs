@@ -711,11 +711,15 @@ pub fn follower_running(ctx: &Ctx) -> bool {
     follow_running(ctx)
 }
 
-/// `_start_follow` — `auto`'s failover follower (`watch follow`), tied to the
+/// `_start_follow` — the failover follower (`watch follow`), tied to the
 /// router like the collector: started once the router is healthy, in `auto`
-/// only. It is this binary, never a `rowt` found on PATH.
+/// or for a pin with `use <tag> --failover`. It is this binary, never a
+/// `rowt` found on PATH.
 pub fn start_follow(ctx: &Ctx) {
-    if env_or("ROWT_AUTO_FOLLOW", "1") != "1" || ctx.sget("selected") != "auto"
+    // In `auto`, and for a pin with `--failover` (rowt #s36): both are the
+    // follower's to watch.
+    if env_or("ROWT_AUTO_FOLLOW", "1") != "1"
+        || (ctx.sget("selected") != "auto" && ctx.sget("failover") != "1")
         || ctx.mode() == "local" || follow_running(ctx) {
         return;
     }

@@ -187,6 +187,18 @@ PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-udp ROWT_CAPTIVE_UR
 PARITY_SCENARIO=watch-pin-held status
 PARITY_TIMEOUT=45 PARITY_SCENARIO=watch-pin-held use beta
 PARITY_TIMEOUT=45 PARITY_SCENARIO=watch-pin-held reload
+# `use <tag> --failover` (rowt #s36, Hong's #s37): the preference flag in state,
+# what `use` says about it, `status`'s rows, the refusals — router down, so no
+# follower is spawned; its loop is tests/test_failover_follow.py.
+use alpha --failover
+use auto --failover
+use best --failover
+PARITY_SCENARIO=failover-pinned status
+PARITY_SCENARIO=failover-pinned use alpha
+PARITY_SCENARIO=failover-pinned use beta --failover
+PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-dead-failover ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick
+PARITY_SCENARIO=watch-pin-held-failover status
+PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-held-failover ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick
 
 # static text and log readers, extracted from the shell at build time
 shell-init

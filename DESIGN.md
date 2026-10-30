@@ -556,6 +556,30 @@ as the only VPN, "direct" just meant "off my tunnel". escape splits that
     opt-in `interrupt_exist_connections` (`ROWT_AUTO_INTERRUPT=1`),
     `use auto --every default`, and `ROWT_AUTO_INTERVAL` reaching the
     watchdog's agent came from PR #4 by shuzhifeng.
+    **`use <tag> --failover`** (rowt #s36, Hong's #s37, 2026-10-30) is the
+    same sidecar on a plain selector: the pin is a preference (state
+    `selected=<tag>`, `failover=1`), nothing changes in host.json, and since
+    a selector never tests its members the follower delay-tests the pin
+    itself each round (`GET /proxies/<pin>/delay`, the watchdog's probe, one
+    try, `ROWT_HEALTH_TIMEOUT`). Dead, it sweeps the other servers in
+    servers.json order with the same test and moves the selector live
+    (`PUT /proxies/escape`) to the first that answers — a fruitless sweep
+    backs off like a fruitless re-test, the pin is re-tested every round —
+    and when the pin answers again it moves back. Off the pin it also tests
+    the stand-in, and leaves that too when it dies. The decision is
+    `rowt_core::follow::pin_step`; the loop is `_watch_follow` / `follow`.
+    While failover is on the watchdog probes `escape` (whatever is in use)
+    rather than the pin, so a successful failover is health, and the hold
+    above keeps the pin as its evidence — with every server dead the
+    follower stays on the pin, and the hold's remedy words name the follower
+    instead of `use auto`. `rowt status` shows the preference, the stand-in
+    when there is one, and the last move (`failover_switch`). A plain
+    `use <tag>`, `use auto` or `use best` ends it; the follower exits at its
+    next look. A dead server costs one `ROWT_HEALTH_TIMEOUT` per test, so a
+    round can stretch to (dead servers + 1) × that before the back-off takes
+    over. If the pool loses the pin (`server rm`, a subscription update), the
+    preference moves to the first server as a plain pin would; an emptied pool
+    falls back to `auto` and the flag sits idle until the next `use`.
 - **A network with no exit (not rowt's to fix).** `restart` and `reload`
   recreate sing-box and the system-proxy setting; they leave the Wi-Fi
   association, the DHCP lease and the route table alone. When those are the

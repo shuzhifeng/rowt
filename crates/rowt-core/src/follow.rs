@@ -19,6 +19,35 @@
 /// The longest a follower waits between two fruitless re-tests.
 pub const MAX_WAIT_SECS: u64 = 600;
 
+/// `use <tag> --failover` (rowt #s36, Hong's #s37): the pin is a PREFERENCE.
+/// Each round the follower delay-tests the pin itself — not sing-box's figure,
+/// which a plain selector never refreshes — and, when it is off the pin, the
+/// server it is on. What one round decides from those two answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinStep {
+    /// The pin answers and the selector is elsewhere: move back to it.
+    Return,
+    /// Nothing to do: on the pin and it answers, or off it on a server that
+    /// answers while the pin still does not.
+    Stay,
+    /// The server in use does not answer (the pin, or the one taken instead
+    /// of it): look for another one that does — under the same back-off as
+    /// `auto`'s fruitless re-tests.
+    Sweep,
+}
+
+/// `on_pin`: the selector is on the pin. `pin_alive`: the pin answered its
+/// delay test. `now_alive`: when off the pin, whether the server in use
+/// answered (None when on the pin — it was not asked twice).
+pub fn pin_step(on_pin: bool, pin_alive: bool, now_alive: Option<bool>) -> PinStep {
+    match (on_pin, pin_alive, now_alive) {
+        (false, true, _) => PinStep::Return,
+        (true, true, _) => PinStep::Stay,
+        (false, false, Some(true)) => PinStep::Stay,
+        _ => PinStep::Sweep,
+    }
+}
+
 /// What one look at the pick found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Look {
@@ -121,6 +150,33 @@ mod tests {
             now = f.next;
         }
         assert_eq!(gaps, [30, 60, 120, 240, 480, 600, 600, 600]);
+    }
+
+    /// The preference comes first: a pin that answers is returned to from
+    /// wherever the selector is, a pin that does not is left only once the
+    /// server in use fails too, and a live stand-in is kept.
+    #[test]
+    fn a_pinned_preference_is_returned_to_left_or_kept() {
+        assert_eq!(pin_step(false, true, Some(true)), PinStep::Return, "pin back, stand-in fine: still return");
+        assert_eq!(pin_step(false, true, Some(false)), PinStep::Return);
+        assert_eq!(pin_step(true, true, None), PinStep::Stay);
+        assert_eq!(pin_step(false, false, Some(true)), PinStep::Stay, "the stand-in answers: keep it");
+        assert_eq!(pin_step(true, false, None), PinStep::Sweep, "on a dead pin: look for another");
+        assert_eq!(pin_step(false, false, Some(false)), PinStep::Sweep, "stand-in dead too: look again");
+        assert_eq!(pin_step(false, false, None), PinStep::Sweep, "off the pin with nothing known: look");
+    }
+
+    /// The sweep rides `auto`'s back-off: a fruitless one waits twice the
+    /// period, then doubles up to ten minutes; a server found resets it.
+    #[test]
+    fn a_fruitless_sweep_backs_off_like_a_fruitless_retest() {
+        let mut f = Follow::new(15);
+        assert!(f.should_retest(Look::Lost, 100, 15));
+        f.after_retest(false, 100, 15);
+        assert!(!f.should_retest(Look::Lost, 120, 15), "inside the 30 s wait");
+        assert!(f.should_retest(Look::Lost, 130, 15));
+        f.after_retest(true, 130, 15);
+        assert_eq!(f, Follow::new(15));
     }
 
     #[test]

@@ -101,6 +101,7 @@ fn run() -> Result<String, String> {
         pinned: opt(o, "pinned"),
         pinned_addr: s(o, "pinned_addr"),
         pinned_reach: o.get("pinned_reach").and_then(|x| x.as_bool()),
+        failover: b(o, "failover"),
         hold_stamp: s(o, "hold_stamp"),
         now: o.get("now").and_then(|x| x.as_i64()).unwrap_or(0),
     };

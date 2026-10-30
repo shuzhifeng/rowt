@@ -247,6 +247,20 @@ impl ExecReplace for std::process::Command {
     }
 }
 
+/// What `use` says about the preference flag it just set or cleared
+/// (`_failover_note`).
+fn failover_note(ctx: &Ctx, tag: &str, was: &str) {
+    let follow = env_or("ROWT_AUTO_FOLLOW", "1");
+    if ctx.sget("failover") == "1" && follow != "1" {
+        eprintln!("==> failover on, but ROWT_AUTO_FOLLOW={follow} keeps the follower off — nothing moves until it is unset");
+    } else if ctx.sget("failover") == "1" {
+        eprintln!("==> failover on: the follower leaves {tag} when it is dead and comes back when it answers (checks every {}s)",
+                  env_or("ROWT_AUTO_FOLLOW_EVERY", "15"));
+    } else if was == "1" {
+        eprintln!("==> failover off — the follower stops at its next look");
+    }
+}
+
 pub fn env_or(k: &str, d: &str) -> String {
     std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string())
 }
@@ -1589,9 +1603,15 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
             let ctx = Ctx::new(cfg.clone());
             // `--every D` / `--every=D` anywhere; the first other word is the tag.
             let (mut tag, mut every): (Option<String>, Option<String>) = (None, None);
+            // `--failover` (rowt #s36): the pin is a PREFERENCE the follower
+            // leaves when it is dead and returns to when it answers. State
+            // only (`failover=1`); the render is unchanged.
+            let mut failover_set = false;
             let mut it = rest.iter();
             while let Some(a) = it.next() {
-                if a == "--every" {
+                if a == "--failover" {
+                    failover_set = true;
+                } else if a == "--every" {
                     match it.next() {
                         Some(v) => every = Some(v.clone()),
                         None => die(&cfg, &format!("usage: {PROG} use auto --every <duration>   (e.g. 3m or 90s)")),
@@ -1625,15 +1645,35 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
             let Some(tag) = tag else {
                 return run(&cfg, "server", &["list".to_string()]);
             };
+            if failover_set && (tag == "auto" || tag == "best") {
+                die(&cfg, &format!("--failover keeps ONE pinned server as the preference; auto and best already fail over by themselves — use: {PROG} use <tag> --failover"));
+            }
             let known = |t: &str| servers.iter().any(|s| s.get("tag").and_then(|x| x.as_str()) == Some(t));
             if tag != "auto" && tag != "best" && !known(&tag) {
                 die(&cfg, &format!("unknown server '{tag}' — see: {PROG} server"));
             }
             let prev = ctx.sget("selected");
+            let fo_was = ctx.sget("failover");
             // rowt #s36: a new selection ends the watchdog's hold on the old one.
             let _ = std::fs::remove_file(cfg.join("watch.hold"));
+            // The preference flag follows THIS selection: set by --failover,
+            // cleared by any `use` without it (the follower sees the cleared
+            // key at its next look).
+            if failover_set {
+                lifecycle::sset(&ctx, "failover", "1");
+                // A new episode: the last move shown by `status` was the old one's.
+                if fo_was != "1" && !ctx.sget("failover_switch").is_empty() {
+                    lifecycle::sset(&ctx, "failover_switch", "");
+                }
+            } else if fo_was == "1" {
+                lifecycle::sset(&ctx, "failover", "");
+            }
             if tag == "best" {
-                return best::use_best(&ctx, &prev);
+                // The note only after `best` succeeded: the shell dies inside
+                // `_use_best` and never reaches its note.
+                let r = best::use_best(&ctx, &prev)?;
+                failover_note(&ctx, &tag, &fo_was);
+                return Ok(r);
             }
             lifecycle::sset(&ctx, "selected", &tag);
             if every.as_deref() == Some("default") {
@@ -1657,11 +1697,13 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
             lifecycle::cmd_render(&ctx)?;
             if lifecycle::host_running(&ctx).is_none() {
                 eprintln!("==> escape -> {tag} (applies on next '{PROG} router up')");
+                failover_note(&ctx, &tag, &fo_was);
                 return Ok(String::new());
             }
             if prev == "auto" && tag == "auto" && before.is_some() && before == configs() {
                 eprintln!("==> escape -> auto, unchanged (re-probed every {}) — router not restarted",
                           lifecycle::auto_interval(&ctx));
+                failover_note(&ctx, &tag, &fo_was);
                 return Ok(String::new());
             }
             let live = prev != "auto" && tag != "auto"
@@ -1669,6 +1711,9 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                                          Some(&format!("{{\"name\":\"{tag}\"}}"))).is_some();
             if live {
                 eprintln!("==> escape -> {tag} (live)");
+                // A live switch into --failover needs its follower now, not
+                // at the next reload.
+                lifecycle::start_follow(&ctx);
             } else {
                 lifecycle::router_stop(&ctx);
                 lifecycle::router_up(&ctx)?;
@@ -1679,6 +1724,7 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                     eprintln!("==> escape -> {tag}");
                 }
             }
+            failover_note(&ctx, &tag, &fo_was);
             Ok(String::new())
         }
         // Back up / move the whole setup. Only the SOURCE-of-truth files: the
@@ -2062,7 +2108,8 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with('#') }).count();
             let sel = { let s = ctx.sget("selected"); if s.is_empty() { String::new() } else { s } };
             o.push(format!("servers:      {}  (selected: {sel}, subs: {subs})", servers.len()));
-            if let Some(now) = lifecycle::clash_selected(&ctx) {
+            let now_sel = lifecycle::clash_selected(&ctx);
+            if let Some(now) = now_sel.clone() {
                 if ctx.sget("selected") == "best" {
                     o.push(format!("active:       {now} (best — {})", best::latency_ms(&ctx, &now)));
                 } else if now == "auto" {
@@ -2100,6 +2147,31 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 let sw = ctx.sget("auto_switch");
                 if !sw.is_empty() {
                     o.push(format!("last switch:  {sw}"));
+                }
+            }
+            // `use <tag> --failover`: the preference, the stand-in when there
+            // is one, the follower, and the last move it made (rowt #s36).
+            let fsel = ctx.sget("selected");
+            if ctx.sget("failover") == "1" && mode != "local" && !fsel.is_empty() && fsel != "auto" && fsel != "best" {
+                let follow = env_or("ROWT_AUTO_FOLLOW", "1");
+                let fl = if follow != "1" {
+                    format!("failover follower off (ROWT_AUTO_FOLLOW={follow})")
+                } else if lifecycle::follower_running(&ctx) {
+                    format!("failover follower running (checks every {}s)", env_or("ROWT_AUTO_FOLLOW_EVERY", "15"))
+                } else if lifecycle::host_running(&ctx).is_some() {
+                    format!("failover follower NOT running (a router started before it existed gets one at its next reload) — '{PROG} reload' starts it")
+                } else {
+                    "failover follower starts with the router".to_string()
+                };
+                o.push(format!("failover:     prefers {fsel}; {fl}"));
+                if let Some(now) = now_sel.as_deref() {
+                    if now != fsel {
+                        o.push(format!("              on {now} — {fsel} is not answering; back on it when it does"));
+                    }
+                }
+                let fsw = ctx.sget("failover_switch");
+                if !fsw.is_empty() {
+                    o.push(format!("last switch:  {fsw}"));
                 }
             }
             // The escape servers' names as rowt resolved and checked them

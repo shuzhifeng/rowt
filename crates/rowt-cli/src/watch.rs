@@ -683,6 +683,7 @@ fn observe(ctx: &Ctx, cap: Option<CaptiveState>, portal: Option<String>, portal_
         pinned,
         pinned_addr,
         pinned_reach,
+        failover: ctx.sget("failover") == "1",
         // Only a hold that begins now is stamped, and the shell runs `date -u`
         // at that moment and not otherwise.
         hold_stamp: if pinned_reach == Some(false) { crate::best::utc(None) } else { String::new() },
@@ -755,7 +756,12 @@ pub fn hold_row(ctx: &Ctx) -> Option<String> {
     if tag.is_empty() || ctx.sget("selected") != tag {
         return None;
     }
-    Some(format!("{:<14}{tag} is dead since {since} UTC — the watchdog holds instead of reloading; '{PROG} use auto' fails over by itself, or pin another server with '{PROG} use <other>'", "escape:"))
+    let rem = if ctx.sget("failover") == "1" {
+        format!("with --failover the follower moves off {tag} as soon as another server answers, and back when {tag} does")
+    } else {
+        format!("'{PROG} use auto' fails over by itself, or pin another server with '{PROG} use <other>'")
+    };
+    Some(format!("{:<14}{tag} is dead since {since} UTC — the watchdog holds instead of reloading; {rem}", "escape:"))
 }
 
 /// The recovery-cooldown stamp. `watch.restart` is the name the SHELL uses
@@ -1030,6 +1036,9 @@ fn health_ok_within(ctx: &Ctx, t: u32) -> bool {
     // about an outbound that does not exist: every tick fails, and the streak
     // reloads a router that was fine.
     let sel = { let s = crate::best::escape_sel(ctx); if s.is_empty() { "escape".into() } else { s } };
+    // `use <tag> --failover`: the selector may be on a stand-in, and that is
+    // health. Probe the selector itself (rowt #s36).
+    let sel = if ctx.sget("failover") == "1" { "escape".to_string() } else { sel };
     let url = env_or("ROWT_HEALTH_URL", "https://www.gstatic.com/generate_204");
     // `python3 -c 'urllib.parse.quote(u, safe="")'` — in-process, same rules.
     let enc = rowt_core::pyurl::quote(&url, "");
@@ -1127,9 +1136,55 @@ fn follow_retest(ctx: &Ctx, pick: &str) -> bool {
     false
 }
 
-/// `watch follow` — `auto`'s failover follower; see `rowt_core::follow` for
-/// why it exists and when it asks. Exits when the router stops, when `auto` is
-/// no longer selected, or when the config directory is gone.
+/// `_follow_delay_ok` — one delay test through `tag` (the watchdog's probe,
+/// one try): the follower's own test of a pinned server, since a plain
+/// selector never refreshes a member's figure.
+fn delay_ok(ctx: &Ctx, tag: &str) -> bool {
+    let Some(ep) = lifecycle::controller(ctx) else { return false };
+    let secret = lifecycle::clash_secret(ctx);
+    let t: u32 = env_or("ROWT_HEALTH_TIMEOUT", "8").parse().unwrap_or(8);
+    let url = env_or("ROWT_HEALTH_URL", "https://www.gstatic.com/generate_204");
+    let out = Command::new("curl")
+        .args(["--noproxy", "*", "-sS", "-m", &(t + 3).to_string(),
+               "-H", &format!("Authorization: Bearer {secret}"),
+               &format!("http://{ep}/proxies/{}/delay?timeout={t}000&url={}",
+                        rowt_core::pyurl::quote(tag, ""), rowt_core::pyurl::quote(&url, ""))])
+        .stderr(Stdio::null()).output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    delay_answered(&out)
+}
+
+/// `_follow_pin_sweep` — the server in use does not answer: the others in
+/// servers.json order, the first that answers taken live. True when one was.
+fn pin_sweep(ctx: &Ctx, pin: &str, now: &str) -> bool {
+    let servers: Vec<serde_json::Value> = serde_json::from_str(&read(&ctx.cfg.join("servers.json"))).unwrap_or_default();
+    for tag in servers.iter().filter_map(|s| s.get("tag").and_then(|t| t.as_str())) {
+        if tag == pin || tag == now || !delay_ok(ctx, tag) {
+            continue;
+        }
+        if lifecycle::clash_curl(ctx, "PUT", "/proxies/escape", Some(&format!("{{\"name\":\"{tag}\"}}"))).is_none() {
+            continue;
+        }
+        let m = if now == pin {
+            format!("failover: {pin} stopped answering — moved to {tag}")
+        } else {
+            format!("failover: {now} stopped answering too ({pin} still not answering) — moved to {tag}")
+        };
+        watch_log(ctx, &m);
+        crate::shell::audit(&ctx.cfg, &format!("watchdog {m}"));
+        lifecycle::sset(ctx, "failover_switch", &format!("{} {now} -> {tag}", crate::best::utc(None)));
+        return true;
+    }
+    watch_log(ctx, &format!("failover: {pin} stopped answering and no other server answered — staying on {now}"));
+    false
+}
+
+/// `watch follow` — the failover follower; see `rowt_core::follow` for why it
+/// exists and when it asks. In `auto` it watches sing-box's pick; for a pin
+/// with `--failover` (rowt #s36) it tests the pin itself and the stand-in,
+/// `rowt_core::follow::pin_step` deciding each round. Exits when the router
+/// stops, when neither selection holds any more, or when the config
+/// directory is gone.
 fn follow(ctx: &Ctx) {
     let every: u64 = match env_or("ROWT_AUTO_FOLLOW_EVERY", "15").parse() {
         Ok(n) if n >= 1 => n,
@@ -1137,7 +1192,45 @@ fn follow(ctx: &Ctx) {
     };
     let mut st = rowt_core::follow::Follow::new(every);
     loop {
-        if !ctx.cfg.is_dir() || lifecycle::host_running(ctx).is_none() || ctx.sget("selected") != "auto" {
+        if !ctx.cfg.is_dir() || lifecycle::host_running(ctx).is_none() {
+            return;
+        }
+        let pin = ctx.sget("selected");
+        if ctx.sget("failover") == "1" && !pin.is_empty() && pin != "auto" && pin != "best" {
+            if let Some(now) = lifecycle::clash_selected(ctx) {
+                use rowt_core::follow::{pin_step, Look, PinStep};
+                let pin_alive = delay_ok(ctx, &pin);
+                let on_pin = now == pin;
+                let now_alive = if !on_pin && !pin_alive { Some(delay_ok(ctx, &now)) } else { None };
+                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                match pin_step(on_pin, pin_alive, now_alive) {
+                    PinStep::Return => {
+                        st = rowt_core::follow::Follow::new(every);
+                        if lifecycle::clash_curl(ctx, "PUT", "/proxies/escape", Some(&format!("{{\"name\":\"{pin}\"}}"))).is_some() {
+                            let m = format!("failover: {pin} answers again — back on it (was on {now})");
+                            watch_log(ctx, &m);
+                            crate::shell::audit(&ctx.cfg, &format!("watchdog {m}"));
+                            lifecycle::sset(ctx, "failover_switch", &format!("{} {now} -> {pin}", crate::best::utc(None)));
+                        }
+                    }
+                    PinStep::Stay => {
+                        if pin_alive {
+                            st = rowt_core::follow::Follow::new(every);
+                        }
+                    }
+                    PinStep::Sweep => {
+                        if st.should_retest(Look::Lost, t, every) {
+                            let found = pin_sweep(ctx, &pin, &now);
+                            st.after_retest(found, t, every);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(every));
+            continue;
+        }
+        if pin != "auto" {
             return;
         }
         if let Some(pick) = lifecycle::clash_auto_pick(ctx) {

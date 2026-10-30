@@ -62,7 +62,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.8.3"
+ROWT_VERSION="3.8.4"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -2822,17 +2822,22 @@ servers_remove() {
 
 # Select the escape server:
 #   use <tag>                pin one server (manual selector; nothing is health-checked)
+#   use <tag> --failover     pin one server as the PREFERENCE: the follower leaves it
+#                            when it is dead and comes back when it answers (#s36)
 #   use auto [--every DUR]   auto-pick the fastest live server, re-probed every
 #                            _auto_interval; --every saves that interval in state
 # Toggling auto<->manual changes the config shape (urltest present/absent), so we
 # re-render and restart; a plain tag->tag change in manual mode can switch live.
+# --failover changes nothing in the render (the selector's default is the pin):
+# it is state (`failover=1`) the follower and the watchdog read.
 cmd_use() {
-  local tag="" every="" every_set=0
+  local tag="" every="" every_set=0 failover_set=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --every)   [ "$#" -ge 2 ] || die "usage: $PROG use auto --every <duration>   (e.g. 3m or 90s)"
                  every="$2"; every_set=1; shift ;;
       --every=*) every="${1#--every=}"; every_set=1 ;;
+      --failover) failover_set=1 ;;
       *)         [ -n "$tag" ] || tag="$1" ;;
     esac
     shift
@@ -2853,12 +2858,22 @@ cmd_use() {
       || die "--every wants a duration from 30s to 30m, like 3m or 90s, or 'default' (got '$every')"
   fi
   if [ -z "$tag" ]; then servers_list; return 0; fi
+  if [ "$failover_set" = 1 ] && { [ "$tag" = auto ] || [ "$tag" = best ]; }; then
+    die "--failover keeps ONE pinned server as the preference; auto and best already fail over by themselves — use: $PROG use <tag> --failover"
+  fi
   if [ "$tag" != "auto" ] && [ "$tag" != best ] && ! jq -e --arg t "$tag" 'any(.tag == $t)' "$SERVERS" >/dev/null; then
     die "unknown server '$tag' — see: $PROG server"
   fi
-  local prev; prev="$(sget selected)"
+  local prev fo_was; prev="$(sget selected)"; fo_was="$(sget failover)"
   rm -f "$WATCH_HOLD"      # rowt #s36: a new selection ends the watchdog's hold on the old one
-  if [ "$tag" = best ]; then _use_best "$prev"; return 0; fi
+  # The preference flag follows THIS selection: set by --failover, cleared by
+  # any `use` without it (the follower sees the cleared key at its next look).
+  if [ "$failover_set" = 1 ]; then
+    sset failover 1
+    # A new episode: the last move shown by `status` was the old one's.
+    [ "$fo_was" = 1 ] || [ -z "$(sget failover_switch)" ] || sset failover_switch ""
+  elif [ "$fo_was" = 1 ]; then sset failover ""; fi
+  if [ "$tag" = best ]; then _use_best "$prev"; _failover_note "$tag" "$fo_was"; return 0; fi
   sset selected "$tag"
   if [ "$every_set" = 1 ] && [ "$every" = default ]; then
     sset auto_interval ""
@@ -2873,19 +2888,32 @@ cmd_use() {
   # its urltest interval only at start.
   local before=""; [ -f "$HOST_CFG" ] && before="$(cat "$HOST_CFG" "$VM_CFG" 2>/dev/null | cksum)"
   cmd_render >/dev/null
-  if ! host_running; then info "escape -> $tag (applies on next '$PROG router up')"; return 0; fi
+  if ! host_running; then info "escape -> $tag (applies on next '$PROG router up')"; _failover_note "$tag" "$fo_was"; return 0; fi
   if [ "$prev" = auto ] && [ "$tag" = auto ] && [ -n "$before" ] \
      && [ "$before" = "$(cat "$HOST_CFG" "$VM_CFG" 2>/dev/null | cksum)" ]; then
     info "escape -> auto, unchanged (re-probed every $(_auto_interval)) — router not restarted"
+    _failover_note "$tag" "$fo_was"
     return 0
   fi
   # same mode + concrete tag -> live switch; any auto toggle -> restart to (de)activate urltest
   if [ "$prev" != "auto" ] && [ "$tag" != "auto" ] && clash_curl PUT /proxies/escape "{\"name\":\"$tag\"}" >/dev/null 2>&1; then
     info "escape -> $tag (live)"
+    _start_follow          # a live switch into --failover needs its follower now, not at the next reload
   else
     cmd_router restart >/dev/null
     [ "$tag" = "auto" ] && info "escape -> auto (fastest live server, re-probed every $(_auto_interval))" \
                         || info "escape -> $tag"
+  fi
+  _failover_note "$tag" "$fo_was"
+}
+# What `use` says about the preference flag it just set or cleared.
+_failover_note() { # $1 = the new selection  $2 = the flag before
+  if [ "$(sget failover)" = 1 ] && [ "$AUTO_FOLLOW" != 1 ]; then
+    info "failover on, but ROWT_AUTO_FOLLOW=$AUTO_FOLLOW keeps the follower off — nothing moves until it is unset"
+  elif [ "$(sget failover)" = 1 ]; then
+    info "failover on: the follower leaves $1 when it is dead and comes back when it answers (checks every ${AUTO_FOLLOW_EVERY}s)"
+  elif [ "${2:-}" = 1 ]; then
+    info "failover off — the follower stops at its next look"
   fi
 }
 
@@ -3849,15 +3877,15 @@ _stop_collector() {
   local bin; bin="$(_collector_bin 2>/dev/null || true)"
   [ -n "$bin" ] && pkill -f "$bin" 2>/dev/null || true
 }
-# ---- auto's failover follower (sidecar; see AUTO_FOLLOW and `watch follow`) ----
+# ---- the failover follower (sidecar; see AUTO_FOLLOW and `watch follow`) ----
 # Tied to the router like the collector: started once it is healthy, in `auto`
-# only, and stopped with it. It is THIS script — `$HERE/bin/$PROG`, never a
+# or for a pin with `use <tag> --failover`, and stopped with it. It is THIS script — `$HERE/bin/$PROG`, never a
 # `rowt` found on PATH, which could be another install of a different version.
 follow_pidfile() { echo "$CFG/follow.pid"; }
 _follow_running() { local p; p="$(cat "$(follow_pidfile)" 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 _start_follow() {
   [ "$AUTO_FOLLOW" = 1 ] || return 0
-  [ "$(sget selected)" = auto ] || return 0
+  [ "$(sget selected)" = auto ] || [ "$(sget failover)" = 1 ] || return 0
   [ "$(sget mode)" != local ] || return 0
   _follow_running && return 0
   mkdir -p "$LOGDIR"
@@ -5820,6 +5848,19 @@ cmd_status() {
     sw="$(sget auto_switch)"
     [ -z "$sw" ] || echo "last switch:  $sw"
   fi
+  # `use <tag> --failover`: the preference, the stand-in when there is one,
+  # the follower, and the last move it made (rowt #s36).
+  if [ "$(sget failover)" = 1 ] && [ "$mode" != local ] && case "$(sget selected)" in ''|auto|best) false ;; *) true ;; esac; then
+    local fsel fl fsw; fsel="$(sget selected)"
+    if [ "$AUTO_FOLLOW" != 1 ]; then fl="failover follower off (ROWT_AUTO_FOLLOW=$AUTO_FOLLOW)"
+    elif _follow_running; then fl="failover follower running (checks every ${AUTO_FOLLOW_EVERY}s)"
+    elif host_running; then fl="failover follower NOT running (a router started before it existed gets one at its next reload) — '$PROG reload' starts it"
+    else fl="failover follower starts with the router"; fi
+    echo "failover:     prefers $fsel; $fl"
+    [ -z "$now" ] || [ "$now" = "$fsel" ] || echo "              on $now — $fsel is not answering; back on it when it does"
+    fsw="$(sget failover_switch)"
+    [ -z "$fsw" ] || echo "last switch:  $fsw"
+  fi
   # The escape servers' names as rowt resolved and checked them: what was
   # refused, and what sing-box was given.
   case "$(sget mode)" in ''|host) _escape_dns status 2>/dev/null || true ;; esac
@@ -6023,6 +6064,9 @@ _watch_probe() {
   # about an outbound that does not exist: every tick fails, and the streak
   # reloads a router that was fine.
   sel="$(_escape_sel)"; sel="${sel:-escape}"
+  # `use <tag> --failover`: the selector may be on a stand-in, and that is
+  # health. Probe the selector itself (rowt #s36).
+  [ "$(sget failover)" = 1 ] && sel=escape
   enc="$(_urlencode "$HEALTH_URL")"
   for t in 1 2; do
     # curl max-time must exceed the clash delay timeout or it cuts the test early.
@@ -6208,12 +6252,13 @@ _watch_shadow() {
       --argjson capoff "$([ "${ROWT_CAPTIVE_CHECK:-1}" = 1 ] && echo false || echo true)" \
       --arg pin "${_SH2_PIN:-}" --arg pinaddr "${_SH2_PINADDR:-}" \
       --argjson pinreach "${_SH2_PINREACH:-null}" --arg holdstamp "${_SH2_HOLDSTAMP:-}" \
+      --argjson failover "${_SH2_FAILOVER:-false}" \
       --arg holdsince "${_SH_HOLDSINCE0:-}" --arg holdtag "${_SH_HOLDTAG0:-}" \
       '{obs:{proxy_intent:"", captive:$cap, captive_check_disabled:$capoff, active_service:$svc, proxy_any_on:true,
              host_running:true, intent:"up", boot_matches:true, iface:$ifc,
              proxy_pointing_ok:$pointing, proxy_bypass_ok:$bypass,
              bound_iface:$cur, net_id:$nid, health_ok:$health, health_slow:$slow, health_flows:$flows, now:$now, gateway_ok:$gwok,
-             pinned:(if $pin == "" then null else $pin end), pinned_addr:$pinaddr, pinned_reach:$pinreach, hold_stamp:$holdstamp,
+             pinned:(if $pin == "" then null else $pin end), pinned_addr:$pinaddr, pinned_reach:$pinreach, hold_stamp:$holdstamp, failover:$failover,
              mode:(if $mode == "" then "host" else $mode end)},
         state:{captive_flag:false, health_fails:$fails, last_net_id:$last,
                last_recovery:$lastrec, last_net_change:$lastnetchg,
@@ -6553,13 +6598,76 @@ _follow_retest() { # $1 = the pick that lost its figure. Returns 0 when a live p
   _watch_log "auto: $1 stopped answering and no other server answered the re-test — still on ${new:-$1}"
   return 1
 }
+# `use <tag> --failover` (rowt #s36): the pin is a PREFERENCE on a plain
+# selector, which never tests its members — so the follower tests the pin
+# itself each round (the watchdog's delay test, one try), and when it is off
+# the pin, the server it is on. The pin answers and the selector is elsewhere:
+# move back. The server in use does not answer: sweep the others in
+# servers.json order and move the selector live to the first that answers; a
+# fruitless sweep backs off like a fruitless re-test (30 s doubling to 10 min),
+# while the pin is re-tested every round regardless. Mirrors
+# rowt_core::follow::pin_step and rowt-cli's `follow`. A dead server costs one
+# HEALTH_TIMEOUT per test, so a round can stretch while several are dead.
+_follow_delay_ok() { # $1 = tag → 0 when a delay test through it answers
+  local ep sec out; ep="$(controller 2>/dev/null || true)"; [ -n "$ep" ] || return 1
+  sec="$(clash_secret)"
+  out="$(curl --noproxy '*' -sS -m "$(( HEALTH_TIMEOUT + 3 ))" -H "Authorization: Bearer $sec" \
+        "http://$ep/proxies/$(_urlencode "$1")/delay?timeout=${HEALTH_TIMEOUT}000&url=$(_urlencode "$HEALTH_URL")" 2>/dev/null || true)"
+  printf '%s' "$out" | jq -e '.delay // empty' >/dev/null 2>&1
+}
+_follow_pin_sweep() { # $1 = pin  $2 = the server in use. Prints the server moved to; nothing when none answered.
+  local t m
+  while IFS= read -r t; do
+    [ -n "$t" ] && [ "$t" != null ] || continue      # an entry without a tag is not a server
+    [ "$t" != "$1" ] && [ "$t" != "$2" ] || continue
+    _follow_delay_ok "$t" || continue
+    clash_curl PUT /proxies/escape "{\"name\":\"$t\"}" >/dev/null 2>&1 || continue
+    if [ "$2" = "$1" ]; then m="failover: $1 stopped answering — moved to $t"
+    else m="failover: $2 stopped answering too ($1 still not answering) — moved to $t"; fi
+    _watch_log "$m"
+    _audit "watchdog $m"
+    sset failover_switch "$(date -u '+%Y-%m-%d %H:%M:%S') $2 -> $t"
+    printf '%s\n' "$t"
+    return 0
+  done < <(jq -r '.[].tag' "$SERVERS" 2>/dev/null || true)
+  _watch_log "failover: $1 stopped answering and no other server answered — staying on $2"
+  return 1
+}
 _watch_follow() {
-  local wait=$(( AUTO_FOLLOW_EVERY * 2 )) next=0 pick fig now
+  local wait=$(( AUTO_FOLLOW_EVERY * 2 )) next=0 pick fig now pin m t
   case "$AUTO_FOLLOW_EVERY" in ''|*[!0-9]*|0) die "ROWT_AUTO_FOLLOW_EVERY wants whole seconds, at least 1" ;; esac
   while :; do
     [ -d "$CFG" ] || return 0
     host_running || return 0
-    [ "$(sget selected)" = auto ] || return 0
+    pin="$(sget selected)"
+    if [ "$(sget failover)" = 1 ] && [ -n "$pin" ] && [ "$pin" != auto ] && [ "$pin" != best ]; then
+      now="$(clash_selected)"
+      if [ -n "$now" ]; then
+        if _follow_delay_ok "$pin"; then
+          wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
+          if [ "$now" != "$pin" ] && clash_curl PUT /proxies/escape "{\"name\":\"$pin\"}" >/dev/null 2>&1; then
+            m="failover: $pin answers again — back on it (was on $now)"
+            _watch_log "$m"
+            _audit "watchdog $m"
+            sset failover_switch "$(date -u '+%Y-%m-%d %H:%M:%S') $now -> $pin"
+          fi
+        elif [ "$now" != "$pin" ] && _follow_delay_ok "$now"; then
+          :                                     # off the pin, on a server that answers: keep it
+        else
+          # The clock is read BEFORE the sweep, as the auto branch reads it
+          # before its re-test and rowt-rs before its sweep: a sweep of several
+          # dead servers takes a while, and the back-off counts from its start.
+          t="$(date +%s)"
+          if [ "$t" -ge "$next" ]; then
+            if [ -n "$(_follow_pin_sweep "$pin" "$now")" ]; then wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
+            else next=$(( t + wait )); wait=$(( wait * 2 )); [ "$wait" -le 600 ] || wait=600; fi
+          fi
+        fi
+      fi
+      sleep "$AUTO_FOLLOW_EVERY"
+      continue
+    fi
+    [ "$pin" = auto ] || return 0
     pick="$(clash_auto_pick)"
     if [ -n "$pick" ]; then
       fig="$(_follow_has_figure "$pick")"
@@ -6624,7 +6732,9 @@ _watch_hold_row() { # the `rowt status` row while a hold names the server still 
   [ -f "$WATCH_HOLD" ] || return 0
   local since="" tag=""; IFS=$'\t' read -r since tag < "$WATCH_HOLD" || true
   { [ -n "$tag" ] && [ "$(sget selected)" = "$tag" ]; } || return 0
-  printf '%-14s%s\n' "escape:" "$tag is dead since $since UTC — the watchdog holds instead of reloading; '$PROG use auto' fails over by itself, or pin another server with '$PROG use <other>'"
+  local rem="'$PROG use auto' fails over by itself, or pin another server with '$PROG use <other>'"
+  [ "$(sget failover)" != 1 ] || rem="with --failover the follower moves off $tag as soon as another server answers, and back when $tag does"
+  printf '%-14s%s\n' "escape:" "$tag is dead since $since UTC — the watchdog holds instead of reloading; $rem"
 }
 
 _watch_health() { # $1=iface  $2=captive verdict
@@ -6634,6 +6744,7 @@ _watch_health() { # $1=iface  $2=captive verdict
   # rowt #s36: a hold names the server it is about. Pinned elsewhere now, or on
   # auto/best, that hold is over whatever this tick finds (mirrors netcheck).
   local ptag paddr=""; ptag="$(_watch_pinned_tag)"; _SH2_PIN="$ptag"
+  _SH2_FAILOVER=false; [ "$(sget failover)" = 1 ] && _SH2_FAILOVER=true
   _watch_hold_retire "$ptag"
   # Offline and healthy both reset the streak and plan nothing, so neither
   # records an action — matching the FSM, which only changes state there.
@@ -6717,17 +6828,24 @@ _watch_health() { # $1=iface  $2=captive verdict
       if tcp_reaches "${1:-}" "${paddr%:*}" "${paddr##*:}"; then _SH2_PINREACH=true; else _SH2_PINREACH=false; fi
     fi
     if [ "${_SH2_PINREACH:-}" = false ]; then
-      local nic="${1:-the NIC}" hs="" ht="" m
+      local nic="${1:-the NIC}" hs="" ht="" m rem rem2
+      # The remedy: under `use <tag> --failover` the follower already is one
+      # (mirrors rowt_core::watch::hold_remedy, word for word).
+      if [ "${_SH2_FAILOVER:-false}" = true ]; then
+        rem="with --failover the follower moves off $ptag as soon as another server answers, and back when $ptag does; '$PROG status' says whether it is running"; rem2="$rem"
+      else
+        rem="'$PROG use auto' fails over by itself"; rem2="$rem, or pin another server with '$PROG use <other>'"
+      fi
       [ -f "$WATCH_HOLD" ] && { IFS=$'\t' read -r hs ht < "$WATCH_HOLD" || true; }
       if [ "$ht" = "$ptag" ]; then
-        m="pinned server $ptag still dead ($paddr does not accept a TCP connection over $nic, $fails consecutive probe failures) — holding, not reloading; '$PROG use auto' fails over by itself"
+        m="pinned server $ptag still dead ($paddr does not accept a TCP connection over $nic, $fails consecutive probe failures) — holding, not reloading; $rem"
         _watch_log "$m"
         _wact "log $m"
       else
-        m="pinned server $ptag is dead: $paddr does not accept a TCP connection over $nic ($fails consecutive probe failures) — a reload would render the same config and restart the router onto the same dead server, so the watchdog holds instead of reloading; '$PROG use auto' fails over by itself, or pin another server with '$PROG use <other>'"
+        m="pinned server $ptag is dead: $paddr does not accept a TCP connection over $nic ($fails consecutive probe failures) — a reload would render the same config and restart the router onto the same dead server, so the watchdog holds instead of reloading; $rem2"
         _watch_log "$m"
         _wact "log $m"
-        m="watchdog hold: pinned server $ptag is dead ($paddr does not accept a TCP connection over $nic) — not reloading; '$PROG use auto' fails over by itself"
+        m="watchdog hold: pinned server $ptag is dead ($paddr does not accept a TCP connection over $nic) — not reloading; $rem"
         _audit "$m"
         _wact "audit $m"
         _SH2_HOLDSTAMP="$(date -u '+%Y-%m-%d %H:%M:%S')"
@@ -7276,7 +7394,7 @@ cmd_watch() {
       _AUDIT_OP=""
       ;;
     follow)
-      # Internal: the router starts this in `auto` (see _start_follow).
+      # Internal: the router starts this in `auto` and for a `--failover` pin (see _start_follow).
       _watch_follow ;;
     *) die "usage: $PROG watch [install | uninstall | status]" ;;
   esac
@@ -7617,7 +7735,7 @@ o@lifecycle@metrics [status|top|path|query]@per-domain traffic history (bytes in
 o@lifecycle@config [list|export|import]@back up / move the whole setup to another machine; 'export --to shadowrocket' for an iPhone
 o@servers & selection@server <list|add|rm|clear|import|dump>@manage the server pool
 o@servers & selection@sub <list|add|rm|update|clear|import|dump>@manage subscriptions
-c@servers & selection@use <tag>|best|auto [--every D]@pin a server, or let rowt pick by median latency (best), or sing-box's urltest (auto, re-tested every D)
+c@servers & selection@use <tag> [--failover]|best|auto [--every D]@pin a server (--failover: leave it when dead, back when it answers), or let rowt pick by median latency (best), or sing-box's urltest (auto, re-tested every D)
 c@servers & selection@ping [tag]@parallel latency test through the tunnel, median of 3 samples each (fastest first)
 a@servers & selection@probe@detect which mode works (host vs vm) with corp VPN up
 c@routing lanes@escape <list|add|rm|import|clear|dump|errors>@edit the escape lane (VPN tunnel)
@@ -8006,10 +8124,23 @@ online and running. Manual updates reset this timer, including failed attempts.
 EOF
 ;;
     use) cat <<EOF
-$PROG use <tag> | use best | use auto [--every DURATION] — select the escape server.
+$PROG use <tag> [--failover] | use best | use auto [--every DURATION] — select the escape server.
 
   use <tag>   pin one server. A plain selector that NEVER health-checks its
               members, so flaky/dead servers just sit idle (no CPU spin).
+              When that server itself dies the watchdog does not reload around
+              it (a reload would land on the same dead server): it holds, says
+              so in '$PROG status', and leaves the choice to you.
+  use <tag> --failover
+              pin one server as the PREFERENCE and let the follower leave it
+              when it is dead and come back when it answers: every
+              ROWT_AUTO_FOLLOW_EVERY seconds (default 15) it delay-tests the
+              pin; dead, it moves the selector live to the first other server
+              that answers (backing off 30 s, doubling to 10 min, while none
+              does) and keeps testing the pin; answering again, it moves back.
+              Nothing changes in the rendered config. A plain 'use <tag>',
+              'use auto' or 'use best' ends it. '$PROG status' shows the
+              preference, the server in use when it differs, and the last move.
   use best    rowt picks: every server is measured as the MEDIAN of three
               delay samples (shared with '$PROG ping' and the monitor, in
               latency.tsv), and the watchdog re-measures every

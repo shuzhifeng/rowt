@@ -1,0 +1,9 @@
+watch-pin-held-failover — watch-pin-held with the preference flag on
+(state failover=1): the hold already names alpha, every server is dead,
+the follower stayed on alpha.
+
+The `status` case: the `escape:` row ends with the --failover remedy ("the
+follower moves off alpha as soon as another server answers, and back when
+alpha does"), not `use auto`; the `failover:` rows come before it. The
+tick case: one short "still dead … holding, not reloading; with --failover
+…" line, nothing else changed.

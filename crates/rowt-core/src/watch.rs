@@ -120,6 +120,12 @@ pub struct Observation {
     /// nothing to measure (no `pinned_addr`), and recovery runs as before —
     /// never hold on ignorance (rowt #s36).
     pub pinned_reach: Option<bool>,
+    /// `use <tag> --failover` is on (state `failover=1`): the follower already
+    /// leaves a dead pin for any server that answers, so the hold's remedy is
+    /// not "use auto" but the follower's own promise. The hold itself is the
+    /// same — with every server dead the follower stays on the pin, and a
+    /// reload onto it would be as futile as ever.
+    pub failover: bool,
     /// `date -u '+%Y-%m-%d %H:%M:%S'` at this tick: the stamp a hold that
     /// begins now is written with. An input rather than derived from `now`,
     /// so both implementations stamp with the same program.
@@ -324,6 +330,23 @@ fn pinned_dead(obs: &Observation) -> Option<(&str, &str)> {
             Some((tag.as_str(), obs.iface.as_deref().unwrap_or("the NIC")))
         }
         _ => None,
+    }
+}
+
+/// What the hold tells the reader to do: the short form (the "still dead"
+/// line and the audit line) and the long one (the first warning). Under
+/// `use <tag> --failover` the follower is already the remedy. Mirrors the
+/// shell's `rem`/`rem2` in `_watch_health`, word for word.
+fn hold_remedy(failover: bool, tag: &str) -> (String, String) {
+    if failover {
+        // Not "the follower found nothing": with ROWT_AUTO_FOLLOW=0, or a
+        // router started before there was a follower, there is none to have
+        // looked. Say what the flag promises and where to check.
+        let r = format!("with --failover the follower moves off {tag} as soon as another server answers, and back when {tag} does; 'rowt status' says whether it is running");
+        (r.clone(), r)
+    } else {
+        ("'rowt use auto' fails over by itself".into(),
+         "'rowt use auto' fails over by itself, or pin another server with 'rowt use <other>'".into())
     }
 }
 
@@ -600,21 +623,21 @@ pub fn netcheck(obs: &Observation, st: &State, cfg: &Config) -> Outcome {
                         // DOES accept TCP while the tunnel probe fails is a
                         // wedged router, and recovers below as it always did.
                         let addr = &obs.pinned_addr;
+                        let (rem, rem_long) = hold_remedy(obs.failover, tag);
                         if s.hold.as_ref().is_some_and(|h| h.tag == tag) {
                             a.push(Action::Log(format!(
                                 "pinned server {tag} still dead ({addr} does not accept a TCP connection over {nic}, \
-                                 {n} consecutive probe failures) — holding, not reloading; 'rowt use auto' fails over by itself"
+                                 {n} consecutive probe failures) — holding, not reloading; {rem}"
                             )));
                         } else {
                             a.push(Action::Log(format!(
                                 "pinned server {tag} is dead: {addr} does not accept a TCP connection over {nic} \
                                  ({n} consecutive probe failures) — a reload would render the same config and restart \
-                                 the router onto the same dead server, so the watchdog holds instead of reloading; \
-                                 'rowt use auto' fails over by itself, or pin another server with 'rowt use <other>'"
+                                 the router onto the same dead server, so the watchdog holds instead of reloading; {rem_long}"
                             )));
                             a.push(Action::Audit(format!(
                                 "watchdog hold: pinned server {tag} is dead ({addr} does not accept a TCP connection over {nic}) \
-                                 — not reloading; 'rowt use auto' fails over by itself"
+                                 — not reloading; {rem}"
                             )));
                             s.hold = Some(Hold { since: obs.hold_stamp.clone(), tag: tag.to_string() });
                         }
@@ -702,9 +725,27 @@ mod tests {
             pinned: None,
             pinned_addr: String::new(),
             pinned_reach: None,
+            failover: false,
             hold_stamp: "2026-10-30 09:00:00".into(),
             now: 1_000_000,
         }
+    }
+
+    /// Under `use <tag> --failover` the hold is the same decision with the
+    /// follower named as the remedy instead of `use auto`.
+    #[test]
+    fn under_failover_the_hold_names_the_follower_as_the_remedy() {
+        let cfg = Config::default();
+        let st = State { health_fails: cfg.health_fails - 1, ..State::default() };
+        let mut o = pinned_dead_tick();
+        o.failover = true;
+        let r = netcheck(&o, &st, &cfg);
+        assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover(_))), "{:?}", r.actions);
+        let l = logs(&r);
+        assert!(l.iter().any(|m| m.ends_with("so the watchdog holds instead of reloading; with --failover the follower moves off alpha as soon as another server answers, and back when alpha does; 'rowt status' says whether it is running")), "{l:?}");
+        assert!(!l.iter().any(|m| m.contains("use auto")), "{l:?}");
+        assert!(r.actions.iter().any(|a| matches!(a, Action::Audit(m) if m.ends_with("— not reloading; with --failover the follower moves off alpha as soon as another server answers, and back when alpha does; 'rowt status' says whether it is running"))), "{:?}", r.actions);
+        assert!(r.state.hold.is_some());
     }
 
     /// rowt #s36: `use <tag>` on a server that is dead, as the 2026-10-30

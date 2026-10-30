@@ -647,6 +647,7 @@ subscriptions) is a member of a sing-box **selector** group named `escape`.
 ./bin/rowt server          # list servers; * marks the live one
 ./bin/rowt ping            # parallel latency test (router must run)
 ./bin/rowt use JP          # pin a specific server (manual — the default)
+./bin/rowt use tokyo-1 --failover   # keep it as the preference; leave it when dead, back when it answers
 ./bin/rowt use best        # let rowt pick the fastest, by median latency
 ./bin/rowt use auto        # or sing-box's own auto-selection
 ./bin/rowt use auto --every 3m   # …re-testing every server every 3 minutes
@@ -694,6 +695,21 @@ the interval and its source, the follower, and the last switch.
 period in seconds (both reach the watchdog's agent, like the other `ROWT_*`
 settings). A router an older rowt started, before there was a follower, gets one at its
 next reload.
+
+`use <tag> --failover` keeps a pinned server as the **preference** and lets the
+same follower leave it when it is dead and come back when it answers. A plain
+selector never tests its members, so here the follower tests the pin itself:
+every 15 s a delay test through it (the watchdog's probe, one try); when the
+pin stops answering it moves the selector live to the first other server that
+answers (back-off 30 s doubling to 10 min while none does, and the pin is
+re-tested every round regardless); when the pin answers again it moves back.
+A dead pin costs one probe timeout per round, and a sweep tests the others one
+after another, so a round can stretch to a minute with several dead servers
+before the back-off takes over. Each move is in `watch.log` and the audit log;
+`rowt status` shows the preference, the server in use when it differs, and the
+last move. A plain `use <tag>`, `use auto` or `use best` ends it. With every
+server dead the follower stays on the pin and says so, and the watchdog holds
+rather than reloading onto it (above).
 
 When the pick changes, connections already open on the old server stay on it.
 After a failover those hang until the app gives up on them;

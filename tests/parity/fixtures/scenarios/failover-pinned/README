@@ -1,0 +1,10 @@
+failover-pinned — `use alpha --failover` has been run and the router is down:
+state carries selected=alpha, failover=1 and a last move. No host.pid, so no
+`use` here spawns the follower (the sandbox cannot host its loop; the loop is
+tests/test_failover_follow.py against a fake clash API).
+
+Cases: `status` prints the failover rows (preference, the follower "starts
+with the router", the last switch) and no stand-in line (no router, no
+`active:`); `use alpha` clears the flag and says the follower stops; `use beta
+--failover` moves the preference and keeps the flag; `use auto --failover` and
+`use best --failover` are refused.

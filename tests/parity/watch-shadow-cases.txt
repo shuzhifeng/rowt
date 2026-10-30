@@ -63,3 +63,4 @@ PARITY_SCENARIO=watch-no-exit ROWT_CAPTIVE_URL=http://127.0.0.1:9/x watch tick |
 PARITY_SCENARIO=watch-pin-dead ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick | so the watchdog holds instead of reloading
 PARITY_SCENARIO=watch-pin-dead-name ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick | 203.0.113.10:443 does not accept a TCP connection over en0
 PARITY_SCENARIO=watch-pin-held ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick | pinned server alpha still dead
+PARITY_SCENARIO=watch-pin-dead-failover ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick | with --failover the follower moves off alpha as soon as another server answers, and back when alpha does

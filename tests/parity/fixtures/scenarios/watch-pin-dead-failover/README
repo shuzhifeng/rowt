@@ -1,0 +1,10 @@
+watch-pin-dead-failover — watch-pin-dead with the preference flag on
+(state failover=1): every server is dead, the follower stayed on alpha.
+
+The watchdog's probe targets the selector itself (`/proxies/escape/delay`,
+unanswered here like alpha's), the direct TCP connect to 203.0.113.10:443
+times out, and the hold fires as in watch-pin-dead — with the remedy words
+naming the follower ("it moves off alpha as soon as one answers, and back
+when alpha does") instead of `use auto`, which is what the watch-shadow
+line pins. Everything else (watch.hold, the audit line, the streak) as in
+watch-pin-dead.

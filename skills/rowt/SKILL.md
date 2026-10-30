@@ -176,7 +176,8 @@ replaced**, run `rowt fetch host` (with a working path to GitHub) or `rowt reloa
    proxy rule and the watchdog, which reloads on network changes, handles captive
    portals, recovers a crashed or spinning router, and clears a stale proxy at login.
    A pinned server (`rowt use <tag>`) that dies is NOT reloaded around: the watchdog
-   holds and says so in `rowt status` (`escape:` row); `rowt use auto` fails over.
+   holds and says so in `rowt status` (`escape:` row); `rowt use auto` fails over,
+   and `rowt use <tag> --failover` keeps the pin as a preference with failover.
    Re-run `rowt doctor`; `NO_SUDO_RULE` should be gone. If they'd rather not run the
    watchdog, then every command that sets the proxy (`rowt up`, `rowt proxy on`)
    is theirs to run in their own terminal.
@@ -199,10 +200,12 @@ replaced**, run `rowt fetch host` (with a working path to GitHub) or `rowt reloa
    A **403 through 7890** means the active server exits in a region your API refuses.
    Run `rowt use <another tag>` and re-test; don't let the user switch over until one
    passes. Then run `rowt ping` and let the user choose `rowt use <tag>` (pinned,
-   never probed), `rowt use best` (rowt picks by median latency and moves off a
-   dead one; needs the watchdog), or `rowt use auto` (sing-box's urltest; `--every
-   3m` sets its re-test round, and a follower leaves a dead pick within a minute). With
-   `best` or `auto`, re-test your API host too.
+   never probed; `rowt use <tag> --failover` keeps it as the preference and lets
+   the follower leave it when dead and return when it answers), `rowt use best`
+   (rowt picks by median latency and moves off a dead one; needs the watchdog), or
+   `rowt use auto` (sing-box's urltest; `--every 3m` sets its re-test round, and a
+   follower leaves a dead pick within a minute). With `best`, `auto` or
+   `--failover`, re-test your API host too.
 7. **Switch over** (the **user**, once you've handed over the resume command). If
    `AGENT_VIA_VPN`, or the proxy env points at another app, say first: "when you turn
    off <client>, this session drops; restart it with

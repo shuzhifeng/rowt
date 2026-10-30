@@ -66,6 +66,10 @@ foreground with output redirected to a file (see SKILL.md → Rules).
   by the watchdog every 10 minutes (at once if the server in use stops answering), and
   a switch only when another server is more than 50 ms faster. One noisy sample can't
   move it, and every switch is in `rowt audit` with both medians. Needs the watchdog.
+- `rowt use <tag> --failover` keeps that server as the preference but lets the
+  follower leave it when it is dead (to the first other server that answers) and
+  come back when it answers again; `rowt status` shows the server in use. A plain
+  `rowt use <tag>`, `use auto` or `use best` ends it.
 - `rowt use auto` is sing-box's own auto: the fastest live server by single samples,
   re-tested every 20 minutes; `rowt use auto --every 3m` sets that round (30s–30m)
   and keeps it across reloads (`--every default` forgets it). While the router runs, a follower checks the pick

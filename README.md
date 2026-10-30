@@ -594,7 +594,10 @@ applies whatever's in the review file, regardless of which client it came from.
 
 VLESS, AnyTLS and Shadowsocks servers import (Shadowsocks with its simple-obfs
 setting). Other protocols, and a Shadowsocks server chained through another,
-are reported as skipped. `PROXY`-rule domains are merged into your escape list.
+are not imported: the line after the import's summary names them by protocol
+(`not imported: Hysteria2 (1)`), and the review file counts them under
+`skipped`. For one you need, export its share link from the app and
+`rowt server add` it. `PROXY`-rule domains are merged into your escape list.
 
 ### Removing servers / subscriptions
 

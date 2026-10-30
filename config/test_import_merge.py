@@ -127,6 +127,40 @@ def main() -> int:
     )
     check("sub-normalized-dedup", len(r6["subscriptions"]), 1)
 
+    # 7. the summary names what the extractor could not convert, not the dedup
+    #    counters.
+    into_path = _tmp("")
+    add_path = _tmp(
+        json.dumps(
+            {
+                "servers": [],
+                "skipped": {"Hysteria2": 2, "duplicate": 5, "bad": "x", "zero": 0},
+            }
+        )
+    )
+    p = subprocess.run(
+        [
+            sys.executable,
+            _SCRIPT,
+            "--into",
+            into_path,
+            "--add",
+            add_path,
+            "--source",
+            "sr",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    os.unlink(into_path)
+    os.unlink(add_path)
+    check(
+        "summary-names-unconverted",
+        p.stderr,
+        "sr: +0 server(s), +0 subscription(s)\n  not imported: Hysteria2 (2)\n",
+    )
+
     if FAILS:
         print("FAIL")
         for f in FAILS:

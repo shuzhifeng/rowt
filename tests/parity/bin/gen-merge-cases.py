@@ -71,7 +71,8 @@ def review(r: random.Random, *, weird: bool) -> dict:
         d["proxy_domains"] = [r.choice(DOMAINS) for _ in range(r.randint(0, 3))]
     if r.random() < 0.5:
         d["skipped"] = {k: r.choice(SKIPPED_VALS)
-                        for k in r.sample(["ss", "trojan", "unknown", "kcp"], r.randint(1, 3))}
+                        for k in r.sample(["ss", "trojan", "unknown", "kcp", "Hysteria2",
+                                           "duplicate", "duplicate-subscription"], r.randint(1, 3))}
     if weird and r.random() < 0.2:
         d["skipped"] = r.choice([[], "nope"])
     if r.random() < 0.2:                       # an unknown key must survive

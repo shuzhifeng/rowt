@@ -198,6 +198,19 @@ pub fn merge(
     if dup_s > 0 || dup_u > 0 {
         summary.push_str(&format!("  (skipped {dup_s} dup server(s), {dup_u} dup sub(s))"));
     }
+    // What the extractor could not convert, by protocol — only the review file
+    // kept it, so a dropped server looked like it had never been there. The two
+    // duplicate counters are dedup, already said above.
+    if let Some(Value::Object(add_skipped)) = add.get("skipped") {
+        let unconverted: Vec<String> = add_skipped
+            .iter()
+            .filter(|(k, _)| k.as_str() != "duplicate" && k.as_str() != "duplicate-subscription")
+            .filter_map(|(k, v)| py_int(v).ok().filter(|n| *n > 0).map(|n| format!("{k} ({n})")))
+            .collect();
+        if !unconverted.is_empty() {
+            summary.push_str(&format!("\n  not imported: {}", unconverted.join(", ")));
+        }
+    }
     Merged { acc: Value::Object(acc), summary }
 }
 
@@ -373,6 +386,20 @@ mod tests {
         // No dups at all and the parenthetical is absent entirely.
         let m2 = merge(None, &add, "", &[], &[]);
         assert_eq!(m2.summary, "source: +2 server(s), +0 subscription(s)");
+    }
+
+    #[test]
+    fn the_summary_names_what_the_extractor_could_not_convert() {
+        let Value::Object(add) = json!({"servers":[srv("a.com","u1","t")],
+            "skipped":{"Hysteria2":2,"duplicate":5,"duplicate-subscription":1,"bad":"x","zero":0}})
+        else {
+            unreachable!()
+        };
+        let m = merge(None, &add, "shadowrocket", &[], &[]);
+        assert_eq!(
+            m.summary,
+            "shadowrocket: +1 server(s), +0 subscription(s)\n  not imported: Hysteria2 (2)"
+        );
     }
 
     #[test]

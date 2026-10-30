@@ -164,6 +164,21 @@ def main() -> int:
     msg = f"{src}: +{added_s} server(s), +{added_u} subscription(s)"
     if dup_s or dup_u:
         msg += f"  (skipped {dup_s} dup server(s), {dup_u} dup sub(s))"
+    # What the extractor could not convert, by protocol — only the review file
+    # kept it, so a dropped server looked like it had never been there. The two
+    # duplicate counters are dedup, already said above.
+    unconverted = []
+    for kk, vv in (add.get("skipped") or {}).items():
+        if kk in ("duplicate", "duplicate-subscription"):
+            continue
+        try:
+            n = int(vv)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            unconverted.append(f"{kk} ({n})")
+    if unconverted:
+        msg += "\n  not imported: " + ", ".join(unconverted)
     print(msg, file=sys.stderr)
     return 0
 

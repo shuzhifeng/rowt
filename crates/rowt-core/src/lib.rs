@@ -33,6 +33,7 @@ pub mod render;
 pub mod sharelink;
 pub mod srimport;
 pub mod srio;
+pub mod status;
 pub mod watch;
 
 pub use classify::{classify, Classification, ClassifyInput, Lane};

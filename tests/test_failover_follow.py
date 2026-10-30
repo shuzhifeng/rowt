@@ -17,8 +17,8 @@ Run after cargo build --release --workspace: python3 tests/test_failover_follow.
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import re
 import threading
-import time
 import unittest
 from urllib.parse import urlsplit
 
@@ -153,10 +153,21 @@ class FailoverFollowTests(unittest.TestCase):
                         self.assertTrue(wait_for(lambda: clash.now == "beta", 60), "the follower never left the dead pin")
                         log = box.cfg / "log/watch.log"
                         self.assertTrue(wait_for(lambda: "failover: alpha stopped answering — moved to beta" in log.read_text(), 10))
-                        self.assertIn("watchdog failover: alpha stopped answering — moved to beta", (box.cfg / "log/audit.log").read_text())
+                        audit = box.cfg / "log/audit.log"
+                        self.assertTrue(wait_for(lambda: "watchdog failover: alpha stopped answering — moved to beta" in audit.read_text(), 10),
+                                        audit.read_text())
                         state = box.cfg / "state"
-                        self.assertTrue(wait_for(lambda: "failover_switch=" in state.read_text(), 10))
-                        self.assertRegex(state.read_text(), r"failover_switch=\d{4}-\d\d-\d\d \d\d:\d\d:\d\d alpha -> beta\n")
+
+                        def switch(line: str) -> bool:
+                            """The state's last move is `line` (the key is written a moment after the log line)."""
+                            return re.search(r"failover_switch=\d{4}-\d\d-\d\d \d\d:\d\d:\d\d " + line + "\n", state.read_text()) is not None
+
+                        self.assertTrue(wait_for(lambda: switch("alpha -> beta"), 10), state.read_text())
+                        # rowt #s41: the round is on record for `rowt status` — the stand-in answered.
+                        record = box.cfg / "follow.last"
+                        self.assertTrue(wait_for(lambda: record.exists() and "target=beta\nresult=ok\n" in record.read_text(), 10),
+                                        record.read_text() if record.exists() else "no follow.last")
+                        self.assertIn("source=follower\n", record.read_text())
                         status = box.run("status")
                         self.assertIn("active:       beta", status)
                         self.assertIn("failover:     prefers alpha; failover follower running (checks every 2s)", status)
@@ -168,13 +179,13 @@ class FailoverFollowTests(unittest.TestCase):
                         clash.kill("beta")
                         self.assertTrue(wait_for(lambda: clash.now == "gamma", 60), "the follower never left the dead stand-in")
                         self.assertTrue(wait_for(lambda: "failover: beta stopped answering too (alpha still not answering) — moved to gamma" in log.read_text(), 10))
-                        self.assertRegex(state.read_text(), r"failover_switch=\d{4}-\d\d-\d\d \d\d:\d\d:\d\d beta -> gamma\n")
+                        self.assertTrue(wait_for(lambda: switch("beta -> gamma"), 10), state.read_text())
 
                         # The pin answers again: back on it.
                         clash.revive("alpha")
                         self.assertTrue(wait_for(lambda: clash.now == "alpha", 60), "the follower never returned to the pin")
                         self.assertTrue(wait_for(lambda: "failover: alpha answers again — back on it (was on gamma)" in log.read_text(), 10))
-                        self.assertRegex(state.read_text(), r"failover_switch=\d{4}-\d\d-\d\d \d\d:\d\d:\d\d gamma -> alpha\n")
+                        self.assertTrue(wait_for(lambda: switch("gamma -> alpha"), 10), state.read_text())
                         self.assertNotIn("is not answering", box.run("status"))
 
                         # Everything dead: it says so and stays on the pin.
@@ -182,6 +193,7 @@ class FailoverFollowTests(unittest.TestCase):
                         self.assertTrue(wait_for(lambda: "failover: alpha stopped answering and no other server answered — staying on alpha"
                                                  in log.read_text(), 60))
                         self.assertEqual(clash.now, "alpha")
+                        self.assertTrue(wait_for(lambda: "result=fail\n" in record.read_text(), 10), record.read_text())
 
                         # A plain `use alpha` ends the preference: the follower exits.
                         out = box.run("use", "alpha")

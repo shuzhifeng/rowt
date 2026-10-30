@@ -152,6 +152,10 @@ class AutoFollowTests(unittest.TestCase):
                                         "the follower did not record the switch")
                         self.assertRegex(state.read_text(),
                                          r"auto_switch=\d{4}-\d\d-\d\d \d\d:\d\d:\d\d alpha -> beta\n")
+                        # rowt #s41: the re-test is on record for `rowt status` (the group, not one server).
+                        record = box.cfg / "follow.last"
+                        self.assertTrue(wait_for(lambda: record.exists() and "target=auto\nresult=ok\n" in record.read_text(), 10),
+                                        record.read_text() if record.exists() else "no follow.last")
                         self.assertIn("auto: alpha stopped answering — re-tested now and moved to beta",
                                       (box.cfg / "log/watch.log").read_text())
                         self.assertIn("watchdog auto: alpha stopped answering", (box.cfg / "log/audit.log").read_text())

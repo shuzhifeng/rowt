@@ -50,7 +50,7 @@ pub fn status_line() -> String {
     }
 }
 
-fn plist_path() -> PathBuf {
+pub(crate) fn plist_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
@@ -500,6 +500,20 @@ fn delay_answered(out: &str) -> bool {
         .is_some_and(|d| !matches!(d, serde_json::Value::Null | serde_json::Value::Bool(false)))
 }
 
+/// `_probe_delay` — the delay a test answered with, in whole milliseconds
+/// (the shell's `${_SH_DELAY%%.*}`); None when it did not answer.
+fn delay_of(out: &str) -> Option<u32> {
+    if !delay_answered(out) {
+        return None;
+    }
+    let d = serde_json::from_str::<serde_json::Value>(out).ok()?.get("delay")?.clone();
+    match d {
+        serde_json::Value::Number(n) => n.as_u64().or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)).map(|v| v as u32),
+        serde_json::Value::String(s) => s.split('.').next()?.parse().ok(),
+        _ => None,
+    }
+}
+
 /// The verdict and the page, given what `curl -w '\n%{http_code}\nredirect=%{redirect_url}'`
 /// wrote for `url`.
 ///
@@ -918,7 +932,7 @@ fn perform(ctx: &Ctx, actions: &[Action]) {
                 // traffic, which is the failure this whole path exists for.
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let up = lifecycle::host_running(ctx).is_some();
-                if up && health_ok(ctx) {
+                if up && health_ok(ctx).is_some() {
                     watch_log(ctx, "recovery ok — escape tunnel answering");
                     crate::shell::audit(&ctx.cfg, "END   watchdog recover: cmd_reload — ok (tunnel answering)");
                 } else {
@@ -1022,23 +1036,41 @@ fn journal(ctx: &Ctx, cap: CaptiveState) {
 /// that fixes nothing. The delay test forces the traffic through the escape
 /// server regardless of routing. Two tries, so one dropped packet is not a
 /// verdict.
-fn health_ok(ctx: &Ctx) -> bool {
+fn health_ok(ctx: &Ctx) -> Option<u32> {
     health_ok_within(ctx, env_or("ROWT_HEALTH_TIMEOUT", "8").parse().unwrap_or(8))
+}
+
+/// `_watch_probe_target` — what the watchdog probes: a concrete server,
+/// 'auto' (urltest), or in `best` mode the pick — the selector itself before
+/// the first one. Probing `best` by name would ask about an outbound that
+/// does not exist: every tick fails, and the streak reloads a router that was
+/// fine. Under `use <tag> --failover` the selector may be on a stand-in, and
+/// that is health: the selector itself (rowt #s36).
+pub fn probe_target(ctx: &Ctx) -> String {
+    let sel = { let s = crate::best::escape_sel(ctx); if s.is_empty() { "escape".into() } else { s } };
+    if ctx.sget("failover") == "1" { "escape".to_string() } else { sel }
+}
+
+/// rowt #s41: `_obs_write` — record what a probe of the escape lane found, in
+/// `watch.last` (the tick) or `follow.last` (the follower), for `rowt status`
+/// to report without probing again. The bookkeeping is `Obs::next`; the stamp
+/// is the shell's `date -u` form.
+pub fn obs_write(ctx: &Ctx, file: &str, source: &str, target: &str, result: &str, delay_ms: Option<u32>) {
+    use rowt_core::status::Obs;
+    let path = ctx.cfg.join(file);
+    let prev = Obs::parse(&read(&path));
+    let next = Obs::next(prev.as_ref(), &crate::best::utc(None), source, target, result, delay_ms);
+    let _ = std::fs::write(path, next.format());
 }
 
 /// `_watch_probe <seconds>` — the same probe with an explicit delay timeout, so
 /// the confirming probe above can ask with far more patience.
-fn health_ok_within(ctx: &Ctx, t: u32) -> bool {
-    let Some(ep) = lifecycle::controller(ctx) else { return false };   // API gone = wedged
+/// The answer is the delay in whole milliseconds (rowt #s41 records it), or
+/// None when the test did not answer.
+fn health_ok_within(ctx: &Ctx, t: u32) -> Option<u32> {
+    let ep = lifecycle::controller(ctx)?;   // API gone = wedged
     let secret = lifecycle::clash_secret(ctx);
-    // A concrete server, 'auto' (urltest), or in `best` mode the pick — the
-    // selector itself before the first one. Probing `best` by name would ask
-    // about an outbound that does not exist: every tick fails, and the streak
-    // reloads a router that was fine.
-    let sel = { let s = crate::best::escape_sel(ctx); if s.is_empty() { "escape".into() } else { s } };
-    // `use <tag> --failover`: the selector may be on a stand-in, and that is
-    // health. Probe the selector itself (rowt #s36).
-    let sel = if ctx.sget("failover") == "1" { "escape".to_string() } else { sel };
+    let sel = probe_target(ctx);
     let url = env_or("ROWT_HEALTH_URL", "https://www.gstatic.com/generate_204");
     // `python3 -c 'urllib.parse.quote(u, safe="")'` — in-process, same rules.
     let enc = rowt_core::pyurl::quote(&url, "");
@@ -1051,14 +1083,14 @@ fn health_ok_within(ctx: &Ctx, t: u32) -> bool {
                    &format!("http://{ep}/proxies/{sel}/delay?timeout={}000&url={enc}", t)])
             .stderr(Stdio::null()).output().ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-        if delay_answered(&out) {
-            return true;
+        if let Some(d) = delay_of(&out) {
+            return Some(d);
         }
         if try_n == 1 {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
-    false
+    None
 }
 
 /// `_watch_fresh_flows` — escape-lane connections opened in the last
@@ -1140,7 +1172,13 @@ fn follow_retest(ctx: &Ctx, pick: &str) -> bool {
 /// one try): the follower's own test of a pinned server, since a plain
 /// selector never refreshes a member's figure.
 fn delay_ok(ctx: &Ctx, tag: &str) -> bool {
-    let Some(ep) = lifecycle::controller(ctx) else { return false };
+    delay_of_tag(ctx, tag).is_some()
+}
+
+/// `_follow_delay_ok` with its answer: the delay, or None. One try, the quick
+/// timeout — also what `rowt status` makes when nothing fresh was observed.
+pub fn delay_of_tag(ctx: &Ctx, tag: &str) -> Option<u32> {
+    let ep = lifecycle::controller(ctx)?;
     let secret = lifecycle::clash_secret(ctx);
     let t: u32 = env_or("ROWT_HEALTH_TIMEOUT", "8").parse().unwrap_or(8);
     let url = env_or("ROWT_HEALTH_URL", "https://www.gstatic.com/generate_204");
@@ -1151,12 +1189,13 @@ fn delay_ok(ctx: &Ctx, tag: &str) -> bool {
                         rowt_core::pyurl::quote(tag, ""), rowt_core::pyurl::quote(&url, ""))])
         .stderr(Stdio::null()).output().ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-    delay_answered(&out)
+    delay_of(&out)
 }
 
 /// `_follow_pin_sweep` — the server in use does not answer: the others in
-/// servers.json order, the first that answers taken live. True when one was.
-fn pin_sweep(ctx: &Ctx, pin: &str, now: &str) -> bool {
+/// servers.json order, the first that answers taken live. That server's tag
+/// when one was; None when none answered.
+fn pin_sweep(ctx: &Ctx, pin: &str, now: &str) -> Option<String> {
     let servers: Vec<serde_json::Value> = serde_json::from_str(&read(&ctx.cfg.join("servers.json"))).unwrap_or_default();
     for tag in servers.iter().filter_map(|s| s.get("tag").and_then(|t| t.as_str())) {
         if tag == pin || tag == now || !delay_ok(ctx, tag) {
@@ -1173,10 +1212,10 @@ fn pin_sweep(ctx: &Ctx, pin: &str, now: &str) -> bool {
         watch_log(ctx, &m);
         crate::shell::audit(&ctx.cfg, &format!("watchdog {m}"));
         lifecycle::sset(ctx, "failover_switch", &format!("{} {now} -> {tag}", crate::best::utc(None)));
-        return true;
+        return Some(tag.to_string());
     }
     watch_log(ctx, &format!("failover: {pin} stopped answering and no other server answered — staying on {now}"));
-    false
+    None
 }
 
 /// `watch follow` — the failover follower; see `rowt_core::follow` for why it
@@ -1199,9 +1238,17 @@ fn follow(ctx: &Ctx) {
         if ctx.sget("failover") == "1" && !pin.is_empty() && pin != "auto" && pin != "best" {
             if let Some(now) = lifecycle::clash_selected(ctx) {
                 use rowt_core::follow::{pin_step, Look, PinStep};
-                let pin_alive = delay_ok(ctx, &pin);
+                let pin_delay = delay_of_tag(ctx, &pin);
+                let pin_alive = pin_delay.is_some();
                 let on_pin = now == pin;
-                let now_alive = if !on_pin && !pin_alive { Some(delay_ok(ctx, &now)) } else { None };
+                let now_delay = if !on_pin && !pin_alive { Some(delay_of_tag(ctx, &now)) } else { None };
+                let now_alive = now_delay.map(|d| d.is_some());
+                // rowt #s41: each round's finding, for `rowt status`.
+                if pin_alive {
+                    obs_write(ctx, "follow.last", "follower", &pin, "ok", pin_delay);
+                } else if now_alive == Some(true) {
+                    obs_write(ctx, "follow.last", "follower", &now, "ok", now_delay.flatten());
+                }
                 let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs()).unwrap_or(0);
                 match pin_step(on_pin, pin_alive, now_alive) {
@@ -1222,7 +1269,14 @@ fn follow(ctx: &Ctx) {
                     PinStep::Sweep => {
                         if st.should_retest(Look::Lost, t, every) {
                             let found = pin_sweep(ctx, &pin, &now);
-                            st.after_retest(found, t, every);
+                            match found.as_deref() {
+                                Some(tag) => obs_write(ctx, "follow.last", "follower", tag, "ok", None),
+                                None => obs_write(ctx, "follow.last", "follower", &pin, "fail", None),
+                            }
+                            st.after_retest(found.is_some(), t, every);
+                        } else {
+                            // Nothing answers, and the next sweep is not due yet.
+                            obs_write(ctx, "follow.last", "follower", &pin, "fail", None);
                         }
                     }
                 }
@@ -1237,8 +1291,13 @@ fn follow(ctx: &Ctx) {
             let look = follow_look(ctx, &pick);
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs()).unwrap_or(0);
+            // rowt #s41: only a test the follower made is a record — a figure
+            // is sing-box's last urltest, up to an `auto` interval old, and a
+            // record of it every round would outrank the watchdog's streak.
             if st.should_retest(look, now, every) {
                 let live = follow_retest(ctx, &pick);
+                // The group was tested, not one server: a live pick anywhere is ok.
+                obs_write(ctx, "follow.last", "follower", "auto", if live { "ok" } else { "fail" }, None);
                 st.after_retest(live, now, every);
             }
         }
@@ -1508,15 +1567,15 @@ fn tick(ctx: &Ctx) {
             }
         }
     }
-    let hb = ctx.mode() == "local" || health_ok(ctx);
+    let hb_delay = if ctx.mode() == "local" { None } else { health_ok(ctx) };
+    let hb = ctx.mode() == "local" || hb_delay.is_some();
     // SLOW is not DEAD: only when the quick probe failed, and only when this
     // tick would cross the streak, ask once more with real patience. Recovery
     // is expensive and rare, so one slow probe is cheap insurance against
     // restarting a tunnel that was carrying traffic all along. Deliberately not
     // keyed on curl's error kind — a genuinely wedged tunnel times out too.
-    let slow = !hb
-        && st.health_fails + 1 >= cfg.health_fails
-        && health_ok_within(ctx, cfg.health_timeout * 3);
+    let slow_delay = if !hb && st.health_fails + 1 >= cfg.health_fails { health_ok_within(ctx, cfg.health_timeout * 3) } else { None };
+    let slow = slow_delay.is_some();
     // FLOWING is not WEDGED: only when the patient probe failed as well, ask
     // the router whether connections opened in the last two minutes are still
     // receiving bytes through the tunnel. Mirrors the shell's `_watch_fresh_flows`.
@@ -1547,6 +1606,22 @@ fn tick(ctx: &Ctx) {
         let proxy_wrong = obs2.active_service.is_some() && !(obs2.proxy_pointing_ok && obs2.proxy_bypass_ok);
         if !iface_moved && !proxy_wrong && obs2.mode != "local" && st.hold.is_none() && hold_file_malformed(ctx) {
             let _ = std::fs::remove_file(hold_file(ctx));
+        }
+        // rowt #s41: what this tick observed of the lane, for `rowt status` —
+        // recorded where the shell enters `_watch_health` and has its verdict:
+        // the network unchanged and the proxy right (a tick that reloads for
+        // the network's sake probes nothing there), never in local mode.
+        // Offline (no interface) is recorded as such.
+        if !iface_moved && !proxy_wrong && obs2.mode != "local" {
+            // Offline is the shell's test, `ipconfig getifaddr "$ifc"` empty
+            // (ROWT_IFACE can name an interface without an address).
+            let online = !ifc.is_empty() && !String::from_utf8_lossy(&Command::new("ipconfig").args(["getifaddr", &ifc])
+                .stderr(Stdio::null()).output().map(|o| o.stdout).unwrap_or_default()).trim().is_empty();
+            let (result, delay) = if !online { ("offline", None) }
+                else if hb { ("ok", hb_delay) }
+                else if slow { ("slow", slow_delay) }
+                else { ("fail", None) };
+            obs_write(ctx, "watch.last", "watchdog", &probe_target(ctx), result, delay);
         }
     }
     let n = netcheck(&obs2, &st, &cfg);

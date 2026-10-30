@@ -62,7 +62,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.8.4"
+ROWT_VERSION="3.8.5"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -6002,7 +6002,11 @@ WATCH_NET="$CFG/watch.net"                   # last-seen network identity (for t
 WATCH_HEALTH="$CFG/watch.health"             # consecutive liveness-probe failures (streak counter)
 WATCH_RESTART="$CFG/watch.restart"           # epoch of the last auto-restart (cooldown gate)
 WATCH_NETCHANGE="$CFG/watch.netchange"       # epoch of the last network change ((c): a portal is likely just after one)
-WATCH_HOLD="$CFG/watch.hold"                 # rowt #s36: "<utc stamp><TAB><tag>" while the watchdog holds instead of reloading onto a dead pinned server
+WATCH_HOLD="$CFG/watch.hold"
+# rowt #s41: what the watchdog and the follower last observed of the escape
+# lane, for `rowt status` to report without probing again (rowt_core::status).
+WATCH_LAST="$CFG/watch.last"
+FOLLOW_LAST="$CFG/follow.last"                 # rowt #s36: "<utc stamp><TAB><tag>" while the watchdog holds instead of reloading onto a dead pinned server
 # Generation of the plist this rowt writes. BUMP IT whenever the generated plist
 # changes, so an agent installed by an older rowt is recognised as stale and
 # self-heals on the next tick. A marker beats diffing the whole body: the body
@@ -6055,6 +6059,51 @@ _boot_id() { sysctl -n kern.boottime 2>/dev/null | sed -n 's/[^0-9]*\([0-9][0-9]
 # server regardless of routing. Two tries so one dropped packet isn't 'wedged'.
 # $1 = the delay timeout in seconds (default HEALTH_TIMEOUT). Parameterised for
 # the confirming probe below, which asks again with far more patience.
+# What the watchdog probes: a concrete server, 'auto' (urltest), or in `best`
+# mode the pick — the selector itself before the first one. Probing `best` by
+# name would ask about an outbound that does not exist: every tick fails, and
+# the streak reloads a router that was fine. Under `use <tag> --failover` the
+# selector may be on a stand-in, and that is health: the selector itself
+# (rowt #s36). Mirrors rowt-rs `probe_target`.
+_watch_probe_target() {
+  local sel; sel="$(_escape_sel)"; sel="${sel:-escape}"
+  [ "$(sget failover)" = 1 ] && sel=escape
+  printf '%s\n' "$sel"
+}
+# A delay test's answer: 0 when it answered, with the whole milliseconds in
+# _SH_DELAY (rowt #s41 records them); 1 otherwise, _SH_DELAY empty.
+_probe_delay() { # $1 = the clash API's JSON
+  _SH_DELAY="$(printf '%s' "$1" | jq -r '.delay // empty' 2>/dev/null || true)"; _SH_DELAY="${_SH_DELAY%%.*}"
+  case "$_SH_DELAY" in ''|*[!0-9]*) _SH_DELAY=""; return 1 ;; esac
+  return 0
+}
+# rowt #s41: record what a probe of the escape lane found, for `rowt status` to
+# report without probing again. Eight `key=value` lines in the order of
+# rowt_core::status::KEYS, with the bookkeeping of Obs::next: an answer (ok,
+# slow) moves last_ok_at to now and keeps ok_since from a previous answer; no
+# answer (fail, offline) keeps fail_since from a previous failure and leaves
+# last_ok_at as it was. A file without a stamp and a result is no record. The
+# stamp is the wall-clock form the parity normaliser masks, never an epoch.
+_obs_write() { # $1 = file  $2 = source  $3 = target  $4 = result  $5 = delay ms (empty when none)
+  local f="$1" now pres pok pfs pls answered=0 last_ok ok_since fail_since delay="${5:-}"
+  now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+  pres="$(_obs_field "$f" result)"; pok="$(_obs_field "$f" ok_since)"; pfs="$(_obs_field "$f" fail_since)"; pls="$(_obs_field "$f" last_ok_at)"
+  [ -n "$(_obs_field "$f" observed_at)" ] && [ -n "$pres" ] || { pres=""; pok=""; pfs=""; pls=""; }   # no stamp or no result: no record (Obs::parse)
+  case "$4" in ok|slow) answered=1 ;; *) delay="" ;; esac
+  if [ "$answered" = 1 ]; then
+    last_ok="$now"; fail_since=""
+    case "$pres" in ok|slow) ok_since="${pok:-$now}" ;; *) ok_since="$now" ;; esac
+  else
+    last_ok="$pls"; ok_since=""
+    case "$pres" in ''|ok|slow) fail_since="$now" ;; *) fail_since="${pfs:-$now}" ;; esac
+  fi
+  printf 'observed_at=%s\nsource=%s\ntarget=%s\nresult=%s\ndelay_ms=%s\nlast_ok_at=%s\nok_since=%s\nfail_since=%s\n' \
+    "$now" "$2" "$3" "$4" "$delay" "$last_ok" "$ok_since" "$fail_since" > "$f" 2>/dev/null || true
+}
+_obs_field() { # $1 = file  $2 = key → the value, or nothing
+  [ -f "$1" ] || return 0
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 || true
+}
 _watch_probe() {
   local ep sec sel enc out t to="${1:-$HEALTH_TIMEOUT}"
   ep="$(controller 2>/dev/null || true)"; [ -n "$ep" ] || return 1   # API gone = wedged
@@ -6063,16 +6112,13 @@ _watch_probe() {
   # selector itself before the first one. Probing `best` by name would ask
   # about an outbound that does not exist: every tick fails, and the streak
   # reloads a router that was fine.
-  sel="$(_escape_sel)"; sel="${sel:-escape}"
-  # `use <tag> --failover`: the selector may be on a stand-in, and that is
-  # health. Probe the selector itself (rowt #s36).
-  [ "$(sget failover)" = 1 ] && sel=escape
+  sel="$(_watch_probe_target)"
   enc="$(_urlencode "$HEALTH_URL")"
   for t in 1 2; do
     # curl max-time must exceed the clash delay timeout or it cuts the test early.
     out="$(curl --noproxy '*' -sS -m "$(( to + 3 ))" -H "Authorization: Bearer $sec" \
           "http://$ep/proxies/$sel/delay?timeout=${to}000&url=$enc" 2>/dev/null || true)"
-    printf '%s' "$out" | jq -e '.delay // empty' >/dev/null 2>&1 && return 0
+    _probe_delay "$out" && return 0
     [ "$t" = 1 ] && sleep 2
   done
   return 1
@@ -6613,7 +6659,7 @@ _follow_delay_ok() { # $1 = tag → 0 when a delay test through it answers
   sec="$(clash_secret)"
   out="$(curl --noproxy '*' -sS -m "$(( HEALTH_TIMEOUT + 3 ))" -H "Authorization: Bearer $sec" \
         "http://$ep/proxies/$(_urlencode "$1")/delay?timeout=${HEALTH_TIMEOUT}000&url=$(_urlencode "$HEALTH_URL")" 2>/dev/null || true)"
-  printf '%s' "$out" | jq -e '.delay // empty' >/dev/null 2>&1
+  _probe_delay "$out"
 }
 _follow_pin_sweep() { # $1 = pin  $2 = the server in use. Prints the server moved to; nothing when none answered.
   local t m
@@ -6644,6 +6690,7 @@ _watch_follow() {
       now="$(clash_selected)"
       if [ -n "$now" ]; then
         if _follow_delay_ok "$pin"; then
+          _obs_write "$FOLLOW_LAST" follower "$pin" ok "$_SH_DELAY"
           wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
           if [ "$now" != "$pin" ] && clash_curl PUT /proxies/escape "{\"name\":\"$pin\"}" >/dev/null 2>&1; then
             m="failover: $pin answers again — back on it (was on $now)"
@@ -6652,15 +6699,20 @@ _watch_follow() {
             sset failover_switch "$(date -u '+%Y-%m-%d %H:%M:%S') $now -> $pin"
           fi
         elif [ "$now" != "$pin" ] && _follow_delay_ok "$now"; then
-          :                                     # off the pin, on a server that answers: keep it
+          _obs_write "$FOLLOW_LAST" follower "$now" ok "$_SH_DELAY"   # off the pin, on a server that answers: keep it
         else
           # The clock is read BEFORE the sweep, as the auto branch reads it
           # before its re-test and rowt-rs before its sweep: a sweep of several
           # dead servers takes a while, and the back-off counts from its start.
           t="$(date +%s)"
           if [ "$t" -ge "$next" ]; then
-            if [ -n "$(_follow_pin_sweep "$pin" "$now")" ]; then wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
-            else next=$(( t + wait )); wait=$(( wait * 2 )); [ "$wait" -le 600 ] || wait=600; fi
+            # `|| true`: the sweep returns 1 when none answered, and under `set -e`
+            # a failing substitution in a bare assignment would end the follower.
+            m="$(_follow_pin_sweep "$pin" "$now")" || true
+            if [ -n "$m" ]; then _obs_write "$FOLLOW_LAST" follower "$m" ok ""; wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
+            else _obs_write "$FOLLOW_LAST" follower "$pin" fail ""; next=$(( t + wait )); wait=$(( wait * 2 )); [ "$wait" -le 600 ] || wait=600; fi
+          else
+            _obs_write "$FOLLOW_LAST" follower "$pin" fail ""         # nothing answers, and the next sweep is not due yet
           fi
         fi
       fi
@@ -6672,11 +6724,15 @@ _watch_follow() {
     if [ -n "$pick" ]; then
       fig="$(_follow_has_figure "$pick")"
       now="$(date +%s)"
+      # rowt #s41: only a test the follower made is a record — a figure is
+      # sing-box's last urltest, up to an `auto` interval old, and a record of
+      # it every round would outrank the watchdog's streak in `rowt status`.
       if [ "$fig" = 1 ]; then
         wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
       elif [ "$fig" = 0 ] && [ "$now" -ge "$next" ]; then
-        if _follow_retest "$pick"; then wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
-        else next=$(( now + wait )); wait=$(( wait * 2 )); [ "$wait" -le 600 ] || wait=600; fi
+        # The group was tested, not one server: a live pick anywhere is ok.
+        if _follow_retest "$pick"; then _obs_write "$FOLLOW_LAST" follower auto ok ""; wait=$(( AUTO_FOLLOW_EVERY * 2 )); next=0
+        else _obs_write "$FOLLOW_LAST" follower auto fail ""; next=$(( now + wait )); wait=$(( wait * 2 )); [ "$wait" -le 600 ] || wait=600; fi
       fi
     fi
     sleep "$AUTO_FOLLOW_EVERY"
@@ -6748,9 +6804,10 @@ _watch_health() { # $1=iface  $2=captive verdict
   _watch_hold_retire "$ptag"
   # Offline and healthy both reset the streak and plan nothing, so neither
   # records an action — matching the FSM, which only changes state there.
-  [ -n "$ip" ] || { rm -f "$WATCH_HEALTH"; _SH2_HEALTH=offline; return 0; }
+  [ -n "$ip" ] || { rm -f "$WATCH_HEALTH"; _SH2_HEALTH=offline; _obs_write "$WATCH_LAST" watchdog "$(_watch_probe_target)" offline ""; return 0; }
   if _watch_probe; then
     rm -f "$WATCH_HEALTH"; _SH2_HEALTH=ok                                    # healthy — clear streak
+    _obs_write "$WATCH_LAST" watchdog "$(_watch_probe_target)" ok "$_SH_DELAY"   # rowt #s41
     rm -f "$WATCH_HOLD"                                                      # the server answers again: the hold is over
     # The probe answering proves the network AND the tunnel work. That is
     # exactly the state the spin hides in, so this is the only place the spin
@@ -6762,6 +6819,7 @@ _watch_health() { # $1=iface  $2=captive verdict
   local fails; fails="$(( $(cat "$WATCH_HEALTH" 2>/dev/null || echo 0) + 1 ))"
   printf '%s\n' "$fails" > "$WATCH_HEALTH" 2>/dev/null || true
   if [ "$fails" -lt "$HEALTH_FAILS" ]; then
+    _obs_write "$WATCH_LAST" watchdog "$(_watch_probe_target)" fail ""
     _watch_log "escape tunnel probe failed ($fails/$HEALTH_FAILS)"
     _wact "log escape tunnel probe failed ($fails/$HEALTH_FAILS)"
     return 0
@@ -6780,6 +6838,7 @@ _watch_health() { # $1=iface  $2=captive verdict
   # tunnel that may simply be far away. See `_watch_probe_confirm`.
   if _watch_probe_confirm; then
     _SH2_SLOW=true
+    _obs_write "$WATCH_LAST" watchdog "$(_watch_probe_target)" slow "$_SH_DELAY"
     local sm="escape tunnel answered a slower probe (${HEALTH_TIMEOUT}s → $(( HEALTH_TIMEOUT * 3 ))s) — slow, not wedged; not restarting. Raise ROWT_HEALTH_TIMEOUT if this link stays this slow (ROWT_HEALTH_TIMEOUT=20 rowt watch install bakes it into the agent)"
     _watch_log "$sm"
     _wact "log $sm"
@@ -6787,6 +6846,7 @@ _watch_health() { # $1=iface  $2=captive verdict
     return 0
   fi
   _SH2_SLOW=false
+  _obs_write "$WATCH_LAST" watchdog "$(_watch_probe_target)" fail ""
   # FLOWING is not WEDGED: see `_watch_fresh_flows`. Positive evidence, like the
   # slower probe answering, so the streak clears — and no escape hatch, because
   # a tunnel relaying responses on connections it opened two minutes ago is

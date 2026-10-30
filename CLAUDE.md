@@ -113,6 +113,24 @@ what doesn't compile. `parity list` shows the matrix; the main gates are
 
 Run these before any release that touches `bin/rowt` or `crates/`.
 
+## What agents may do here under Hong's account
+
+Hong, 2026-10-30 ("I feel the rule overly cautious. Check how other repos'
+commit rule works and be consistent"), on the terms steward and
+agentdev-toolbox grant:
+
+- **Commit and push to `main` directly**, once the gates for what the commit
+  touches pass on the exact tree: CI's list above, plus the differential gates
+  for a change to `bin/rowt`, `crates/` or `config/`. Small commits, pushed by
+  fast-forward.
+- **A release waits for Hong's word**, asked on record as a `--for person`
+  decision with the release as its yes action. Unlike steward's, a rowt release
+  reaches colleagues' Macs through `brew upgrade`, not only his.
+- **A contributor's pull request** merges on Hong's word; small fixes after it
+  are ours to make.
+- **Not granted:** force-pushing or rewriting `main`'s history, or changing the
+  repository's visibility or settings.
+
 ## Versioning & commits
 
 The pre-commit hook **auto-bumps the PATCH** in `bin/rowt` for any commit
@@ -132,8 +150,8 @@ stage both.
 current version; to *release* it you must bump `ROWT_VERSION` in `bin/rowt`
 yourself, in the same commit.
 
-Commit only when asked. Conventional-commit subjects; explain the *why* in the
-body.
+Conventional-commit subjects; explain the *why* in the body. When to commit and
+push: the section above.
 
 Testing against the **live** `~/.config/rowt`: run the repo's `bin/rowt`, but
 remember a later `rowt up`/`reload` from the *installed* binary re-renders
@@ -142,8 +160,11 @@ reload/restart in the **foreground** (see the `rowt` skill).
 
 ## Cutting a release
 
-Repo `tanghong123/rowt`; tap **`~/personal/homebrew-tap`** (`Formula/rowt.rb`),
-installed as `tanghong123/tap`. Only when the user says to.
+Repo `tanghong123/rowt`; the tap is a working clone of
+**`tanghong123/homebrew-tap`** (`Formula/rowt.rb`), installed as
+`tanghong123/tap`. Its path differs per box: `~/personal/homebrew-tap` on
+aries-black, `~/code/homebrew-tap` on hong-devserver. Only on Hong's word (see
+"What agents may do here").
 
 1. Clean tree at the intended version — confirm `grep ROWT_VERSION= bin/rowt`.
 2. `git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`

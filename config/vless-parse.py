@@ -504,8 +504,16 @@ def parse_hysteria2(link: str, tag: str = "escape") -> dict:
     if down.isdigit():
         out["down_mbps"] = int(down)
 
-    if _first(qs, "obfs"):
+    # Salamander is the only obfs hysteria2 has, and sing-box refuses it without
+    # a password ("missing obfs password") — which fails the whole render, not
+    # just this server. `obfs=none`, as some clients write it, means no obfs.
+    obfs = _first(qs, "obfs")
+    if obfs == "salamander":
+        if not _first(qs, "obfs-password"):
+            raise ValueError("hysteria2 link has obfs salamander but no obfs-password")
         out["obfs"] = {"type": "salamander", "password": _first(qs, "obfs-password")}
+    elif obfs and obfs != "none":
+        raise ValueError(f"hysteria2 link has an obfs rowt cannot use: {obfs}")
 
     return out
 

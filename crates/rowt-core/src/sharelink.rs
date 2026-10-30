@@ -596,11 +596,21 @@ pub fn parse_hysteria2(link: &str, tag: &str) -> Result<Value, String> {
     if digits(&down) {
         out.insert("down_mbps".into(), down.parse::<u64>().unwrap_or(0).into());
     }
-    if !first(&qs, "obfs", "").is_empty() {
+    // Salamander is the only obfs hysteria2 has, and sing-box refuses it without
+    // a password ("missing obfs password") — which fails the whole render, not
+    // just this server. `obfs=none`, as some clients write it, means no obfs.
+    let obfs = first(&qs, "obfs", "");
+    if obfs == "salamander" {
+        let pw = first(&qs, "obfs-password", "");
+        if pw.is_empty() {
+            return Err("hysteria2 link has obfs salamander but no obfs-password".into());
+        }
         let mut o = obj();
         o.insert("type".into(), "salamander".into());
-        o.insert("password".into(), first(&qs, "obfs-password", "").into());
+        o.insert("password".into(), pw.into());
         out.insert("obfs".into(), o.into());
+    } else if !obfs.is_empty() && obfs != "none" {
+        return Err(format!("hysteria2 link has an obfs rowt cannot use: {obfs}"));
     }
     Ok(out.into())
 }
@@ -1530,6 +1540,21 @@ mod tests {
         assert_eq!(o["tls"]["insecure"], true);
         assert_eq!(o["server_port"], 443);
         assert_eq!(o["tls"]["server_name"], "h.example");
+    }
+
+    #[test]
+    fn obfs_none_is_no_obfs_and_salamander_needs_a_password() {
+        // sing-box refuses salamander without a password, and that fails the
+        // whole render; `obfs=none` is how some clients say "no obfs".
+        assert!(one("hysteria2://pw@h.example:8443?insecure=1&alpn=h3&obfs=none#N", "N").get("obfs").is_none());
+        assert_eq!(
+            parse_link("hysteria2://pw@h.example:443?obfs=salamander", "t").unwrap_err(),
+            "hysteria2 link has obfs salamander but no obfs-password"
+        );
+        assert_eq!(
+            parse_link("hysteria2://pw@h.example:443?obfs=xor&obfs-password=x", "t").unwrap_err(),
+            "hysteria2 link has an obfs rowt cannot use: xor"
+        );
     }
 
     #[test]

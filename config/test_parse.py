@@ -63,6 +63,23 @@ def test_obfs_and_alpn():
     eq(o["server_port"], 8443, "port")
 
 
+def test_obfs_none_is_no_obfs_and_salamander_needs_a_password():
+    o = vp.parse_hysteria2(
+        "hysteria2://pw@h.example:8443?insecure=1&alpn=h3&obfs=none#N", "N"
+    )
+    eq("obfs" in o, False, "obfs=none renders no obfs")
+    for q, msg in (
+        ("obfs=salamander", "hysteria2 link has obfs salamander but no obfs-password"),
+        ("obfs=xor&obfs-password=x", "hysteria2 link has an obfs rowt cannot use: xor"),
+    ):
+        try:
+            vp.parse_hysteria2(f"hysteria2://pw@h.example:443?{q}", "t")
+        except ValueError as e:
+            eq(str(e), msg, q)
+            continue
+        raise AssertionError(f"expected ValueError for {q}")
+
+
 def test_alias():
     a = vp.parse_link("hy2://pw@h.example:443#X", "X")
     b = vp.parse_link("hysteria2://pw@h.example:443#X", "X")

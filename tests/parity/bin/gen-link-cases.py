@@ -109,7 +109,7 @@ def q(r: random.Random, proto: str) -> str:
             add("upmbps", r.choice(MBPS))
             add("downmbps", r.choice(MBPS))
             if r.random() < 0.5:
-                add("obfs", r.choice(["", "salamander"]))
+                add("obfs", r.choice(["", "salamander", "none", "xor"]))
                 add("obfs-password", r.choice(["", "obfs-1", "o%20p"]))
     if r.random() < 0.7:
         add("sni", r.choice(["", "sni.example", "s%2Ee.example"]))

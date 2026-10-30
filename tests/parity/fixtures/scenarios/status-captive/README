@@ -1,0 +1,2 @@
+status-captive — the watchdog dropped the proxy for a captive portal (state captive=1) with the router
+up: DOWN, reason captive-portal, settled before any observation is read, and no probe is made.

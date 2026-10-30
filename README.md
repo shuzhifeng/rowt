@@ -68,7 +68,7 @@ rowt up host                  # host mode (the common one); 'rowt up' auto-detec
 # --- now switch networks ---
 # 4. quit Shadowrocket, connect the CORP VPN, then verify:
 rowt explain www.google.com   # which lane a destination takes (was 'rowt route')
-rowt status                   # mode / server / proxy / reachability
+rowt status                   # mode / server / proxy / the escape lane's health, from the watchdog's last look
 ```
 
 (Mode `vm` also needs its image — `up vm` fetches that too if it isn't cached.
@@ -101,7 +101,7 @@ rowt block add ads.example.com   # sinkhole an ad/telemetry domain (no DNS, no d
 rowt hotspot add unitedwifi.com  # a venue's captive portal: reached WITHOUT the proxy, so its login page loads
 rowt config export --to shadowrocket  # the same routes (and servers) for Shadowrocket on your iPhone
 rowt use JP                   # pick a server (rowt ping shows the fastest)
-rowt status                   # is it working? (mode / server / proxy / reachability)
+rowt status                   # is it working? (mode / server / proxy / the escape lane's health); --probe fetches live, --json for scripts
 rowt speed <url>              # is a lane FAST enough — and is rowt the cause? (it says which)
 rowt monitor                  # live full-screen dashboard (connections, errors, server health)
 rowt reload                   # after switching Wi-Fi ↔ wired ↔ hotspot
@@ -717,6 +717,40 @@ After a failover those hang until the app gives up on them;
 new pick at once. It is off by default because it also cuts healthy connections
 when a round moves the pick only for speed; `rowt status` says when it is on.
 
+### What `rowt status` knows about the escape lane
+
+`rowt status` is **passive**: its `escape:` block comes from what rowt itself
+last observed, not from a fetch of its own. The watchdog records each probe
+(`~/.config/rowt/watch.last`: the stamp, what it probed, ok / slow / fail /
+offline, the delay, when the lane was last seen ok, since when it has been ok
+or failing) and the follower records each round (`follow.last`); `status`
+reads the fresher of the two — fresh is within three watchdog intervals, six
+minutes by default — and gives one of five words, with a reason:
+
+| word | it means |
+|---|---|
+| `ok` | the lane answered its last probe |
+| `degraded` | the probe is failing but the watchdog has not reached its limit (`probe-failing`), or only the patient probe answered (`slow`) |
+| `holding` | the pinned server is dead and the watchdog holds instead of reloading (`pinned-dead`; the row names the remedy) |
+| `down` | the streak reached the limit (`probe-failed`), no server answered the follower (`all-dead`), the NIC had no address (`offline`), the router is stopped, or a captive portal holds the proxy off |
+| `unknown` | local mode (no tunnel), or nothing observed and no probe possible |
+
+When nothing fresh was observed — no watchdog, a box just up, a stale record —
+`status` makes one try of the watchdog's delay test itself, at once, and says
+so (`probed now:`); the answer is reported, never recorded. `rowt status --probe` makes
+that probe regardless and brings back the live `via proxy:` fetch through the
+proxy and, when it fails, the `uplink:` verdict. `members:` lists each server's
+last delay test as the clash API remembers it.
+
+`rowt status --json` prints the same facts as one JSON object with a stable,
+versioned schema (`"schema": 1`, additive changes only, never the clash secret,
+no server addresses), for agents and fleet checks: `.escape.state` is the word
+above, `.escape.reason` why, `.escape.since` from when, `.escape.active` the
+server in use, `.escape.preferred` the pin, `.escape.servers` the members. It
+needs no sudo, no TTY and no network when a record is fresh, answers in about
+a second, and exits 0 whenever it could report. The keys are documented in the
+skill, `skills/rowt/references/status-json.md`.
+
 ### Escape servers named by domain
 
 When a server is named by a domain (`entry.example.com`, not an address), rowt
@@ -890,7 +924,7 @@ Every command has detailed help: `rowt <command> --help` (or `rowt help <command
 | `restart` | bounce the tunnel in place (host or vm, whichever is active) — no re-render, no proxy change. Use if sing-box is stuck/high-CPU. |
 | `reload` | re-detect the network interface, re-render, restart, re-apply the proxy — run after switching Wi-Fi ↔ wired ↔ hotspot. |
 | `watch <install\|uninstall\|status>` | install/remove a LaunchAgent that (a) runs `reload` on every network change (debounced; a no-op when neither the interface nor the active-service proxy moved) and (b) on a timer **probes the escape tunnel** and auto-recovers it — a *wedged* tunnel (router up, not carrying traffic; 3 failed probes) or a *crashed* one (router down while your intent is up, same boot), via `reload`, cooldown-gated and verified by a re-probe — and **held off** while the network itself reaches nothing (its own unproxied probe failing), since no reload fixes an uplink; `watch.log` then says what the NIC and its gateway answered, in the words of `rowt status`'s `uplink:` line. Likewise held off when the **pinned server itself is dead** (`use <tag>`, and a direct TCP connect from the NIC to it fails): a reload would land on the same dead server, so the watchdog says so once (`watch.log`, `audit`, an `escape:` row in `status`) and points at `rowt use auto`, which fails over by itself. It also runs once at **login**: if rowt isn't running but the system proxy is still set to `127.0.0.1:7890`, it clears it, so rowt's proxy effect never outlives a reboot. `install` also adds a scoped passwordless-sudo rule for the `networksetup` proxy toggles (so a Wi-Fi↔Ethernet switch doesn't prompt); `uninstall` removes both. Recoveries are recorded in `audit`. It further (c) restarts a router that is **up and answering but spinning** — high CPU with no traffic — which the liveness probe alone cannot see, and (d) **re-syncs its own agent plist** when that plist was written by an older rowt. `status` reports a stale agent instead of just `LOADED`. |
-| `status` | mode, servers, proxy state, reachability **and config validity** — rowt itself. Its `corp lane:` line says which tunnel rowt would route corp traffic into, and is **not a VPN health check**: a corp tunnel exists throughout exactly the outages that matter. For the VPN's health it shows a dedicated checker's verdict when one is published — corp-route's `<epoch> <ok\|fail\|down\|untested> <id>` file (`ROWT_CORP_HEALTH`), "no opinion" once older than `ROWT_CORP_HEALTH_STALE` (300 s) — and otherwise says the VPN's health is not rowt's to judge. `rowt doctor` prints the same line as its `corp` row. |
+| `status [--json] [--probe]` | mode, servers, proxy state, the escape lane's health (`escape:`, from the watchdog's and the follower's last records; `--probe` fetches live) **and config validity** — rowt itself; `--json` is the same as one object, schema 1 (`skills/rowt/references/status-json.md`). Its `corp lane:` line says which tunnel rowt would route corp traffic into, and is **not a VPN health check**: a corp tunnel exists throughout exactly the outages that matter. For the VPN's health it shows a dedicated checker's verdict when one is published — corp-route's `<epoch> <ok\|fail\|down\|untested> <id>` file (`ROWT_CORP_HEALTH`), "no opinion" once older than `ROWT_CORP_HEALTH_STALE` (300 s) — and otherwise says the VPN's health is not rowt's to judge. `rowt doctor` prints the same line as its `corp` row. |
 | `explain <domain\|ip>` | explain which lane a destination takes — `escape` (proxy), `corp` (into the corp VPN), `block`, or `direct` (pass-through) — and which rule matched. Mirrors the real routing: a `--domain` (whole-host) entry wins outright, else hand-list domain suffixes win by **longest match** across all three lanes, then — for a name no rule matched, when the final route is direct — the address the router resolves it to at its own resolver, checked against the corp CIDRs and the private/overlay ranges (a hit routes it corp), then final. A name that resolver cannot answer gets a note with both hand fixes (`corp add` for an intranet name, `hotspot add` for an overlay zone only the OS resolves). Adds a live HTTP check if the router is running. (`route` still works as a hidden alias.) |
 | `report` | full offline diagnostic (deps, configs, per-server reachability, DNS, through-proxy tests, log + audit tail) → `~/.config/rowt/diag-*.txt`, **secrets masked**, for sharing. |
 | `audit [-n N\|all\|path\|clear]` | the **mutation trail** — one line per state-changing op, whether you ran it or the `watch` agent did, with `BEGIN`/`END`/`ABORT`, timing, and a `by=<parent>(<tty>)` field that says whether it was hands-on (`by=zsh`) or the watchdog (`by=launchd`). `BEGIN` is written before the work, so even a command that hangs leaves a trace. Read-only commands aren't recorded. Every **lane membership change** is in it too, as `LANE <from> -> <to> (<n>): <entries>` — an add, an `rm`, every entry of an `import`, a monitor route, a `corp sync` — and an edit made to a lane file outside rowt is logged as `outside rowt` at the next command or watchdog tick. `direct` means "in no lane"; entries are written exactly as in the lane file, so reversing a line is `rowt <lane> add|rm` of the same text. → `~/.config/rowt/log/audit.log`. |

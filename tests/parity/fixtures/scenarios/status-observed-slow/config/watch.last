@@ -1,0 +1,8 @@
+observed_at=2100-01-01 00:00:00
+source=watchdog
+target=alpha
+result=slow
+delay_ms=17000
+last_ok_at=2100-01-01 00:00:00
+ok_since=2099-12-31 23:00:00
+fail_since=

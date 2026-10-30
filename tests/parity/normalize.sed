@@ -17,6 +17,8 @@ s/[0-9]\{4\}-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/<TS>/g
 s/pid=[0-9][0-9]*/pid=<PID>/g
 s/ppid=[0-9][0-9]*/ppid=<PID>/g
 s/(pid [0-9][0-9]*)/(pid <PID>)/g
+# rowt #s41: the same pid in `status --json`.
+s/"pid": [0-9][0-9]*/"pid": <PID>/g
 
 # Elapsed time reported by an operation ('rc=0 (3s)').
 s/rc=\([0-9-]*\) ([0-9][0-9]*s)/rc=\1 (<DUR>s)/g

@@ -138,7 +138,10 @@ foreground with output redirected to a file (see SKILL.md → Rules).
 
 ## Watching
 
-- `rowt status`: mode, server, engine, proxy, reachability and the watchdog line.
+- `rowt status`: mode, server, engine, proxy, the escape lane's health (`escape:`, from the
+  watchdog's and the follower's last records; `--probe` fetches live) and the watchdog line.
+  `rowt status --json` is the same as one object, schema 1 (`status-json.md`): read
+  `.escape.state` and `.escape.reason`.
 - `rowt connections [lane|-w]`: live connections per lane.
 - `rowt metrics top [secs]`: the heaviest domains. The collector records per-domain
   bytes (`rowt metrics query "<SQL>"` is read-only).

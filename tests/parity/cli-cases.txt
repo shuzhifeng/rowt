@@ -321,11 +321,52 @@ PARITY_SCENARIO=router-up connections direct
 PARITY_SCENARIO=router-up conns block
 PARITY_SCENARIO=router-up connections nosuchlane
 PARITY_SCENARIO=router-up status
+# rowt #s41: `status` is passive — the escape block comes from what the
+# watchdog and the follower last recorded (watch.last, follow.last) — and
+# probes only when nothing fresh was observed (router-up: nothing recorded, so
+# it probes, gets no fixture answer, and says DOWN with a `probed now:` note)
+# or on --probe, which also brings back the via-proxy fetch. `--json` is
+# schema 1 (skills/rowt/references/status-json.md), built once in rowt-rs and
+# handed over by the shell, so the two are identical by construction — the
+# case keeps the hand-over itself honest (the trace, the exit status).
+PARITY_SCENARIO=router-up status --json
+PARITY_SCENARIO=router-up status --probe
+status --json
+status --bogus
+PARITY_SCENARIO=render-local status --json
+PARITY_SCENARIO=watch-pin-held status --json
 # The via-proxy probe got 000: curl's exit 28 (its own 8 s ran out) is a slow
-# link or a dead tunnel, anything else is no route. #s15.
-PARITY_SCENARIO=status-slow-tunnel status
+# link or a dead tunnel, anything else is no route. #s15. Behind --probe since
+# rowt #s41; the plain `status` on the same worlds probes the lane (no delay
+# fixture: DOWN) and never fetches through the proxy.
+PARITY_SCENARIO=status-slow-tunnel status --probe
+PARITY_SCENARIO=status-dead-tunnel status --probe
+PARITY_SCENARIO=status-slow-local status --probe
 PARITY_SCENARIO=status-dead-tunnel status
-PARITY_SCENARIO=status-slow-local status
+# The recorded worlds (their READMEs say why the stamps are in 2100): the
+# passive path, each verdict word and reason, the stale record that makes
+# `status` probe now, the follower's records, and the --json of each.
+PARITY_SCENARIO=status-observed-ok status
+PARITY_SCENARIO=status-observed-ok status --json
+PARITY_SCENARIO=status-observed-ok status --probe
+PARITY_SCENARIO=status-observed-degraded status
+PARITY_SCENARIO=status-observed-degraded status --json
+PARITY_SCENARIO=status-observed-down status
+PARITY_SCENARIO=status-observed-down status --json
+PARITY_SCENARIO=status-observed-slow status
+PARITY_SCENARIO=status-observed-slow status --json
+PARITY_SCENARIO=status-observed-offline status
+PARITY_SCENARIO=status-observed-offline status --json
+PARITY_SCENARIO=status-observed-stale status
+PARITY_SCENARIO=status-observed-stale status --json
+PARITY_SCENARIO=status-follow-standin status
+PARITY_SCENARIO=status-follow-standin status --json
+PARITY_SCENARIO=status-follow-alldead status
+PARITY_SCENARIO=status-follow-alldead status --json
+PARITY_SCENARIO=status-auto-observed status
+PARITY_SCENARIO=status-auto-observed status --json
+PARITY_SCENARIO=status-captive status
+PARITY_SCENARIO=status-captive status --json
 PARITY_SCENARIO=router-up explain example.com
 PARITY_SCENARIO=router-up router status
 

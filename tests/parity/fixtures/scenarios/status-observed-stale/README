@@ -1,0 +1,4 @@
+status-observed-stale — the watchdog's record is from 2000, older than the window (3 × ROWT_WATCH_INTERVAL):
+`status` probes now (Hong, #s42: "if there is no observed status, start a probe right away") — the
+delay fixture answers 90 ms — reports ok with source status and a `probed now:` note naming the stale
+record, and writes nothing: watch.last stays byte for byte (the config-tree compare checks that).

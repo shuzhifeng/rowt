@@ -29,6 +29,7 @@ mod skill;
 mod sources;
 mod vm;
 mod watch;
+mod status;
 mod seeds {
     include!(concat!(env!("OUT_DIR"), "/seeds.rs"));
 }
@@ -2095,6 +2096,21 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
         // classified by a process that outlives the CLI
         "status" => {
             let ctx = Ctx::new(cfg.clone());
+            // rowt #s41: `--json` (schema 1, see status.rs) and `--probe` (the
+            // live fetch rows, and a delay test now even when an observation is
+            // fresh). Anything else is the usage error the shell prints.
+            let mut json_out = false;
+            let mut probe = false;
+            for a in &rest {
+                match a.as_str() {
+                    "--json" => json_out = true,
+                    "--probe" => probe = true,
+                    _ => return Err(format!("usage: {PROG} status [--json] [--probe]")),
+                }
+            }
+            if json_out {
+                return Ok(status::json(&ctx, probe));
+            }
             let mut o = Vec::new();
             let mode = ctx.mode();
             if mode == "local" {
@@ -2268,7 +2284,11 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 o.push(format!("config:       host.json {}",
                     if ok { "OK".to_string() } else { format!("INVALID (run '{PROG} render')") }));
             }
-            if lifecycle::host_running(&ctx).is_some() {
+            // rowt #s41: the escape lane's health, from what the watchdog and
+            // the follower last observed — the `via proxy:` fetch only on
+            // `--probe` now (Hong, #s42: passive by default).
+            o.extend(status::rows(&ctx, probe));
+            if probe && lifecycle::host_running(&ctx).is_some() {
                 // 000 is no answer at all; curl's own exit 28 says its 8 s ran
                 // out, which on a slow link is not the same as a dead tunnel.
                 let (vc, rc) = lifecycle::curl_code_rc(&format!("http://127.0.0.1:{}", ctx.port), "https://www.google.com/");
@@ -2416,6 +2436,11 @@ fn main() -> ExitCode {
     // a helper call is not a command, and gets no preamble and no audit line.
     if args.first().map(|s| s.as_str()) == Some("_escape-dns") {
         return ExitCode::from(escape_dns::helper(&args[1..]) as u8);
+    }
+    // rowt #s41: the escape lane's health block and `status --json`, which
+    // bin/rowt reaches here for the same reason.
+    if args.first().map(|s| s.as_str()) == Some("_status") {
+        return ExitCode::from(status::helper(&args[1..]) as u8);
     }
     if args.first().map(|s| s.as_str()) == Some("_splitter") {
         let (Some(hl), Some(ld)) = (args.get(1), args.get(2)) else {

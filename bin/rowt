@@ -62,7 +62,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.8.5"
+ROWT_VERSION="3.8.6"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -5818,7 +5818,47 @@ _uplink_verdict() { # $1=mode
   fi
 }
 
+# rowt #s41: `status [--json] [--probe]`. The escape lane's health comes from
+# what the watchdog and the follower last observed (watch.last, follow.last);
+# `status` probes only when nothing fresh was observed, or on --probe, which
+# also brings back the live `via proxy:` fetch. One implementation, in rowt-rs
+# (status.rs): `--json` is handed over whole and the text block is fetched as
+# rows, the way the escape-name rows are (`_escape_dns`). The rowt-rs `status`
+# arm reads the same flags.
+_status_rs() { # $1 = rows | json  $2 = 1 to probe → rowt-rs's output; 1 when it did not answer
+  local rb v why rc out errf; rb="$(_rust_cli)" || rb=""
+  if [ -n "$rb" ]; then
+    # Captured, and printed only when it answered: a rowt-rs from before the arm
+    # existed (one found on PATH) prints its usage page to stdout, which would
+    # put half a help screen before the error — or, under --json, before
+    # nothing. Mirrors `_escape_dns`.
+    errf="$(mktemp)"
+    rc=0   # `set -e`: a failing substitution in a bare assignment would end the script here
+    if [ "${2:-0}" = 1 ]; then out="$("$rb" _status "$1" --probe --config-dir "$CFG" 2>"$errf")" || rc=$?
+    else out="$("$rb" _status "$1" --config-dir "$CFG" 2>"$errf")" || rc=$?; fi
+    if [ "$rc" -eq 0 ]; then
+      cat "$errf" >&2; rm -f "$errf"
+      [ -n "$out" ] && printf '%s\n' "$out"
+      return 0
+    fi
+    rm -f "$errf"
+    v="$("$rb" version 2>/dev/null | head -n 1)" || true; why="rowt-rs at $rb (${v:-no version}) did not answer (exit $rc)"
+  else
+    why="rowt-rs is not installed beside $PROG"
+  fi
+  if [ "$1" = json ]; then
+    err "status --json needs rowt-rs: $why — reinstall or rebuild rowt-rs"
+  else
+    printf '%-14s%s\n' "escape:" "not assessed — $why; reinstall or rebuild rowt-rs"
+  fi
+  return 1
+}
 cmd_status() {
+  local json=0 probe=0 a
+  for a in "$@"; do
+    case "$a" in --json) json=1 ;; --probe) probe=1 ;; *) die "usage: $PROG status [--json] [--probe]" ;; esac
+  done
+  if [ "$json" = 1 ]; then _status_rs json "$probe"; return $?; fi
   local mode; mode="$(sget mode)"; mode="${mode:-?}"
   if [ "$mode" = "local" ]; then
     echo "mode:         local  (no tunnel — the escape lane routes direct)"
@@ -5898,7 +5938,11 @@ cmd_status() {
   if [ -x "$SB" ] && [ -f "$HOST_CFG" ]; then
     "$SB" check -c "$HOST_CFG" >/dev/null 2>&1 && echo "config:       host.json OK" || echo "config:       host.json INVALID (run '$PROG render')"
   fi
-  if host_running; then
+  # rowt #s41: the escape lane's health, from what the watchdog and the
+  # follower last observed — the `via proxy:` fetch only on --probe now
+  # (Hong, #s42: passive by default).
+  _status_rs rows "$probe" || true
+  if [ "$probe" = 1 ] && host_running; then
     # 000 is no answer at all; curl's own exit 28 says its 8 s ran out, which
     # on a slow link is not the same as a dead tunnel.
     local vc vrc=0 why=""
@@ -7783,7 +7827,7 @@ o@lifecycle@skill <install|uninstall|status|recipe> [--store]@link the rowt agen
 o@lifecycle@restart@bounce the tunnel in place (no re-render / proxy change)
 c@lifecycle@reload@re-apply after a network switch (re-render + restart + proxy)
 o@lifecycle@watch <install|uninstall|status|refresh>@auto-reload on net change; captive-portal handling; clears a stale proxy at login
-c@lifecycle@status@state + config validity + reachability
+c@lifecycle@status [--json] [--probe]@state, config validity, the escape lane's health as last observed (--probe: fetch live; --json: one object, schema 1, for agents)
 o@lifecycle@explain <domain|ip>@explain a destination's lane (escape / corp / direct)
 o@lifecycle@speed [url …]@sustained throughput per lane, proxied vs bypassed (catches a lane that is reachable but too slow to use)
 o@lifecycle@connections [lane|-w]@live view: active connections + which lane each is on
@@ -8007,9 +8051,21 @@ EOF
 $PROG status — at-a-glance state and health.
 
 Shows mode, server count + selected/active server, the host-router pid/port, the
-system-proxy state, the routing buckets, sing-box config validity, and a live
-'via proxy' reachability check. For what's AROUND rowt — other VPN apps, who holds
-its ports, a PAC, what answers where — see '$PROG doctor'.
+system-proxy state, the routing buckets, sing-box config validity, and the
+escape lane's health ('escape:') as rowt last observed it — the watchdog's and
+the follower's records, not a fetch of its own: ok, degraded, holding, DOWN or
+unknown, with the reason, since when, and each server's last test ('members:').
+When nothing fresh was observed it makes one try of the watchdog's delay test
+at once and says so ('probed now:').
+For what's AROUND rowt — other VPN apps, who holds its ports, a PAC, what
+answers where — see '$PROG doctor'.
+
+  --probe   probe now regardless, and fetch through the proxy live ('via proxy:',
+            and on failure 'uplink:' — whose fault a dead lane is)
+  --json    the same facts as one JSON object with a stable schema (1), for
+            agents and fleet checks: .escape.state is the word above. Needs
+            rowt-rs; exits 0 whenever it could report. Keys: the rowt skill,
+            references/status-json.md.
 
 In auto: the server sing-box's urltest is on, how often it re-tests (and
 whether that came from 'use auto --every'), the failover follower, and its

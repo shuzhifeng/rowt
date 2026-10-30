@@ -773,6 +773,31 @@ as the only VPN, "direct" just meant "off my tunnel". escape splits that
   *before* that command's `BEGIN` rather than blamed on it. A no-op logs
   nothing: the tick runs every two minutes.
 
+### What `status` says about the escape lane, and why it does not look itself
+
+`rowt status` used to fetch through the proxy every time it ran — eight
+seconds when the tunnel was dead, one sample, and not what rowt acts on. The
+watchdog's streak is what rowt acts on, so since rowt #s41 `status` reports
+that. Each tick records its probe in `watch.last` and each follower round in
+`follow.last` (`rowt_core::status::Obs`: stamp, source, target, result, delay,
+`last_ok_at`, `ok_since`, `fail_since`, eight `key=value` lines; the stamps are
+the wall-clock form, never an epoch); `status` reads the fresher record — fresh
+is within three watchdog intervals, one-sided, so a stamp in the future counts
+(a fixture's way to be "just observed"; on a real box the next tick overwrites
+it) — and `rowt_core::status::verdict` turns it into one of five words with a
+reason, in a fixed order: local mode, a stopped router, a captive portal and
+the watchdog's hold settle it before any record is read. With nothing fresh,
+`status` makes one try of the watchdog's delay test at once (Hong, #s42) and reports it
+as `source: status`, never writes it: the records are the watchdog's and the
+follower's, and a read command that wrote one would race the tick and leave a
+cache a second `status` would trust for six minutes. `--probe` forces that
+probe and brings back the live fetch. `--json` is the same facts as one object
+(schema 1, additive), built once in rowt-rs; bin/rowt hands `--json` over and
+fetches the text block as rows (`rowt-rs _status`), the way it reaches the
+escape-name check, so there is one copy of the verdict. The watchdog's knobs
+it reads — the tick interval, the streak limit — are the installed agent's
+(its plist), not the caller's environment: `watch install` bakes `ROWT_*` in.
+
 ## 11. Captive portals: detection, drop, restore
 
 Public hotspots (airports, hotels, lounges) gate internet access behind a login

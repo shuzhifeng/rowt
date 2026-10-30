@@ -1,0 +1,1 @@
+{"proxies":{"alpha":{"type":"VLESS","name":"alpha","history":[{"time":"2100-01-01T00:00:00Z","delay":140}]},"beta":{"type":"VLESS","name":"beta","history":[{"time":"2100-01-01T00:00:00Z","delay":95}]},"escape":{"type":"Selector","name":"escape","now":"alpha","all":["alpha","beta"],"history":[]}}}

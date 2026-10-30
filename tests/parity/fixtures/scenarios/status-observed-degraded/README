@@ -1,0 +1,6 @@
+status-observed-degraded — alpha pinned, the watchdog's last probe failed and the streak is 2 of 3:
+degraded, reason probe-failing, failing since the record's fail_since, last ok as recorded.
+The stamps are in 2100 so the record counts as fresh whenever the gate runs (freshness is one-sided: a
+future stamp is fresh; on a real box the next tick overwrites it within an interval). Both sides read the
+same files and make the same clash API reads, and for the plain `status` neither probes: the trace
+shows no delay test (`--probe`, where a case has it, is the exception).

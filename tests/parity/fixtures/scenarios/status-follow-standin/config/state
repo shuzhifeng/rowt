@@ -1,0 +1,8 @@
+mode=host
+selected=alpha
+proxy_intent=on
+intent=up
+boot=1700000000
+clash_secret=PARITYFIXTURESECRET00000
+failover=1
+failover_switch=2100-01-01 00:00:00 alpha -> beta

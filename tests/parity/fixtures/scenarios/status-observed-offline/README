@@ -1,0 +1,6 @@
+status-observed-offline — the watchdog found the NIC without an address and recorded offline:
+DOWN, reason offline, last ok as recorded.
+The stamps are in 2100 so the record counts as fresh whenever the gate runs (freshness is one-sided: a
+future stamp is fresh; on a real box the next tick overwrites it within an interval). Both sides read the
+same files and make the same clash API reads, and for the plain `status` neither probes: the trace
+shows no delay test (`--probe`, where a case has it, is the exception).

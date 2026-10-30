@@ -256,11 +256,11 @@ replaced**, run `rowt fetch host` (with a working path to GitHub) or `rowt reloa
 - **Measure CPU over an interval**: compare `ps -o time=` about 15 s apart. Never use
   `ps %CPU`, which is a decaying average.
 
-## Everyday: see `references/everyday.md`
+## Everyday: see `references/everyday.md` (and `references/status-json.md` for `rowt status --json`, schema 1)
 
 | need | command |
 |---|---|
-| is it working | `rowt status` · `rowt proxy check` · `rowt connections [lane]` |
+| is it working | `rowt status` (passive: the `escape:` row is the watchdog's last look; `--probe` fetches live) · `rowt status --json` (`.escape.state`: ok, degraded, holding, down, unknown) · `rowt proxy check` · `rowt connections [lane]` |
 | why that lane | `rowt explain <domain\|ip>` · `rowt escape errors` / `rowt direct errors` (candidates for escape) |
 | route a site | `rowt escape\|corp\|block\|hotspot add <entry>` (one lane per entry) · `geosite:<name>` (escape and block only) |
 | after a network change | automatic with the watchdog; otherwise `rowt reload` |

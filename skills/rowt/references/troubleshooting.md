@@ -7,10 +7,20 @@
    - `router:` running or not;
    - `engine:` pinned, or KNOWN BAD;
    - `system proxy:` and `config:`;
-   - `via proxy:` a real fetch through the escape lane, 8 s budget. `HTTP 000 … no answer
-     within 8s` is a slow link or a dead tunnel (check `rowt connections` for live
-     traffic before concluding which); `tunnel not reachable` failed outright;
-   - `uplink:` (printed only after a failed `via proxy:`): the same path with the
+   - `escape:` the lane's health as rowt last observed it (the watchdog's probe every
+     120 s, the follower's test every 15 s): `ok`, `degraded` (failing but under the
+     watchdog's limit, or slow), `holding` (a dead pinned server; the row names the
+     remedy), `DOWN` (the streak reached the limit, no server answered the follower,
+     offline, the router stopped, a captive portal), with since when and the last ok.
+     `probed now:` means nothing fresh was observed, so status made one try of the
+     watchdog's delay test itself. `members:`
+     is each server's last delay test. The same as JSON: `rowt status --json`
+     (`status-json.md`), `.escape.state` and `.escape.reason`;
+   - `via proxy:` (with `--probe`) a real fetch through the escape lane, 8 s budget.
+     `HTTP 000 … no answer within 8s` is a slow link or a dead tunnel (check
+     `rowt connections` for live traffic before concluding which); `tunnel not
+     reachable` failed outright;
+   - `uplink:` (with `--probe`, after a failed `via proxy:`): the same path with the
      router out of it — the captive-probe host fetched unproxied over the physical
      NIC, then a ping at that NIC's gateway. It names one of three faults: the
      **tunnel** (`rowt restart`, or another server), a **login page** (`rowt proxy

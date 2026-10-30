@@ -1061,6 +1061,8 @@ pub fn cmd_revert(ctx: &Ctx, here: &Path) -> Result<String, String> {
     // started against some other config — the high-CPU orphan this is for.
     pkill(&format!("{} run", ctx.sb().display()));
     let _ = fs::remove_file(ctx.pidfile());
+    // rowt #s36: nothing is holding while nothing runs.
+    let _ = fs::remove_file(ctx.cfg.join("watch.hold"));
     eprintln!("==> stopped — system proxy off, sing-box down (servers kept at {}).",
               ctx.cfg.join("servers.json").display());
     Ok(String::new())
@@ -1072,6 +1074,8 @@ pub fn cmd_reload(ctx: &Ctx, here: &Path) -> Result<String, String> {
         return Err(format!("nothing to reload — run '{} up' first", crate::PROG));
     }
     eprintln!("==> reloading for the current network…");
+    // rowt #s36: any reload is a fresh start for the watchdog's hold.
+    let _ = fs::remove_file(ctx.cfg.join("watch.hold"));
     if ctx.sget("mode") == "vm" && crate::vm::vm_running() {
         // re-detects the VM's bridged IP, re-renders, re-pushes the guest
         say(&crate::vm::cmd(ctx, here, "up")?);

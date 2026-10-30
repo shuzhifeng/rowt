@@ -1,0 +1,8 @@
+watch-pin-udp — never hold on ignorance: alpha is a hysteria2 server, carried
+over UDP, so a TCP connect says nothing about it and the tick asks none (the
+curl fixture for 203.0.113.10:443 says "timed out", and is never consulted).
+
+Same world as watch-pin-dead otherwise; the recovery stamp in 2100 makes the
+cooldown hold the reload off. What the gate pins: no watch.hold and no
+watchdog-hold audit line in the config tree (ticks skip the argv compare and
+log/ is not compared, so the cooldown line itself is not asserted).

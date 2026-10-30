@@ -48,11 +48,11 @@ fn render(a: &Action) -> String {
 
 fn run() -> Result<String, String> {
     let mut args = std::env::args().skip(1);
-    let (mut obs_path, mut phase) = (None::<String>, "guard".to_string());
+    let (mut obs_path, mut phase, mut phase_given) = (None::<String>, "guard".to_string(), false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--obs" => obs_path = args.next(),
-            "--phase" => phase = args.next().unwrap_or_else(|| "guard".into()),
+            "--phase" => { phase = args.next().unwrap_or_else(|| "guard".into()); phase_given = true; }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -60,6 +60,15 @@ fn run() -> Result<String, String> {
     let body = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
     let v: Value = serde_json::from_str(&body).map_err(|e| format!("{path}: {e}"))?;
 
+    // A case file may name its phase (`"_phase": "netcheck"`): `watch-diff`
+    // runs every case without `--phase`, and until rowt #s36 that meant every
+    // case was a guard case — the netcheck decisions (the health streak, the
+    // holds, recovery) had no gate of this kind.
+    if !phase_given {
+        if let Some(ph) = v.get("_phase").and_then(|x| x.as_str()) {
+            phase = ph.to_string();
+        }
+    }
     let o = v.get("obs").unwrap_or(&v);
     let obs = Observation {
         proxy_intent: s(o, "proxy_intent"),
@@ -86,6 +95,13 @@ fn run() -> Result<String, String> {
         // Absent in a fixture means no flow was seen, which is what every
         // case written before this field existed describes.
         health_flows: o.get("health_flows").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        // rowt #s36. Absent in a fixture means not pinned and nothing
+        // measured, which is what every case written before these existed
+        // describes; `pinned_reach` is a JSON null when the shell did not probe.
+        pinned: opt(o, "pinned"),
+        pinned_addr: s(o, "pinned_addr"),
+        pinned_reach: o.get("pinned_reach").and_then(|x| x.as_bool()),
+        hold_stamp: s(o, "hold_stamp"),
         now: o.get("now").and_then(|x| x.as_i64()).unwrap_or(0),
     };
     let empty = Value::Object(Default::default());
@@ -96,6 +112,10 @@ fn run() -> Result<String, String> {
         last_net_id: opt(sv, "last_net_id"),
         last_recovery: sv.get("last_recovery").and_then(|x| x.as_i64()).unwrap_or(0),
         last_net_change: sv.get("last_net_change").and_then(|x| x.as_i64()).unwrap_or(0),
+        hold: match (opt(sv, "hold_since"), opt(sv, "hold_tag")) {
+            (Some(since), Some(tag)) if !tag.is_empty() => Some(rowt_core::watch::Hold { since, tag }),
+            _ => None,
+        },
     };
 
     let cfg = Config::default();

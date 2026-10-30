@@ -56,3 +56,10 @@ PARITY_SCENARIO=captive-no-dns watch tick | captive portal detected — dropping
 # say what the NIC and its gateway answered, in rowt status's own words — not
 # reload, which is what this world got before.
 PARITY_SCENARIO=watch-no-exit ROWT_CAPTIVE_URL=http://127.0.0.1:9/x watch tick | nothing answers over en0, not even its gateway
+# rowt #s36: a dead pinned server holds instead of reloading, said in full on
+# the first tick and in one line after. The alive and udp worlds (the arm NOT
+# firing) are cli-diff cases only: their 2100 recovery stamp lands on the
+# cooldown line, whose "N s ago" is the shell's clock against the planner's.
+PARITY_SCENARIO=watch-pin-dead ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick | so the watchdog holds instead of reloading
+PARITY_SCENARIO=watch-pin-dead-name ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick | 203.0.113.10:443 does not accept a TCP connection over en0
+PARITY_SCENARIO=watch-pin-held ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick | pinned server alpha still dead

@@ -1,0 +1,10 @@
+watch-pin-alive — the regression guard for #s36: a pinned server that ACCEPTS a
+TCP connection while the tunnel probe fails is a wedged router, not a dead
+server, and recovery runs as it always did.
+
+Same world as watch-pin-dead, but the direct connect to 203.0.113.10:443 is
+answered (no .rc, so the shim exits 0). The recovery stamp (watch.restart) sits
+in 2100, so the cooldown holds the reload off and the tick stays quick and its
+tree deterministic: what the case pins is that the pinned-dead arm did NOT
+fire — no watch.hold and no watchdog-hold audit line (log/ is not compared,
+so the cooldown line itself is not asserted).

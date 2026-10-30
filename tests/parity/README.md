@@ -265,9 +265,9 @@ reconcile and the watchdog's decision table. Each has a gate:
 | `merge-diff` | the review FILE, plus the streams, vs the Python | 1,500 generated cases |
 | `foreign-diff` | stdout + stderr + exit status, over client config TREES | 1,200 generated cases |
 | `sr-diff` | stdout + stderr + exit status, over Shadowrocket installs | 1,200 generated cases |
-| `watch-diff` | decisions, read back from watch.log + trace | 6 cases |
+| `watch-diff` | decisions, read back from watch.log + trace; a case file names its phase with `_phase` (`guard` unless it says `netcheck`) | 8 cases |
 | `platform-diff` | the argv the platform layer produces | 12 cases |
-| `cli-diff` | stdout, status, the config tree + rc files + LaunchAgent plist (content + mode), argv trace, audit log | 461 cases |
+| `cli-diff` | stdout, status, the config tree + rc files + LaunchAgent plist (content + mode), argv trace, audit log | 469 cases |
 
 `merge-diff` is the only gate whose primary artifact is a file written in
 place: `cmd_import` reads the accumulation straight back with jq, and a human

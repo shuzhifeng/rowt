@@ -588,7 +588,29 @@ as the only VPN, "direct" just meant "off my tunnel". escape splits that
   `ROWT_HEALTH_COOLDOWN` (default 600s) and **verified by a re-probe** so a
   start-then-crash isn't logged as success:
   - *Wedged* (router up, not carrying traffic): after `ROWT_HEALTH_FAILS`
-    (default 3) consecutive probe failures.
+    (default 3) consecutive probe failures — unless the **pinned server itself
+    is dead** (rowt #s36). `use <tag>` means that server and no other, so a
+    reload renders the same config and restarts the router onto the same dead
+    server, cutting the corp and direct lanes for nothing (2026-10-30: thirteen
+    such reloads in half an hour). The tunnel probe cannot tell a dead server
+    from a wedged router, so at the decision the tick asks one more question: a
+    direct TCP connect from the NIC to the server's address (`tcp_reaches`, the
+    `probe` command's test), which never passes through sing-box. Refused or
+    timed out, the watchdog **holds**: it writes `watch.hold` (`<utc stamp>\t<tag>`),
+    logs once that the server is dead and that `rowt use auto` fails over by
+    itself, puts one line in the audit log, and says so in `rowt status`
+    (`escape:` row); later ticks add one short line each. Accepted, the router
+    is what is stuck and the reload runs as before. The hold ends when the probe
+    answers, when the selection moves (another pin, `auto`, `best`), or with
+    any reload, a `rowt down`, a new `use` or `watch uninstall`. The address
+    is an IPv4 literal as written, or for a name the escape-hosts answer (what
+    sing-box dials); a server carried over UDP (hysteria2, tuic), one with no
+    usable port, or a name rowt has not checked (the system resolver could
+    answer differently from dns-direct) gives no such evidence and recovers
+    as before — never hold on ignorance. `auto` and `best` re-pick by
+    themselves and are not held here. A pin rowt itself made — the first
+    server, after an import or a subscription update removed the selected one
+    — is held like any other: manual stays manual, whoever chose the tag.
   - *Crashed* (router down): only when the user's intent is **up** and it is the
     same boot the router was started in — a reboot or a deliberate `rowt down`
     never resurrects it (rowt has no auto-start). Intent is tracked in `state`

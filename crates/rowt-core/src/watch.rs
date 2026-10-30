@@ -103,6 +103,27 @@ pub struct Observation {
     /// pending. Only ever read when the patient probe failed as well, so a
     /// healthy tick pays nothing for it.
     pub health_flows: u32,
+    /// The escape selection when it is ONE concrete server (`use <tag>`) in
+    /// host mode: the pinned tag. None under `auto` and `best`, which re-pick
+    /// by themselves, and in local or vm mode, where there is no selector here.
+    pub pinned: Option<String>,
+    /// That server as the physical NIC would dial it, `ip:port` — the
+    /// escape-hosts answer for a name, else the system resolver's — or "" when
+    /// no address is known or the protocol is not carried by TCP (hysteria2,
+    /// tuic), where a TCP connect says nothing.
+    pub pinned_addr: String,
+    /// A direct TCP connect from the NIC to `pinned_addr`, bypassing sing-box:
+    /// Some(false) is the one piece of evidence that separates a dead SERVER
+    /// from a wedged router, since the tunnel probe fails the same way for
+    /// both. Measured only at the recovery decision, like `health_slow` and
+    /// `health_flows`, so a healthy tick pays nothing; None = not measured, or
+    /// nothing to measure (no `pinned_addr`), and recovery runs as before —
+    /// never hold on ignorance (rowt #s36).
+    pub pinned_reach: Option<bool>,
+    /// `date -u '+%Y-%m-%d %H:%M:%S'` at this tick: the stamp a hold that
+    /// begins now is written with. An input rather than derived from `now`,
+    /// so both implementations stamp with the same program.
+    pub hold_stamp: String,
     pub now: i64,
 }
 
@@ -125,6 +146,23 @@ pub struct State {
     /// streak takes three ticks to build, so by the time recovery is even
     /// considered the move that caused the portal is already minutes old.
     pub last_net_change: i64,
+    /// rowt #s36: the watchdog is HOLDING instead of reloading, because the
+    /// pinned server itself is dead and a reload would render the same config
+    /// and restart the router onto the same dead server (2026-10-30: thirteen
+    /// such reloads in half an hour, each cutting the corp and direct lanes
+    /// too). Persisted as `watch.hold` ("<utc stamp>\t<tag>") so `rowt
+    /// status` can say so and the warning is written once per hold, not once
+    /// per tick. Retired when the probe answers, when the selection changes,
+    /// and by any reload.
+    pub hold: Option<Hold>,
+}
+
+/// A watchdog hold on a dead pinned server: when it began and which server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hold {
+    /// `date -u '+%Y-%m-%d %H:%M:%S'` when the hold began.
+    pub since: String,
+    pub tag: String,
 }
 
 #[derive(Debug, Clone)]
@@ -235,15 +273,24 @@ fn suspect_whitelisted_portal(obs: &Observation, st: &State) -> bool {
 }
 
 fn hold_for_network(obs: &Observation, fails: u32, cfg: &Config) -> bool {
+    would_hold_for_network(obs.captive_check_disabled, obs.captive, fails, cfg)
+}
+
+/// `hold_for_network` on its three inputs alone, so the tick can ask it BEFORE
+/// the observation is complete: the direct probe of a pinned server (rowt #s36)
+/// is only worth making when this would not hold anyway — a dead gateway says
+/// nothing about the server — and the shell applies the same condition, or the
+/// two would disagree about the argv a tick produces.
+pub fn would_hold_for_network(captive_check_disabled: bool, captive: Option<CaptiveState>, fails: u32, cfg: &Config) -> bool {
     // (a), the floor. With the check off every verdict is `unknown` by
     // construction, so the rule would read "never recover" — silently
     // disabling self-healing for anyone who turned portal detection off, which
     // is a far worse failure than one wasted reload.
-    if obs.captive_check_disabled {
+    if captive_check_disabled {
         return false;
     }
     // The evidence recovery is waiting for.
-    if obs.captive == Some(CaptiveState::Clear) {
+    if captive == Some(CaptiveState::Clear) {
         return false;
     }
     // (a), the escape hatch. Note this can only be reached while the tunnel is
@@ -267,6 +314,19 @@ fn hold_for_network(obs: &Observation, fails: u32, cfg: &Config) -> bool {
     true
 }
 
+/// rowt #s36: is the pinned server itself dead? Only a measured `Some(false)`
+/// says so: the tag it names and the NIC the connect was made from, for the
+/// words of the hold. None of the other states — not pinned, no address, a UDP
+/// server, a connect that reached it — hold anything.
+fn pinned_dead(obs: &Observation) -> Option<(&str, &str)> {
+    match (&obs.pinned, obs.pinned_reach) {
+        (Some(tag), Some(false)) if !obs.pinned_addr.is_empty() => {
+            Some((tag.as_str(), obs.iface.as_deref().unwrap_or("the NIC")))
+        }
+        _ => None,
+    }
+}
+
 /// `_watch_recover`'s cooldown: too soon after the last one and it only says so.
 fn recover_or_hold(
     actions: &mut Vec<Action>,
@@ -285,6 +345,10 @@ fn recover_or_hold(
     }
     st.last_recovery = obs.now;
     st.health_fails = 0;
+    // A reload is a fresh start for the hold as well (`_watch_recover` removes
+    // `watch.hold` beside `watch.health`): if the server is still dead, the
+    // next streak says so again with a new stamp.
+    st.hold = None;
     // `_watch_recover` logs before it acts, so the decision is visible even if
     // the reload then fails. Without this the shell writes a line the plan does
     // not, and every real recovery would read as a divergence.
@@ -456,12 +520,19 @@ pub fn netcheck(obs: &Observation, st: &State, cfg: &Config) -> Outcome {
         // local mode has no tunnel to probe; leaving this on would fail every tick
         // and drive recovery into a permanent reload loop.
         if obs.mode != "local" {
+            // A hold names the server it is about. Pinned elsewhere now, or on
+            // `auto`/`best`: that hold is over, whatever this tick finds.
+            if s.hold.as_ref().is_some_and(|h| obs.pinned.as_deref() != Some(h.tag.as_str())) {
+                s.hold = None;
+            }
             if obs.iface.is_none() {
                 // Offline: a restart cannot help, and a returning network fires its
                 // own tick. Reset the streak and wait.
                 s.health_fails = 0;
             } else if obs.health_ok {
                 s.health_fails = 0;
+                // The server answers again: the hold is over.
+                s.hold = None;
             } else {
                 s.health_fails += 1;
                 if s.health_fails < cfg.health_fails {
@@ -514,6 +585,39 @@ pub fn netcheck(obs: &Observation, st: &State, cfg: &Config) -> Outcome {
                             format!("nothing answers over {nic}, not even its gateway ({n} consecutive probe failures, captive={cap}) \
                                      — the network is down or walled, not the tunnel; a reload cannot fix this, holding off recovery")
                         }));
+                    } else if let Some((tag, nic)) = pinned_dead(obs) {
+                        // rowt #s36 (Hong, #s35 option 1): the pinned server
+                        // ITSELF is dead — a direct TCP connect from the NIC,
+                        // which never passes through sing-box, cannot reach it
+                        // — so a reload would render the same config (nothing
+                        // else moved: `need` is false, and every command that
+                        // changes a render input renders) and restart the
+                        // router onto the same dead server, cutting the corp
+                        // and direct lanes for nothing. Manual stays manual:
+                        // hold, and say what to do instead. Said in full once
+                        // per hold, with an audit line; a short line per tick
+                        // after that, like the cooldown hold. A server that
+                        // DOES accept TCP while the tunnel probe fails is a
+                        // wedged router, and recovers below as it always did.
+                        let addr = &obs.pinned_addr;
+                        if s.hold.as_ref().is_some_and(|h| h.tag == tag) {
+                            a.push(Action::Log(format!(
+                                "pinned server {tag} still dead ({addr} does not accept a TCP connection over {nic}, \
+                                 {n} consecutive probe failures) — holding, not reloading; 'rowt use auto' fails over by itself"
+                            )));
+                        } else {
+                            a.push(Action::Log(format!(
+                                "pinned server {tag} is dead: {addr} does not accept a TCP connection over {nic} \
+                                 ({n} consecutive probe failures) — a reload would render the same config and restart \
+                                 the router onto the same dead server, so the watchdog holds instead of reloading; \
+                                 'rowt use auto' fails over by itself, or pin another server with 'rowt use <other>'"
+                            )));
+                            a.push(Action::Audit(format!(
+                                "watchdog hold: pinned server {tag} is dead ({addr} does not accept a TCP connection over {nic}) \
+                                 — not reloading; 'rowt use auto' fails over by itself"
+                            )));
+                            s.hold = Some(Hold { since: obs.hold_stamp.clone(), tag: tag.to_string() });
+                        }
                     } else {
                         // Once per streak, not once per tick: the streak only
                         // grows from here while a cooldown holds recovery off.
@@ -595,8 +699,131 @@ mod tests {
             health_ok: true,
             health_slow: false,
             health_flows: 0,
+            pinned: None,
+            pinned_addr: String::new(),
+            pinned_reach: None,
+            hold_stamp: "2026-10-30 09:00:00".into(),
             now: 1_000_000,
         }
+    }
+
+    /// rowt #s36: `use <tag>` on a server that is dead, as the 2026-10-30
+    /// outage: the tunnel probe fails, the slow probe and the flows say
+    /// nothing, the network is clear, and a direct TCP connect from the NIC
+    /// cannot reach the server either.
+    fn pinned_dead_tick() -> Observation {
+        let mut o = running();
+        o.health_ok = false;
+        o.health_slow = false;
+        o.health_flows = 0;
+        o.pinned = Some("alpha".into());
+        o.pinned_addr = "203.0.113.10:443".into();
+        o.pinned_reach = Some(false);
+        o
+    }
+
+    /// The hold replaces the reload: no `Recover`, the warning names the
+    /// server, the address, the NIC and the remedy, the audit log gets one
+    /// line, and the state carries the hold with this tick's stamp.
+    #[test]
+    fn a_dead_pinned_server_is_held_not_reloaded() {
+        let cfg = Config::default();
+        let st = State { health_fails: cfg.health_fails - 1, ..State::default() };
+        let r = netcheck(&pinned_dead_tick(), &st, &cfg);
+        assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover(_))), "{:?}", r.actions);
+        let l = logs(&r);
+        assert!(l.iter().any(|m| m.starts_with("pinned server alpha is dead: 203.0.113.10:443 does not accept a TCP connection over en0 (3 consecutive probe failures)")
+                                  && m.contains("holds instead of reloading") && m.contains("'rowt use auto' fails over by itself")), "{l:?}");
+        assert!(r.actions.iter().any(|a| matches!(a, Action::Audit(m) if m.starts_with("watchdog hold: pinned server alpha is dead"))), "{:?}", r.actions);
+        assert_eq!(r.state.hold, Some(Hold { since: "2026-10-30 09:00:00".into(), tag: "alpha".into() }));
+        // The streak keeps counting: this is not positive evidence of health.
+        assert_eq!(r.state.health_fails, 3);
+        assert_eq!(r.state.last_recovery, 0, "no recovery stamp: nothing was reloaded");
+    }
+
+    /// Once held, a tick says so in one short line and changes nothing: no
+    /// second warning, no audit line, the stamp as it was.
+    #[test]
+    fn a_hold_in_progress_logs_one_short_line_and_keeps_its_stamp() {
+        let cfg = Config::default();
+        let hold = Hold { since: "2026-10-30 08:50:00".into(), tag: "alpha".into() };
+        let st = State { health_fails: 7, hold: Some(hold.clone()), ..State::default() };
+        let r = netcheck(&pinned_dead_tick(), &st, &cfg);
+        assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover(_) | Action::Audit(_))), "{:?}", r.actions);
+        let l = logs(&r);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("pinned server alpha still dead (203.0.113.10:443 does not accept a TCP connection over en0, 8 consecutive probe failures) — holding, not reloading"), "{l:?}");
+        assert_eq!(r.state.hold, Some(hold));
+    }
+
+    /// The hold needs the evidence, not the pin: a server that accepts a TCP
+    /// connection while the tunnel probe fails is a wedged router and is
+    /// reloaded as before; so is one nothing could be measured about (a UDP
+    /// server, no address), and so is `auto`, which the follower owns.
+    #[test]
+    fn without_evidence_that_the_server_is_dead_recovery_runs_as_before() {
+        let cfg = Config::default();
+        let st = State { health_fails: cfg.health_fails - 1, ..State::default() };
+        let mut alive = pinned_dead_tick();
+        alive.pinned_reach = Some(true);
+        let mut unknown = pinned_dead_tick();
+        unknown.pinned_reach = None;
+        unknown.pinned_addr = String::new();
+        let mut auto = pinned_dead_tick();
+        auto.pinned = None;
+        auto.pinned_addr = String::new();
+        auto.pinned_reach = None;
+        for (name, o) in [("alive", alive), ("unknown", unknown), ("auto", auto)] {
+            let r = netcheck(&o, &st, &cfg);
+            assert!(r.actions.iter().any(|a| matches!(a, Action::Recover(_))), "{name}: {:?}", r.actions);
+            assert!(!logs(&r).iter().any(|m| m.contains("pinned server")), "{name}: {:?}", logs(&r));
+            assert_eq!(r.state.hold, None, "{name}");
+        }
+    }
+
+    /// A reload — the cooldown having passed — retires the hold along with the
+    /// streak, and a hold left from before survives a cooldown tick untouched.
+    #[test]
+    fn a_recovery_retires_the_hold() {
+        let cfg = Config::default();
+        let hold = Hold { since: "2026-10-30 08:50:00".into(), tag: "alpha".into() };
+        let mut alive = pinned_dead_tick();
+        alive.pinned_reach = Some(true);
+        let st = State { health_fails: 7, hold: Some(hold.clone()), ..State::default() };
+        let r = netcheck(&alive, &st, &cfg);
+        assert!(r.actions.iter().any(|a| matches!(a, Action::Recover(_))), "{:?}", r.actions);
+        assert_eq!(r.state.hold, None);
+        let cooling = State { health_fails: 7, hold: Some(hold.clone()), last_recovery: alive.now - 10, ..State::default() };
+        let r = netcheck(&alive, &cooling, &cfg);
+        assert!(logs(&r).iter().any(|m| m.contains("holding off")), "{:?}", logs(&r));
+        assert_eq!(r.state.hold, Some(hold));
+    }
+
+    /// The hold is about one server: it ends when that server answers, and
+    /// when the selection moves off it — to another pin or to `auto` — even
+    /// on a tick that decides nothing else.
+    #[test]
+    fn the_hold_ends_when_the_server_answers_or_the_selection_moves() {
+        let cfg = Config::default();
+        let hold = Hold { since: "2026-10-30 08:50:00".into(), tag: "alpha".into() };
+        let st = State { health_fails: 7, hold: Some(hold.clone()), ..State::default() };
+        let mut answers = pinned_dead_tick();
+        answers.health_ok = true;
+        answers.pinned_reach = None;
+        assert_eq!(netcheck(&answers, &st, &cfg).state.hold, None, "answered");
+        let mut moved = pinned_dead_tick();
+        moved.pinned = Some("beta".into());
+        moved.pinned_addr = "203.0.113.11:8443".into();
+        let r = netcheck(&moved, &st, &cfg);
+        assert_eq!(r.state.hold, Some(Hold { since: "2026-10-30 09:00:00".into(), tag: "beta".into() }), "a new hold on the new pin, {:?}", r.actions);
+        let mut auto = pinned_dead_tick();
+        auto.pinned = None;
+        auto.pinned_addr = String::new();
+        auto.pinned_reach = None;
+        let early = State { health_fails: 0, hold: Some(hold), ..State::default() };
+        let r = netcheck(&auto, &early, &cfg);
+        assert_eq!(r.state.hold, None, "moved to auto: {:?}", r.actions);
+        assert!(!r.actions.iter().any(|a| matches!(a, Action::Recover(_))), "a first failure under auto only counts: {:?}", r.actions);
     }
 
     /// #48: a link whose round trip sits ON the probe timeout fails every

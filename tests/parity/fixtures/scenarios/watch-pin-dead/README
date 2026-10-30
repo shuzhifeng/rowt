@@ -1,0 +1,20 @@
+watch-pin-dead — rowt #s36 (Hong, #s35 option 1): the 2026-10-30 outage, the
+pinned server dead.
+
+The router is up (host.pid.self), the system proxy points at it, the machine
+has not moved (watch.net holds this sandbox's net id), and the escape selection
+is ONE server: state says selected=alpha and the selector agrees. watch.health
+seeds a streak of two, so this tick is the third failed tunnel probe: the clash
+delay URL has no fixture, the slower confirmation probe fails the same way, and
+the connection list is empty (no fresh flow). The captive probe is pointed at
+http://127.0.0.1:8099/success, so the network is CLEAR and nothing holds
+recovery for the network's sake. Then the one more question: a direct TCP
+connect from the NIC to alpha, 203.0.113.10:443, which times out (curl 28 in
+the .rc file) — the server itself is dead.
+
+Expected: no reload. The tick writes watch.hold ("<utc stamp><TAB>alpha"),
+logs "pinned server alpha is dead: 203.0.113.10:443 does not accept a TCP
+connection over en0 (3 consecutive probe failures) — … the watchdog holds
+instead of reloading; 'rowt use auto' fails over by itself …" and one audit
+line, and the streak reads 3. Before #s36 this exact world ran cmd_reload —
+thirteen times in half an hour on the day, each cutting every lane.

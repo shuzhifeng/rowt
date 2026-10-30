@@ -1,0 +1,13 @@
+watch-pin-held — watch-pin-dead one tick later: watch.hold already names alpha.
+
+Same world as watch-pin-dead (pinned alpha, third failed probe, network clear,
+the direct TCP connect to 203.0.113.10:443 timing out), with the hold already
+stamped. Expected: one short line, "pinned server alpha still dead (… holding,
+not reloading …)", no audit line, watch.hold byte for byte as it was, and the
+streak at 3.
+
+Also the `status` case: with the hold naming the server still pinned, status
+prints an `escape:` row saying alpha is dead since the stamp and what to do.
+And the `use beta` and `reload` cases: a new selection and any reload end the
+hold — both sides remove watch.hold (the config-tree compare catches a side
+that keeps it).

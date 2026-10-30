@@ -149,6 +149,15 @@ server; some servers fail it while carrying real traffic. Verify with
 **A hotspot login page never loads.** Ask for the portal's hostname, then
 `rowt hotspot add <host>`. `captive.log` shows what the watchdog saw.
 
+**The escape lane is down and `rowt status` has an `escape:` row saying the pinned
+server is dead.** The server behind `rowt use <tag>` does not accept a connection
+from this machine at all (the watchdog tried a direct TCP connect from the NIC), so
+a reload would only restart the router onto the same dead server; the watchdog
+holds instead and writes one line per tick to `watch.log`. Fix: `rowt use auto`
+(the fastest live server, with hot failover from then on), or pin a live one with
+`rowt use <other>` (`rowt server` lists them, `rowt ping` measures them). The row
+clears when that server answers again or the selection moves.
+
 **The watchdog does nothing.** `rowt watch status` shows the state and recent log.
 `NOT loaded` or STALE is fixed with `rowt watch refresh`. A missing sudoers rule is
 fixed by the user running `rowt watch install` in their own terminal.

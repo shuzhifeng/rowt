@@ -1,0 +1,10 @@
+watch-pin-dead-name — watch-pin-dead with the server written as a NAME.
+
+alpha's server is alpha.example; escape-hosts (what sing-box dials, written
+by escape-dns) maps it to 203.0.113.10 — and escape-dns.tsv carries that row
+dated 2999, so the tick's own refresh keeps it instead of asking DoH. The
+direct TCP connect goes to that hosts answer, 203.0.113.10:443 (the only
+address the tick will take for a name: a name with no escape-hosts row is no
+evidence, and no lookup is made), and times out. Expected: the same hold as
+watch-pin-dead, the warning naming 203.0.113.10:443 — which is what the
+watch-shadow line for this case pins; ticks skip the argv compare.

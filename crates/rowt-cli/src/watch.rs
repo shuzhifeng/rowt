@@ -11,7 +11,7 @@
 
 use crate::lifecycle::{self, Ctx};
 use crate::{die, env_or, read, PROG};
-use rowt_core::watch::{guard, netcheck, Action, CaptiveState, Config, Next, Observation, State};
+use rowt_core::watch::{guard, netcheck, Action, CaptiveState, Config, Hold, Next, Observation, State};
 use rowt_platform::{Mac, Platform};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -640,7 +640,8 @@ fn net_id(iface: &str) -> String {
     format!("{ssid} {addr}/{router}").trim().to_string()
 }
 
-fn observe(ctx: &Ctx, cap: Option<CaptiveState>, portal: Option<String>, portal_host: Option<String>, health_ok: bool, health_slow: bool, health_flows: u32) -> Observation {
+fn observe(ctx: &Ctx, cap: Option<CaptiveState>, portal: Option<String>, portal_host: Option<String>, health_ok: bool, health_slow: bool, health_flows: u32,
+           pinned: Option<String>, pinned_addr: String, pinned_reach: Option<bool>) -> Observation {
     let p = Mac;
     let svc = p.active_service();
     let iface = p.detect_iface();
@@ -679,8 +680,82 @@ fn observe(ctx: &Ctx, cap: Option<CaptiveState>, portal: Option<String>, portal_
         health_ok,
         health_slow,
         health_flows,
+        pinned,
+        pinned_addr,
+        pinned_reach,
+        // Only a hold that begins now is stamped, and the shell runs `date -u`
+        // at that moment and not otherwise.
+        hold_stamp: if pinned_reach == Some(false) { crate::best::utc(None) } else { String::new() },
         now: crate::sh_date("+%s").parse().unwrap_or(0),
     }
+}
+
+/// rowt #s36: the escape selection when it is ONE concrete server (`use <tag>`)
+/// in host mode. `auto` and `best` re-pick by themselves; local and vm mode
+/// have no selector here. Mirrors `_watch_pinned_tag`.
+fn pinned_tag(ctx: &Ctx) -> Option<String> {
+    if ctx.mode() != "host" {
+        return None;
+    }
+    let sel = ctx.sget("selected");
+    if sel.is_empty() || sel == "auto" || sel == "best" { None } else { Some(sel) }
+}
+
+/// rowt #s36: the pinned server as the NIC would dial it, `ip:port` — an IPv4
+/// literal, or for a name ONLY the escape-hosts answer (what sing-box dials;
+/// names keyed lowercased with the trailing dot off, as escape-dns keys them).
+/// None for a server a TCP connect says nothing about (hysteria2, tuic), one
+/// with no usable port, or a name rowt has not checked: the system resolver
+/// could answer differently from dns-direct, and a hold on an address the
+/// router never dials would withhold a reload that might have helped. Asked
+/// only at the recovery decision. Mirrors `_watch_pinned_addr`.
+fn pinned_addr(ctx: &Ctx, tag: &str) -> Option<String> {
+    let servers: Vec<serde_json::Value> = serde_json::from_str(&read(&ctx.cfg.join("servers.json"))).unwrap_or_default();
+    let s = servers.iter().find(|s| s.get("tag").and_then(|t| t.as_str()) == Some(tag))?;
+    if !matches!(s.get("type").and_then(|t| t.as_str()).unwrap_or(""), "vless" | "vmess" | "trojan" | "shadowsocks" | "anytls") {
+        return None;
+    }
+    let host = s.get("server").and_then(|h| h.as_str()).unwrap_or("").to_string();
+    let port = match s.get("server_port") {
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(p)) => p.clone(),
+        _ => String::new(),
+    };
+    if host.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // The shell's test: digits and dots only is an address literal.
+    let ip = if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        host
+    } else {
+        let name = host.strip_suffix('.').unwrap_or(&host).to_ascii_lowercase();
+        read(&ctx.cfg.join("escape-hosts")).lines()
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| { let mut f = l.split_whitespace(); let a = f.next()?; (f.next()? == name).then(|| a.to_string()) })
+            .unwrap_or_default()
+    };
+    if ip.is_empty() { None } else { Some(format!("{ip}:{port}")) }
+}
+
+/// rowt #s36: `watch.hold` exists but is not "<stamp>\t<tag>" — a hand edit.
+/// The shell's `_watch_hold_retire` removes such a file wherever it reaches
+/// `_watch_health`; `load_state` reads it as no hold, so the tick removes it at
+/// that same point rather than leaving a file the shell would not.
+fn hold_file_malformed(ctx: &Ctx) -> bool {
+    let p = hold_file(ctx);
+    p.exists() && !matches!(read(&p).trim_end_matches('\n').split_once('\t'), Some((_, t)) if !t.is_empty())
+}
+
+/// rowt #s36: the `rowt status` row while the watchdog holds instead of
+/// reloading onto a dead pinned server — when `watch.hold` names the server
+/// still pinned. Mirrors `_watch_hold_row` word for word.
+pub fn hold_row(ctx: &Ctx) -> Option<String> {
+    let body = read(&hold_file(ctx));
+    let (since, tag) = body.trim_end_matches('\n').split_once('\t')?;
+    if tag.is_empty() || ctx.sget("selected") != tag {
+        return None;
+    }
+    Some(format!("{:<14}{tag} is dead since {since} UTC — the watchdog holds instead of reloading; '{PROG} use auto' fails over by itself, or pin another server with '{PROG} use <other>'", "escape:"))
 }
 
 /// The recovery-cooldown stamp. `watch.restart` is the name the SHELL uses
@@ -699,6 +774,11 @@ fn restart_file(ctx: &Ctx) -> PathBuf {
 fn health_file(ctx: &Ctx) -> PathBuf {
     ctx.cfg.join("watch.health")
 }
+/// rowt #s36: "<utc stamp>\t<tag>\n" while the watchdog holds instead of
+/// reloading onto a dead pinned server. `WATCH_HOLD` in bin/rowt.
+fn hold_file(ctx: &Ctx) -> PathBuf {
+    ctx.cfg.join("watch.hold")
+}
 
 fn load_state(ctx: &Ctx) -> State {
     State {
@@ -710,6 +790,13 @@ fn load_state(ctx: &Ctx) -> State {
         },
         last_recovery: read(&restart_file(ctx)).trim().parse().unwrap_or(0),
         last_net_change: read(&netchange_file(ctx)).trim().parse().unwrap_or(0),
+        hold: {
+            let body = read(&hold_file(ctx));
+            match body.trim_end_matches('\n').split_once('\t') {
+                Some((since, tag)) if !tag.is_empty() => Some(Hold { since: since.to_string(), tag: tag.to_string() }),
+                _ => None,
+            }
+        },
     }
 }
 
@@ -752,6 +839,14 @@ fn save_state(ctx: &Ctx, disk: &mut State, new: &State) {
     if new.last_recovery != disk.last_recovery {
         let _ = std::fs::write(restart_file(ctx), format!("{}\n", new.last_recovery));
         disk.last_recovery = new.last_recovery;
+    }
+    if new.hold != disk.hold {
+        // An ended hold is an ABSENT file, like a cleared streak.
+        match &new.hold {
+            Some(h) => { let _ = std::fs::write(hold_file(ctx), format!("{}\t{}\n", h.since, h.tag)); }
+            None => { let _ = std::fs::remove_file(hold_file(ctx)); }
+        }
+        disk.hold = new.hold.clone();
     }
 }
 
@@ -839,6 +934,7 @@ fn perform(ctx: &Ctx, actions: &[Action]) {
                 if r.is_ok() {
                     watch_log(ctx, "reload ok");
                     let _ = std::fs::remove_file(ctx.cfg.join("watch.health"));
+                    let _ = std::fs::remove_file(hold_file(ctx));
                     crate::shell::audit(&ctx.cfg, "END   watchdog reload — ok");
                 } else {
                     watch_log(ctx, "reload FAILED");
@@ -1132,6 +1228,8 @@ pub fn cmd(ctx: &Ctx, self_bin: &Path, action: &str) -> Result<String, String> {
                 let _ = quiet("launchctl", &["unload", &plist.to_string_lossy()]);
             }
             let _ = std::fs::remove_file(&plist);
+            // rowt #s36: no watchdog, no hold for `status` to report.
+            let _ = std::fs::remove_file(hold_file(ctx));
             if Path::new(SUDOERS).is_file() {
                 eprintln!("==> removing {SUDOERS} (needs admin)");
                 if !quiet("sudo", &["rm", "-f", SUDOERS]) {
@@ -1265,7 +1363,7 @@ fn tick(ctx: &Ctx) {
     // `Action::Journal` because that is what the shadow comparison matches
     // against; `perform` skips it below rather than running it twice.
     journal(ctx, cap);
-    let obs = observe(ctx, Some(cap), portal.clone(), portal_host.clone(), true, false, 0);
+    let obs = observe(ctx, Some(cap), portal.clone(), portal_host.clone(), true, false, 0, None, String::new(), None);
     let g = guard(&obs, &st, &cfg);
     perform_planned(ctx, &g.actions);
     st = g.state;
@@ -1300,8 +1398,8 @@ fn tick(ctx: &Ctx) {
     // network just moved: a reload is coming, and measuring over a half-moved
     // interface is noise. The health streak as the LAST tick left it decides
     // whether to measure everyone now (its first failure: the pick may be dead).
+    let ifc = Mac.detect_iface().unwrap_or_default();
     {
-        let ifc = Mac.detect_iface().unwrap_or_default();
         let host: serde_json::Value = serde_json::from_str(&read(&ctx.cfg.join("host.json"))).unwrap_or(serde_json::Value::Null);
         let cur = host.get("outbounds").and_then(|o| o.as_array())
             .and_then(|a| a.iter().find(|o| o.get("tag").and_then(|t| t.as_str()) == Some("direct")))
@@ -1330,7 +1428,34 @@ fn tick(ctx: &Ctx) {
     // the router whether connections opened in the last two minutes are still
     // receiving bytes through the tunnel. Mirrors the shell's `_watch_fresh_flows`.
     let flows = if !hb && st.health_fails + 1 >= cfg.health_fails && !slow { fresh_escape_flows(ctx) } else { 0 };
-    let obs2 = observe(ctx, Some(cap), portal, portal_host, hb, slow, flows);
+    // rowt #s36: is the pinned server ITSELF dead? One more question, asked
+    // only where the answer could change the decision — the streak crossing,
+    // neither the patient probe nor a fresh flow speaking for the tunnel, and
+    // the network not the story — and only about a pinned server: a direct TCP
+    // connect from the NIC, which never passes through sing-box. Resolving the
+    // name and the connect are network calls, so the shell asks under exactly
+    // this condition (`_watch_health`), or the two traces would differ.
+    let pinned = pinned_tag(ctx);
+    // Offline (`_watch_health` returns before its probe when the NIC has no
+    // address) there is nothing to ask either.
+    let at_decision = !ifc.is_empty() && !hb && st.health_fails + 1 >= cfg.health_fails && !slow && flows == 0
+        && !rowt_core::watch::would_hold_for_network(env_or("ROWT_CAPTIVE_CHECK", "1") != "1", Some(cap), st.health_fails + 1, &cfg);
+    let paddr = if at_decision { pinned.as_deref().and_then(|t| pinned_addr(ctx, t)) } else { None };
+    let reach = paddr.as_deref().map(|a| {
+        let (ip, port) = a.rsplit_once(':').unwrap_or((a, ""));
+        crate::diag::tcp_reaches(&ifc, ip, port)
+    });
+    let obs2 = observe(ctx, Some(cap), portal, portal_host, hb, slow, flows, pinned, paddr.unwrap_or_default(), reach);
+    // Where the shell enters `_watch_health` (phase two, nothing to reload for
+    // the network's sake, a tunnel to probe), it also throws away a malformed
+    // `watch.hold`; see `hold_file_malformed`.
+    {
+        let iface_moved = matches!((&obs2.iface, &obs2.bound_iface), (Some(i), b) if Some(i) != b.as_ref());
+        let proxy_wrong = obs2.active_service.is_some() && !(obs2.proxy_pointing_ok && obs2.proxy_bypass_ok);
+        if !iface_moved && !proxy_wrong && obs2.mode != "local" && st.hold.is_none() && hold_file_malformed(ctx) {
+            let _ = std::fs::remove_file(hold_file(ctx));
+        }
+    }
     let n = netcheck(&obs2, &st, &cfg);
     perform_planned(ctx, &n.actions);
     save_state(ctx, &mut disk, &n.state);

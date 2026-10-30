@@ -1,0 +1,13 @@
+{
+  "_phase": "netcheck",
+  "_run": "PARITY_SCENARIO=watch-pin-held ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick",
+  "obs": {"proxy_intent":"on","captive":"clear","active_service":"Wi-Fi","proxy_any_on":true,
+          "host_running":true,"intent":"up","boot_matches":true,"iface":"en0",
+          "proxy_pointing_ok":true,"proxy_bypass_ok":true,"bound_iface":"en0",
+          "net_id":"ParityNet 192.0.2.15/192.0.2.1","mode":"host",
+          "health_ok":false,"health_slow":false,"health_flows":0,
+          "pinned":"alpha","pinned_addr":"203.0.113.10:443","pinned_reach":false,
+          "hold_stamp":"","now":1800000000},
+  "state": {"captive_flag": false, "health_fails": 2, "last_net_id": "ParityNet 192.0.2.15/192.0.2.1",
+            "hold_since": "2026-10-30 08:50:00", "hold_tag": "alpha"}
+}

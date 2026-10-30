@@ -1630,6 +1630,8 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
                 die(&cfg, &format!("unknown server '{tag}' — see: {PROG} server"));
             }
             let prev = ctx.sget("selected");
+            // rowt #s36: a new selection ends the watchdog's hold on the old one.
+            let _ = std::fs::remove_file(cfg.join("watch.hold"));
             if tag == "best" {
                 return best::use_best(&ctx, &prev);
             }
@@ -2104,6 +2106,9 @@ fn run(cfg: &Path, cmd: &str, rest: &[String]) -> Result<String, String> {
             // (escape_dns): what was refused, and what sing-box was given.
             if mode == "host" {
                 o.extend(escape_dns::status(&cfg));
+                // rowt #s36: the watchdog holding instead of reloading onto a
+                // dead pinned server.
+                o.extend(watch::hold_row(&ctx));
             }
             if mode == "vm" {
                 o.push(format!("vm ip:        {}", ctx.sget("vm_ip")));

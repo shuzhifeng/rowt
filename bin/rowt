@@ -62,7 +62,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.8.2"
+ROWT_VERSION="3.8.3"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -2857,6 +2857,7 @@ cmd_use() {
     die "unknown server '$tag' — see: $PROG server"
   fi
   local prev; prev="$(sget selected)"
+  rm -f "$WATCH_HOLD"      # rowt #s36: a new selection ends the watchdog's hold on the old one
   if [ "$tag" = best ]; then _use_best "$prev"; return 0; fi
   sset selected "$tag"
   if [ "$every_set" = 1 ] && [ "$every" = default ]; then
@@ -5822,6 +5823,8 @@ cmd_status() {
   # The escape servers' names as rowt resolved and checked them: what was
   # refused, and what sing-box was given.
   case "$(sget mode)" in ''|host) _escape_dns status 2>/dev/null || true ;; esac
+  # rowt #s36: the watchdog holding instead of reloading onto a dead pinned server.
+  case "$(sget mode)" in ''|host) _watch_hold_row ;; esac
   [ "$mode" = "vm" ] && echo "vm ip:        $(sget vm_ip)"
   echo "router:       $(host_running && echo "running (pid $(cat "$(host_pidfile)"))" || echo stopped) on 127.0.0.1:$PORT"
   # Named ports, and whether the rendered config agrees with the table. Nothing
@@ -5917,6 +5920,7 @@ cmd_restart() {
 cmd_reload() {
   [ -s "$SERVERS" ] || die "nothing to reload — run '$PROG up' first"
   info "reloading for the current network…"
+  rm -f "$WATCH_HOLD"                     # rowt #s36: any reload is a fresh start for the watchdog's hold
   if [ "$(sget mode)" = "vm" ] && vm_running; then
     cmd_vm up                             # re-detects the VM's bridged IP, re-renders, re-pushes guest
   else
@@ -5957,6 +5961,7 @@ WATCH_NET="$CFG/watch.net"                   # last-seen network identity (for t
 WATCH_HEALTH="$CFG/watch.health"             # consecutive liveness-probe failures (streak counter)
 WATCH_RESTART="$CFG/watch.restart"           # epoch of the last auto-restart (cooldown gate)
 WATCH_NETCHANGE="$CFG/watch.netchange"       # epoch of the last network change ((c): a portal is likely just after one)
+WATCH_HOLD="$CFG/watch.hold"                 # rowt #s36: "<utc stamp><TAB><tag>" while the watchdog holds instead of reloading onto a dead pinned server
 # Generation of the plist this rowt writes. BUMP IT whenever the generated plist
 # changes, so an agent installed by an older rowt is recognised as stale and
 # self-heals on the next tick. A marker beats diffing the whole body: the body
@@ -6201,13 +6206,18 @@ _watch_shadow() {
       --argjson now "${_SH2_NOW:-$(date +%s)}" \
       --arg cap "${_SH_CAP:-clear}" \
       --argjson capoff "$([ "${ROWT_CAPTIVE_CHECK:-1}" = 1 ] && echo false || echo true)" \
+      --arg pin "${_SH2_PIN:-}" --arg pinaddr "${_SH2_PINADDR:-}" \
+      --argjson pinreach "${_SH2_PINREACH:-null}" --arg holdstamp "${_SH2_HOLDSTAMP:-}" \
+      --arg holdsince "${_SH_HOLDSINCE0:-}" --arg holdtag "${_SH_HOLDTAG0:-}" \
       '{obs:{proxy_intent:"", captive:$cap, captive_check_disabled:$capoff, active_service:$svc, proxy_any_on:true,
              host_running:true, intent:"up", boot_matches:true, iface:$ifc,
              proxy_pointing_ok:$pointing, proxy_bypass_ok:$bypass,
              bound_iface:$cur, net_id:$nid, health_ok:$health, health_slow:$slow, health_flows:$flows, now:$now, gateway_ok:$gwok,
+             pinned:(if $pin == "" then null else $pin end), pinned_addr:$pinaddr, pinned_reach:$pinreach, hold_stamp:$holdstamp,
              mode:(if $mode == "" then "host" else $mode end)},
         state:{captive_flag:false, health_fails:$fails, last_net_id:$last,
-               last_recovery:$lastrec, last_net_change:$lastnetchg}}' > "$obs2" 2>/dev/null
+               last_recovery:$lastrec, last_net_change:$lastnetchg,
+               hold_since:$holdsince, hold_tag:$holdtag}}' > "$obs2" 2>/dev/null
     "$wb" --obs "$obs2" --phase netcheck 2>/dev/null >> "$plan" || true
     # Kept, not deleted: this is the observation the diverging half of the plan
     # was decided from, and a bundle without it sends the next reader to the
@@ -6280,6 +6290,7 @@ _watch_recover() {
   fi
   printf '%s\n' "$now" > "$WATCH_RESTART" 2>/dev/null || true
   rm -f "$WATCH_HEALTH"
+  rm -f "$WATCH_HOLD"      # a fresh start for the hold too (rowt #s36)
   _watch_log "$reason — recovering ($*)"
   # The FSM logs before it acts, so the decision is visible even if the reload
   # then fails; the lines that follow the action (`recovery ok`, `recovery
@@ -6564,15 +6575,72 @@ _watch_follow() {
   done
 }
 
+# rowt #s36 (Hong, #s35 option 1): a pinned server that is DEAD. `use <tag>`
+# means that server and no other, so the watchdog's remedy was `cmd_reload`,
+# which renders the same config and restarts the router onto the same dead
+# server — on 2026-10-30 thirteen times in half an hour, each cutting the corp
+# and direct lanes for nothing. The tunnel probe cannot tell a dead server from
+# a wedged router (both fail it), so the tick asks one more question at the
+# decision: a direct TCP connect from the NIC to the server, which never passes
+# through sing-box. Refused or timed out, the server itself is dead and the
+# watchdog HOLDS and says what to do instead; accepted, it is the router that
+# is stuck and a reload is what it always was. `auto` and `best` re-pick by
+# themselves and are not touched here (R6 of collab's report is the follower's
+# arm). While it holds, `watch.hold` carries the stamp and the tag: `rowt
+# status` reads it, the warning is written once per hold, and the hold ends
+# when the probe answers, when the selection moves, or with any reload.
+# Mirrors rowt_core::watch::netcheck (`pinned_dead`) word for word.
+_watch_pinned_tag() { # the escape selection when it is one concrete server, in host mode
+  case "$(sget mode)" in ''|host) ;; *) return 0 ;; esac
+  local sel; sel="$(sget selected)"
+  case "$sel" in ''|auto|best) ;; *) printf '%s\n' "$sel" ;; esac
+}
+_watch_pinned_addr() { # $1 = tag → "ip:port" as the NIC would dial it; nothing for a UDP server or no address
+  local ty="" host="" port="" ip=""
+  IFS=$'\t' read -r ty host port < <(jq -r --arg t "$1" '.[] | select(.tag == $t) | [.type, .server, (.server_port | tostring)] | @tsv' "$SERVERS" 2>/dev/null | head -n 1) || true
+  # A TCP connect says nothing about a server carried over UDP.
+  case "$ty" in vless|vmess|trojan|shadowsocks|anytls) ;; *) return 0 ;; esac
+  [ -n "$host" ] || return 0
+  case "$port" in ''|null|*[!0-9]*) return 0 ;; esac
+  case "$host" in
+    *[!0-9.]*) # a name: ONLY the address sing-box dials (escape-hosts, written by
+               # escape-dns; names keyed lowercased, trailing dot off, as there).
+               # A name rowt has not checked is no evidence: the system resolver
+               # could answer differently from dns-direct, and a hold on an
+               # address the router never dials would withhold a reload that
+               # might have helped.
+               ip="$(awk -v n="$(printf '%s' "${host%.}" | LC_ALL=C tr 'A-Z' 'a-z')" '!/^#/ && $2 == n { print $1; exit }' "$CFG/escape-hosts" 2>/dev/null || true)" ;;
+    *) ip="$host" ;;
+  esac
+  [ -n "$ip" ] && printf '%s:%s\n' "$ip" "$port"
+  return 0
+}
+_watch_hold_retire() { # $1 = the pinned tag, or empty: a hold about any other server is over
+  [ -f "$WATCH_HOLD" ] || return 0
+  local since="" tag=""; IFS=$'\t' read -r since tag < "$WATCH_HOLD" || true
+  { [ -n "$1" ] && [ "$tag" = "$1" ]; } || rm -f "$WATCH_HOLD"
+}
+_watch_hold_row() { # the `rowt status` row while a hold names the server still pinned
+  [ -f "$WATCH_HOLD" ] || return 0
+  local since="" tag=""; IFS=$'\t' read -r since tag < "$WATCH_HOLD" || true
+  { [ -n "$tag" ] && [ "$(sget selected)" = "$tag" ]; } || return 0
+  printf '%-14s%s\n' "escape:" "$tag is dead since $since UTC — the watchdog holds instead of reloading; '$PROG use auto' fails over by itself, or pin another server with '$PROG use <other>'"
+}
+
 _watch_health() { # $1=iface  $2=captive verdict
   # Offline (no interface IP) — a restart can't help and a returning network
   # fires its own resolver-change reload, so just reset the streak and bail.
   local cap="${2:-}" ip; ip="$(ipconfig getifaddr "${1:-}" 2>/dev/null || true)"
+  # rowt #s36: a hold names the server it is about. Pinned elsewhere now, or on
+  # auto/best, that hold is over whatever this tick finds (mirrors netcheck).
+  local ptag paddr=""; ptag="$(_watch_pinned_tag)"; _SH2_PIN="$ptag"
+  _watch_hold_retire "$ptag"
   # Offline and healthy both reset the streak and plan nothing, so neither
   # records an action — matching the FSM, which only changes state there.
   [ -n "$ip" ] || { rm -f "$WATCH_HEALTH"; _SH2_HEALTH=offline; return 0; }
   if _watch_probe; then
     rm -f "$WATCH_HEALTH"; _SH2_HEALTH=ok                                    # healthy — clear streak
+    rm -f "$WATCH_HOLD"                                                      # the server answers again: the hold is over
     # The probe answering proves the network AND the tunnel work. That is
     # exactly the state the spin hides in, so this is the only place the spin
     # test may run: it can never be blamed on an uplink.
@@ -6639,6 +6707,34 @@ _watch_health() { # $1=iface  $2=captive verdict
     _watch_log "$m"
     _wact "log $m"
     return 0
+  fi
+  # rowt #s36: is the pinned server ITSELF dead? See the comment above
+  # `_watch_pinned_tag`. Asked only here, where the answer can change the
+  # decision; rowt-rs asks under the same condition.
+  if [ -n "$ptag" ]; then
+    paddr="$(_watch_pinned_addr "$ptag")"; _SH2_PINADDR="$paddr"
+    if [ -n "$paddr" ]; then
+      if tcp_reaches "${1:-}" "${paddr%:*}" "${paddr##*:}"; then _SH2_PINREACH=true; else _SH2_PINREACH=false; fi
+    fi
+    if [ "${_SH2_PINREACH:-}" = false ]; then
+      local nic="${1:-the NIC}" hs="" ht="" m
+      [ -f "$WATCH_HOLD" ] && { IFS=$'\t' read -r hs ht < "$WATCH_HOLD" || true; }
+      if [ "$ht" = "$ptag" ]; then
+        m="pinned server $ptag still dead ($paddr does not accept a TCP connection over $nic, $fails consecutive probe failures) — holding, not reloading; '$PROG use auto' fails over by itself"
+        _watch_log "$m"
+        _wact "log $m"
+      else
+        m="pinned server $ptag is dead: $paddr does not accept a TCP connection over $nic ($fails consecutive probe failures) — a reload would render the same config and restart the router onto the same dead server, so the watchdog holds instead of reloading; '$PROG use auto' fails over by itself, or pin another server with '$PROG use <other>'"
+        _watch_log "$m"
+        _wact "log $m"
+        m="watchdog hold: pinned server $ptag is dead ($paddr does not accept a TCP connection over $nic) — not reloading; '$PROG use auto' fails over by itself"
+        _audit "$m"
+        _wact "audit $m"
+        _SH2_HOLDSTAMP="$(date -u '+%Y-%m-%d %H:%M:%S')"
+        printf '%s\t%s\n' "$_SH2_HOLDSTAMP" "$ptag" > "$WATCH_HOLD" 2>/dev/null || true
+      fi
+      return 0
+    fi
   fi
   # A garden that WHITELISTS the probe host answers it truthfully and lies about
   # the network: the verdict is `clear` while every real connection waits for a
@@ -6860,6 +6956,7 @@ cmd_watch() {
       launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null \
         || launchctl unload "$WATCH_PLIST" 2>/dev/null || true
       rm -f "$WATCH_PLIST"
+      rm -f "$WATCH_HOLD"      # rowt #s36: no watchdog, no hold for `status` to report
       if [ -f "$WATCH_SUDOERS" ]; then
         info "removing $WATCH_SUDOERS (needs admin)"
         sudo rm -f "$WATCH_SUDOERS" || err "could not remove $WATCH_SUDOERS — delete it by hand"
@@ -6935,6 +7032,8 @@ cmd_watch() {
       _SH_FAILS0="$(cat "$WATCH_HEALTH" 2>/dev/null || echo 0)"
       _SH_LASTREC0="$(cat "$WATCH_RESTART" 2>/dev/null || echo 0)"
       _SH_LASTNETCHG0="$(cat "$WATCH_NETCHANGE" 2>/dev/null || echo 0)"
+      _SH_HOLDSINCE0=""; _SH_HOLDTAG0=""
+      [ -f "$WATCH_HOLD" ] && { IFS=$'\t' read -r _SH_HOLDSINCE0 _SH_HOLDTAG0 < "$WATCH_HOLD" || true; }
       _SH2_HEALTH=ok
       # `watch.tick` is stamped on the way OUT, whatever the tick did: a tick
       # that finished. `rowt monitor` reads its mtime for the watch cell's age —
@@ -7173,7 +7272,7 @@ cmd_watch() {
       _wact "audit $why_audit"
       _wact "reload $why_short"
       _wact "next stop"
-      cmd_reload >>"$WATCH_LOG" 2>&1 && { _watch_log "reload ok"; rm -f "$WATCH_HEALTH"; _audit "END   watchdog reload — ok"; } || { _watch_log "reload FAILED"; _audit "END   watchdog reload — FAILED"; }
+      cmd_reload >>"$WATCH_LOG" 2>&1 && { _watch_log "reload ok"; rm -f "$WATCH_HEALTH" "$WATCH_HOLD"; _audit "END   watchdog reload — ok"; } || { _watch_log "reload FAILED"; _audit "END   watchdog reload — FAILED"; }
       _AUDIT_OP=""
       ;;
     follow)
@@ -7382,6 +7481,7 @@ cmd_revert() {
   # last-resort: kill ANY sing-box started from our pinned binary (stray/high-CPU)
   pkill -f "$SB run" 2>/dev/null || true
   rm -f "$(host_pidfile)"
+  rm -f "$WATCH_HOLD"      # rowt #s36: nothing is holding while nothing runs
   info "stopped — system proxy off, sing-box down (servers kept at $SERVERS)."
 }
 

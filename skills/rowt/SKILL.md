@@ -175,6 +175,8 @@ replaced**, run `rowt fetch host` (with a working path to GitHub) or `rowt reloa
    `rowt watch install`. It asks for the password once. It installs the passwordless
    proxy rule and the watchdog, which reloads on network changes, handles captive
    portals, recovers a crashed or spinning router, and clears a stale proxy at login.
+   A pinned server (`rowt use <tag>`) that dies is NOT reloaded around: the watchdog
+   holds and says so in `rowt status` (`escape:` row); `rowt use auto` fails over.
    Re-run `rowt doctor`; `NO_SUDO_RULE` should be gone. If they'd rather not run the
    watchdog, then every command that sets the proxy (`rowt up`, `rowt proxy on`)
    is theirs to run in their own terminal.

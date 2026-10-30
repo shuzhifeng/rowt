@@ -173,6 +173,20 @@ PARITY_SCENARIO=watch-intent-off ROWT_CAPTIVE_URL=http://127.0.0.1:8099/portal w
 # DNS-free fallback — an intercepted request to an address that is never routed
 # — sees the redirect. Both sides must reach `captive` and open the SAME target.
 PARITY_NOTRACE=1 PARITY_SCENARIO=captive-no-dns watch tick
+# rowt #s36 (Hong, #s35 option 1): a pinned server that is DEAD — a direct TCP
+# connect from the NIC, which never passes through sing-box, is refused or
+# times out — holds instead of reloading onto the same dead server, and says
+# so once (watch.hold). The alive and udp cases pin that the arm does NOT fire
+# without that evidence; their recovery stamp sits in 2100 so the cooldown
+# holds the reload and the tree stays deterministic. READMEs in the scenarios.
+PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-dead ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick
+PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-held ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick
+PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-dead-name ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick
+PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-alive ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick
+PARITY_TIMEOUT=45 PARITY_NOTRACE=1 PARITY_SCENARIO=watch-pin-udp ROWT_CAPTIVE_URL=http://127.0.0.1:8099/success watch tick
+PARITY_SCENARIO=watch-pin-held status
+PARITY_TIMEOUT=45 PARITY_SCENARIO=watch-pin-held use beta
+PARITY_TIMEOUT=45 PARITY_SCENARIO=watch-pin-held reload
 
 # static text and log readers, extracted from the shell at build time
 shell-init

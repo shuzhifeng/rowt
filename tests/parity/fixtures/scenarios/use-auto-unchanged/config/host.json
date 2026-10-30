@@ -23,6 +23,12 @@
           "intranet.corp.example"
         ],
         "server": "local"
+      },
+      {
+        "rule_set": [
+          "corp-sync-dom"
+        ],
+        "server": "local"
       }
     ],
     "final": "dns-direct"
@@ -169,14 +175,19 @@
         "outbound": "block"
       },
       {
+        "rule_set": [
+          "corp-sync-dom"
+        ],
+        "outbound": "corp"
+      },
+      {
         "action": "resolve",
         "server": "dns-direct",
         "strategy": "prefer_ipv4"
       },
       {
-        "ip_cidr": [
-          "198.51.100.0/24",
-          "10.99.0.0/16"
+        "rule_set": [
+          "corp-cidr"
         ],
         "outbound": "corp"
       },
@@ -196,7 +207,21 @@
     "default_domain_resolver": {
       "server": "dns-direct",
       "strategy": "prefer_ipv4"
-    }
+    },
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "corp-cidr",
+        "format": "source",
+        "path": "@CFG@/corp-cidr.json"
+      },
+      {
+        "type": "local",
+        "tag": "corp-sync-dom",
+        "format": "source",
+        "path": "@CFG@/corp-sync-domains.json"
+      }
+    ]
   },
   "experimental": {
     "clash_api": {

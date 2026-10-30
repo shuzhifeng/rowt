@@ -6,6 +6,7 @@ default
 local-mode        PARITY_SCENARIO=render-local
 local-precedence  PARITY_SCENARIO=render-local-precedence
 no-corp           PARITY_SCENARIO=render-no-corp
+corp-sync-shadow  PARITY_SCENARIO=corp-sync-shadowed
 unicode-and-ties  PARITY_SCENARIO=render-unicode
 # Overlapping suffix shapes (bare / dot-led / label-suffix-of-another): pins
 # WHICH entry the boundary rule picks, not just which lane.

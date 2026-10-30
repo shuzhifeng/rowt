@@ -1,0 +1,15 @@
+Synced DHCP domains under a broader inline suffix.
+
+The render puts the corp lane's synced DHCP domains in one rule-set rule
+(corp-sync-domains.json) placed after every inline suffix rule, so sing-box
+consults them only when no inline suffix matched. That changes one ranking:
+`hq.shadow.example` (synced, corp) under escape's `shadow.example` used to win
+on length and now loses — a hand entry wins, as corp sync promises. `explain`
+must rank the same way, and both implementations must agree on it:
+
+    x.hq.shadow.example      ->  ESCAPE  (escape's shadow.example)
+    x.synced.corp.example    ->  CORP    (the inline corp.example, not the synced entry)
+    a.dot.synced.example     ->  CORP    (synced only — nothing inline covers it)
+
+The CIDR block is there so the render's corp-cidr set carries a synced CIDR
+next to the hand-added one.

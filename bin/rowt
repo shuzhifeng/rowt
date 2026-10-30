@@ -62,7 +62,7 @@
 set -euo pipefail
 
 # ---------- paths & constants ------------------------------------------------
-ROWT_VERSION="3.8.8"
+ROWT_VERSION="3.8.9"
 # Resolve symlinks so an installed 'rowt' symlink still finds config/, lima/, etc.
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -1093,6 +1093,26 @@ CORP_SYNC_MARKER="# --- rowt corp sync (auto-managed; superset of live tunnel ro
 # with ROWT_AUTO_CORP_DOMAINS=0.
 CORP_SYNC_DOM_MARKER="# --- rowt corp sync: DHCP search domains (auto-managed, do not edit below) ---"
 AUTO_CORP_DOMAINS="${ROWT_AUTO_CORP_DOMAINS:-1}"
+# What corp sync changes reaches the RUNNING router without a restart.
+# The corp lane's CIDRs (hand-added and synced alike — they were one rule) and
+# its synced DHCP search domains are rendered as two local sing-box rule-sets,
+# not inline lists. sing-box watches a local rule-set file (fswatch on its
+# directory, 1.13 route/rule/rule_set_local.go) and swaps the rules in place
+# when it is replaced, so host.json stays byte-identical across a corp sync and
+# the router — and every escape / direct connection on it — keeps running.
+# Every other corp DOMAIN stays inline: those take part in the longest-suffix
+# ordering against escape and block, which one rule-set rule cannot. So the
+# synced DHCP domains now rank after every inline suffix — a hand entry in
+# escape or block that is BROADER than a synced domain wins, which is what corp
+# sync already promised ("your rule wins"); `explain` ranks them the same way.
+# ROUTER_CFG_SUM is the cksum of the host.json the running router was started
+# (or SIGHUP-reloaded) from: corp sync applies live only when the fresh render
+# is that same file; anything else (an older rowt started it, a hand change is
+# pending) restarts as before. ROWT_CORP_HOT=0 restores the old always-restart.
+CORP_SET_CIDR="$CFG/corp-cidr.json"
+CORP_SET_DOM="$CFG/corp-sync-domains.json"
+ROUTER_CFG_SUM="$CFG/host.running"
+CORP_HOT="${ROWT_CORP_HOT:-1}"
 # corp sync ALSO learns the DNS zones that ONLY an overlay resolver answers — a
 # tailnet's MagicDNS zone (`ts.net`), or whatever base domain a self-hosted
 # control server was given — and puts those on the OS proxy BYPASS list.
@@ -1234,6 +1254,66 @@ _corp_block_domains() {
     index($0,"# --- rowt corp sync")==1 { inblk=($0==m); next }
     inblk && NF && $0 !~ /^[[:space:]]*#/ { gsub(/[[:space:]]/,""); if($0!="") print }
   ' "$CORP_DOMAINS"
+}
+
+# The corp lane split for the render. Every line outside the DHCP block (the
+# hand-kept head, and anything a hand put under another marker) stays inline;
+# the synced DHCP domains and every corp CIDR go to the two rule-set files (see
+# CORP_SET_CIDR).
+_corp_inline_lines() {
+  [ -f "$CORP_DOMAINS" ] || return 0
+  awk -v m="$CORP_SYNC_DOM_MARKER" 'index($0,"# --- rowt corp sync")==1 { inblk=($0==m) } !inblk' "$CORP_DOMAINS"
+}
+_corp_inline_domains_json() {
+  local t; t="$(mktemp)"; _corp_inline_lines > "$t"; list_json "$t" domain; rm -f "$t"
+}
+_corp_sync_domains_json() {
+  local t; t="$(mktemp)"; _corp_block_domains > "$t"; list_json "$t" domain; rm -f "$t"
+}
+# Write one rule-set file: unchanged bytes are left alone (a rewrite would make
+# sing-box reload it for nothing); a change goes to a temp file in the same
+# directory and is renamed over it, so the watcher only ever reads a whole file.
+# Measured with sing-box 1.13.14 on Linux (inotify) and macOS 26 / APFS (kqueue):
+# the new rules are in use within a second, same process. (On a VM shared
+# folder — VirtioFS — no file event arrives at all; ~/.config is never one.)
+# The previous file is kept as <file>.prev until the render validates.
+_corp_set_put() { # $1=file  $2=JSON array  $3=rule key (ip_cidr | domain_suffix)
+  local t; t="$(mktemp "$1.XXXXXX")"
+  printf '%s' "$2" | jq -c --arg k "$3" '{version:1, rules:(if length > 0 then [{($k):.}] else [] end)}' > "$t" \
+    || { rm -f "$t"; return 1; }
+  if cmp -s "$t" "$1" 2>/dev/null; then rm -f "$t"; return 0; fi
+  if [ -f "$1" ]; then cp -p "$1" "$1.prev" 2>/dev/null || true; fi
+  chmod 600 "$t" 2>/dev/null || true
+  mv -f "$t" "$1"
+}
+_corp_sets_write() {
+  rm -f "$CORP_SET_CIDR.prev" "$CORP_SET_DOM.prev"
+  _corp_set_put "$CORP_SET_CIDR" "$(corp_cidrs_json)" ip_cidr \
+    && _corp_set_put "$CORP_SET_DOM" "$(_corp_sync_domains_json)" domain_suffix
+}
+_corp_sets_restore() { # a render that failed validation puts the previous sets back
+  local f; for f in "$CORP_SET_CIDR" "$CORP_SET_DOM"; do
+    if [ -f "$f.prev" ]; then mv -f "$f.prev" "$f"; fi
+  done; return 0
+}
+# Remember what the running router was started from (see ROUTER_CFG_SUM).
+_router_cfg_mark() { cksum < "$HOST_CFG" > "$ROUTER_CFG_SUM" 2>/dev/null || true; }
+# Apply a corp-lane change: render, then live when the running router was
+# started from exactly this host.json — the sets it watches carry the change —
+# else the restart reload_if_running always did.
+_corp_apply() {
+  host_running || return 0
+  cmd_render >/dev/null
+  local run now pid; pid="$(cat "$(host_pidfile)" 2>/dev/null || true)"
+  run="$(cat "$ROUTER_CFG_SUM" 2>/dev/null || true)"; now="$(cksum < "$HOST_CFG" 2>/dev/null || true)"
+  if [ "$CORP_HOT" = 1 ] && [ -n "$run" ] && [ "$run" = "$now" ]; then
+    info "corp sync: applied live through the corp rule-sets — router not restarted (pid $pid), no connection dropped"
+    return 0
+  fi
+  if [ "$CORP_HOT" != 1 ]; then info "reloading router (ROWT_CORP_HOT=$CORP_HOT)"
+  elif [ -z "$run" ]; then info "reloading router (the running router predates live corp updates — once)"
+  else info "reloading router (host.json differs from the one the router runs)"; fi
+  cmd_router restart
 }
 
 # DHCP search domains the physical NIC advertises (corp/internal by definition).
@@ -1475,7 +1555,7 @@ corp_sync() {
   # Log the reason even under --quiet: this is a real change that triggers a reload,
   # so the watchdog log should record WHY it reloaded (no-op ticks stay silent above).
   info "corp sync: updated corp lane — $nd DHCP domain(s) + $nc CIDR(s) (superset of $na live route(s))"
-  [ "$noreload" = 0 ] && reload_if_running || true
+  [ "$noreload" = 0 ] && _corp_apply || true   # live when it can be, a restart only when it must
   return 0
 }
 
@@ -2039,7 +2119,11 @@ assemble_host() {
   esc_geo="$(_lane_geo_json "$DOMAINS")"
   block_geo="$(_lane_geo_json "$BLOCK_DOMAINS")"
   geo_sets="$(_geo_sets_json)"
+  # corp_dom is the corp suffixes outside the DHCP block; the synced DHCP
+  # domains and every corp CIDR are the rule-sets corp-sync-dom / corp-cidr.
+  _corp_sets_write || die "could not write the corp rule-sets ($CORP_SET_CIDR, $CORP_SET_DOM)"
   jq -n \
+    --arg corp_set_cidr "$CORP_SET_CIDR" --arg corp_set_dom "$CORP_SET_DOM" \
     --argjson esc_geo "$esc_geo" \
     --argjson block_geo "$block_geo" \
     --argjson geo_sets "$geo_sets" \
@@ -2056,7 +2140,7 @@ assemble_host() {
     --arg esc_out "$esc_out" \
     --arg escape_hosts "$CFG/escape-hosts" \
     --argjson esc_dom "$(domains_json)" \
-    --argjson corp_dom "$(corp_domains_json)" \
+    --argjson corp_dom "$(_corp_inline_domains_json)" \
     --argjson corp_cidr "$(corp_cidrs_json)" \
     --argjson block_dom "$(block_domains_json)" \
     --argjson esc_exact "$(escape_exact_json)" \
@@ -2122,11 +2206,14 @@ assemble_host() {
     | ([ {action:"sniff"} ]
      + $exact_rules
      + $suffix_rules
+     # The synced DHCP domains, after every hand suffix (a hand entry
+     # in escape or block still wins, as corp sync already promised).
+     + [ {rule_set:["corp-sync-dom"], outbound:"corp"} ]
      + $geo_rules
      + [ if $ads != ""                   then {rule_set:["geosite-ads"], outbound:"block"} else empty end,
          if $final == "direct" and ($n_corp > 0 or $priv_default == "corp")
                                          then {action:"resolve", server:"dns-direct", strategy:"prefer_ipv4"} else empty end,
-         if $n_corp > 0                  then {ip_cidr:$corp_cidr, outbound:"corp"} else empty end,
+         {rule_set:["corp-cidr"], outbound:"corp"},   # always there: the set carries the CIDRs, none or many
          if $priv_default == "corp"      then {ip_cidr:$private_cidrs, outbound:"corp"} else empty end ]) as $rules
     |
     # Named ports share every rule above and differ only in what none of them
@@ -2148,7 +2235,7 @@ assemble_host() {
     | ( if $ri == null then $rules + [ $tun[] | {inbound:[(.n + "-in")], outbound:$esc_out} ]
         else $rules[:$ri]
              + [ $tun[] | .n as $n
-                 | (if $n_corp > 0             then {inbound:[($n + "-in")], ip_cidr:$corp_cidr, outbound:"corp"} else empty end),
+                 | {inbound:[($n + "-in")], rule_set:["corp-cidr"], outbound:"corp"},
                    (if $priv_default == "corp" then {inbound:[($n + "-in")], ip_cidr:$private_cidrs, outbound:"corp"} else empty end),
                    {inbound:[($n + "-in")], outbound:$esc_out} ]
              + $rules[$ri:] end )
@@ -2171,7 +2258,8 @@ assemble_host() {
     # public IP and leave the tunnel — so an EXACT corp entry needs this rule
     # just as much as a suffix one. `domain` first, mirroring the route rules.
     ([ if ($corp_exact|length) > 0 then {domain:$corp_exact, server:"local"} else empty end,
-       if ($corp_dom|length)   > 0 then {domain_suffix:$corp_dom, server:"local"} else empty end ]) as $dns_rules
+       if ($corp_dom|length)   > 0 then {domain_suffix:$corp_dom, server:"local"} else empty end,
+       {rule_set:["corp-sync-dom"], server:"local"} ]) as $dns_rules   # the synced DHCP domains resolve locally too
     |
     {
       log:{level:$lvl, timestamp:true},
@@ -2194,7 +2282,9 @@ assemble_host() {
       # and halves load on the single direct DNS socket.
       route:(({rules:$rules, final:$final, auto_detect_interface:false,
                default_domain_resolver:{server:"dns-direct", strategy:"prefer_ipv4"}})
-             + (($geo_sets + (if $ads != "" then [{type:"local", tag:"geosite-ads", format:"binary", path:$ads}] else [] end)) as $allsets
+             + (($geo_sets + (if $ads != "" then [{type:"local", tag:"geosite-ads", format:"binary", path:$ads}] else [] end)
+                 + [{type:"local", tag:"corp-cidr", format:"source", path:$corp_set_cidr},   # the corp lane (see CORP_SET_CIDR)
+                    {type:"local", tag:"corp-sync-dom", format:"source", path:$corp_set_dom}]) as $allsets
                 | if ($allsets|length) > 0 then {rule_set:$allsets} else {} end))
     }
     + ( ( (if $clash=="" then {} else {clash_api:{external_controller:$clash, secret:$secret}} end)
@@ -2270,10 +2360,11 @@ cmd_render() {
   fi
   # VM guest config (used only in mode vm): selector + clash API bound to the LAN
   assemble_vm "$(build_escape_outbounds vm-guest)" "0.0.0.0" "0.0.0.0:$VM_CLASH" > "$tv"
-  "$SB" check -c "$th" || { rm -f "$th" "$tv"; die "generated host config failed validation"; }
+  "$SB" check -c "$th" || { rm -f "$th" "$tv"; _corp_sets_restore; die "generated host config failed validation"; }   # and the corp sets as they were
   "$SB" check -c "$tv" || { rm -f "$th" "$tv"; die "generated vm config failed validation"; }
   mv -f "$th" "$HOST_CFG"
   mv -f "$tv" "$VM_CFG"
+  rm -f "$CORP_SET_CIDR.prev" "$CORP_SET_DOM.prev"   # validated: the previous corp sets are done with
   [ "${ROWT_RENDER_SHADOW:-$(sget shadow_render)}" = 1 ] && _render_shadow "$mode" || true
   echo "  host: $HOST_CFG"
   echo "  vm:   $VM_CFG"
@@ -3141,6 +3232,7 @@ _port_apply() { # $1=the table before this command (a failed render goes back to
      && { [ -z "$want_open" ] || _port_wait "$want_open" 1; } \
      && { [ -z "$want_closed" ] || _port_wait "$want_closed" 0; } \
      && host_running && _router_ready 2; then
+    _router_cfg_mark   # the reloaded instance runs this host.json (ROUTER_CFG_SUM)
     info "$msg (router reloaded in place, pid $pid — open connections were reset)"
     return 0
   fi
@@ -3912,8 +4004,9 @@ cmd_router() {
       [ -f "$HOST_CFG" ] || cmd_render
       ensure_singbox_host
       info "starting rule-router on 127.0.0.1:$PORT"
+      local _cfgsum; _cfgsum="$(cksum < "$HOST_CFG" 2>/dev/null || true)"; rm -f "$ROUTER_CFG_SUM"   # see ROUTER_CFG_SUM
       _start_host_router 1
-      if _router_ready 5; then _start_collector; _start_follow; echo "  ✓ running (pid $(cat "$(host_pidfile)"))"; return 0; fi
+      if _router_ready 5; then printf '%s\n' "$_cfgsum" > "$ROUTER_CFG_SUM"; _start_collector; _start_follow; echo "  ✓ running (pid $(cat "$(host_pidfile)"))"; return 0; fi
       # it didn't come up healthy (exited, or alive but the clash API never
       # answered = wedged). Show why, then retry ONCE after a settle, this time
       # with plain logging (rules out both a startup-network blip and the splitter).
@@ -3922,7 +4015,7 @@ cmd_router() {
       _router_stop   # clean up the failed process before retrying (proxy untouched)
       sleep 2
       _start_host_router 0
-      if _router_ready 5; then _start_collector; _start_follow; echo "  ✓ running (pid $(cat "$(host_pidfile)"))  [plain log]"; return 0; fi
+      if _router_ready 5; then printf '%s\n' "$_cfgsum" > "$ROUTER_CFG_SUM"; _start_collector; _start_follow; echo "  ✓ running (pid $(cat "$(host_pidfile)"))  [plain log]"; return 0; fi
       err "router failed to come up healthy — see $HOST_LOG"; tail -8 "$HOST_LOG" >&2
       _ensure_no_limbo   # never leave the proxy pointing at a router that won't start
       return 1
@@ -5591,13 +5684,19 @@ _list_hit() {
 # -> "<lane> <exact|suffix> <entry>". An EXACT (`domain:`) hit beats every suffix
 # at any length, because the render emits the `domain` rules first and sing-box
 # is first-match-wins; among exacts the first lane seen wins, matching that same
-# emission order (escape -> corp -> block).
+# emission order (escape -> corp -> block). The corp lane's synced DHCP domains
+# are one rule-set rule placed after every inline suffix (assemble_host), so they
+# are ranked only among themselves, and only when no inline suffix matched.
 _longest_domain_hit() { # $1=domain
-  local val="$1" best_e="" best_lane="" ex_e="" ex_lane="" e lane f pair ent
+  local val="$1" best_e="" best_lane="" ex_e="" ex_lane="" sy_e="" insync e lane f pair ent
   for pair in "escape:$DOMAINS" "corp:$CORP_DOMAINS" "block:$BLOCK_DOMAINS"; do
     lane="${pair%%:*}"; f="${pair#*:}"
     [ -f "$f" ] || continue
+    insync=0
     while IFS= read -r e; do
+      if [ "$lane" = corp ]; then
+        case "$e" in "# --- rowt corp sync"*) [ "$e" = "$CORP_SYNC_DOM_MARKER" ] && insync=1 || insync=0; continue ;; esac
+      fi
       e="$(printf '%s' "$e" | sed 's/[[:space:]]//g')"; case "$e" in ''|\#*) continue ;; esac
       case "$e" in '*.'?*) e="${e#\*}" ;; esac   # `*.z.com` is `.z.com` (_lane_has)
       case "$e" in
@@ -5607,6 +5706,13 @@ _longest_domain_hit() { # $1=domain
           continue ;;
       esac
       case "$e" in */[0-9]*) continue ;; esac   # skip corp CIDR entries
+      if [ "$insync" = 1 ]; then
+        case "$e" in
+          .*) case "$val" in *"$e") [ "${#e}" -gt "${#sy_e}" ] && sy_e="$e" ;; esac ;;
+          *)  case "$val" in "$e"|*".$e") [ "${#e}" -gt "${#sy_e}" ] && sy_e="$e" ;; esac ;;
+        esac
+        continue
+      fi
       # sing-box matches domain_suffix on a LABEL BOUNDARY — measured with
       # `sing-box rule-set match` on 1.13.14:
       #     z.com  -> z.com Y  a.z.com Y  xz.com .    com .
@@ -5623,6 +5729,7 @@ _longest_domain_hit() { # $1=domain
     done < "$f"
   done
   [ -n "$ex_e" ] && { printf '%s exact %s\n' "$ex_lane" "$ex_e"; return 0; }
+  [ -z "$best_e" ] && [ -n "$sy_e" ] && { best_e="$sy_e"; best_lane=corp; }
   [ -n "$best_e" ] || return 1
   printf '%s suffix %s\n' "$best_lane" "$best_e"
 }
@@ -7001,7 +7108,7 @@ _watch_plist_body() {
   done
   local envxml v val
   envxml="    <key>PATH</key><string>$agent_path</string>"
-  for v in XDG_CONFIG_HOME ROWT_PORT ROWT_CLASH_PORT ROWT_FINAL ROWT_IFACE ROWT_DNS_DIRECT ROWT_DNS_LOCAL ROWT_GFW_CANARIES ROWT_GFW_TIMEOUT SINGBOX_VERSION ROWT_LOG_LEVEL ROWT_WATCH_INTERVAL ROWT_HEALTH_FAILS ROWT_HEALTH_COOLDOWN ROWT_HEALTH_TIMEOUT ROWT_HEALTH_URL ROWT_CAPTIVE_CHECK ROWT_CAPTIVE_URL ROWT_CAPTIVE_TIMEOUT ROWT_CAPTIVE_RETRY ROWT_CAPTIVE_FALLBACK ROWT_WATCH_SHADOW ROWT_RENDER_SHADOW ROWT_PPROF ROWT_CPU_SPIN_PCT ROWT_CPU_SPIN_BYTES ROWT_CPU_SPIN_TICKS ROWT_CPU_HEAL_COOLDOWN ROWT_AUTO_FOLLOW ROWT_AUTO_FOLLOW_EVERY ROWT_ESCAPE_DNS_MAX_AGE \
+  for v in XDG_CONFIG_HOME ROWT_PORT ROWT_CLASH_PORT ROWT_FINAL ROWT_IFACE ROWT_DNS_DIRECT ROWT_DNS_LOCAL ROWT_GFW_CANARIES ROWT_GFW_TIMEOUT SINGBOX_VERSION ROWT_LOG_LEVEL ROWT_WATCH_INTERVAL ROWT_HEALTH_FAILS ROWT_HEALTH_COOLDOWN ROWT_HEALTH_TIMEOUT ROWT_HEALTH_URL ROWT_CAPTIVE_CHECK ROWT_CAPTIVE_URL ROWT_CAPTIVE_TIMEOUT ROWT_CAPTIVE_RETRY ROWT_CAPTIVE_FALLBACK ROWT_WATCH_SHADOW ROWT_RENDER_SHADOW ROWT_PPROF ROWT_CPU_SPIN_PCT ROWT_CPU_SPIN_BYTES ROWT_CPU_SPIN_TICKS ROWT_CPU_HEAL_COOLDOWN ROWT_AUTO_FOLLOW ROWT_AUTO_FOLLOW_EVERY ROWT_ESCAPE_DNS_MAX_AGE ROWT_CORP_HOT \
            ROWT_AUTO_INTERVAL ROWT_AUTO_TOLERANCE ROWT_AUTO_INTERRUPT; do
     val="${!v:-}"; [ -n "$val" ] && envxml="$envxml
     <key>$v</key><string>$val</string>"
@@ -8437,7 +8544,11 @@ $PROG $1 <subcommand> — edit the $1 lane$([ "$1" = escape ] && echo " (domains
                        mirrors the DNS zones only an OVERLAY resolver answers (a
                        tailnet's, served from 100.64/10) into the hotspot lane, so
                        macOS keeps them off the proxy: no lane can resolve such a
-                       zone, and the OS is the only resolver that can.
+                       zone, and the OS is the only resolver that can. A change
+                       reaches a running router LIVE: the lane's CIDRs and synced
+                       DHCP domains are two rule-set files sing-box re-reads
+                       (corp-cidr.json, corp-sync-domains.json), so nothing
+                       restarts and no connection drops (ROWT_CORP_HOT=0: restart).
   suggest              list the internal DNS domains THIS network advertises
                        (DHCP search domains, which are corp-routed automatically,
                        overlay zones, which are proxy-bypassed automatically, and

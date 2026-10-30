@@ -169,6 +169,8 @@ fn plist_body(ctx: &Ctx, self_bin: &Path) -> String {
               // auto's follower and the escape-server name check: a reload or
               // refresh the watchdog makes must see the same knobs.
               "ROWT_AUTO_FOLLOW", "ROWT_AUTO_FOLLOW_EVERY", "ROWT_ESCAPE_DNS_MAX_AGE",
+              // corp sync's live apply, so a watchdog tick honours ROWT_CORP_HOT=0.
+              "ROWT_CORP_HOT",
               "ROWT_AUTO_INTERVAL", "ROWT_AUTO_TOLERANCE", "ROWT_AUTO_INTERRUPT"] {
         // bin/rowt defaults SINGBOX_VERSION into its own shell variable, so the
         // plist ALWAYS carries the pin; reading only the environment left it

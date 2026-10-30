@@ -268,7 +268,7 @@ machine the corp lane mostly configures itself:
   `corp suggest` still lists them as candidates, and an overlay zone is now
   marked there rather than suggested for `corp add`, which could never work.
 
-Two properties keep it cheap and safe, and three rules bound what it can grow
+Three properties keep it cheap and safe, and three rules bound what it can grow
 into:
 
 - **Superset reconcile, minimal reloads** (`config/corp-sync-reconcile.py`): the
@@ -278,6 +278,25 @@ into:
   live route (whole, never shrunk), and keep stale CIDRs from a now-down tunnel —
   they're still needed in-office, where the same ranges are on the LAN and no
   tunnel is up. Hand-added entries are never touched.
+- **A change reaches the running router live.** The lane's CIDRs (hand-added
+  and synced alike) and its synced DHCP domains render as two local sing-box
+  rule-sets, `corp-cidr.json` and `corp-sync-domains.json` beside `host.json`,
+  which only points at them. sing-box watches a local rule-set file and swaps its
+  rules in place when the file is replaced (written whole, by rename, and only
+  when the bytes change), so a sync leaves `host.json` byte-identical and the
+  router — with every escape and direct connection on it — keeps running. Before
+  this, every sync that changed the lane was a render plus `router restart`, and
+  a VPN reshuffling its routes reset every connection on the machine, up to three
+  times in three minutes. `host.running` records the cksum of the `host.json` the
+  router was started from; a sync whose render differs from it (an older rowt
+  started the router, another edit is pending, or the corp CIDRs went from none
+  to some, which adds the resolve rule) restarts as before, and says why.
+  `ROWT_CORP_HOT=0` restores the old always-restart. The cost is one ordering
+  change: the synced DHCP domains are one rule placed after every inline suffix,
+  so a hand entry in escape or block that is *broader* than a synced domain now
+  wins (it used to lose on length) — the "your rule wins" promise above, kept for
+  suffixes too. Every other corp domain stays inline, in the longest-suffix
+  ordering, and `explain` ranks the synced domains the way the router does.
 - **A globally-routable range is never mirrored automatically.** A corp VPN
   really does route its employer's cloud tenancy — and those same ranges host
   everyone else's sites, so following the VPN there would send a stranger's

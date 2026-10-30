@@ -239,11 +239,16 @@ pub enum HitKind {
 /// string and more labels agree — which is what keeps this in step with the
 /// render's `sort_by([label count, length])`. Ties keep the FIRST lane seen,
 /// because the shell replaces the best only on strictly-greater length.
+///
+/// The corp lane's synced DHCP domains are one rule-set rule the render places
+/// after every inline suffix (`render::CORP_SET_DOM`), so they are ranked only
+/// among themselves, and only when no inline suffix matched.
 pub fn longest_domain_hit(dest: &str, escape: &str, corp: &str, block: &str) -> Option<(Lane, HitKind, String)> {
     let mut best: Option<(Lane, String)> = None;
+    let mut synced: Option<String> = None;
     let mut exact: Option<(Lane, String)> = None;
     for (lane, list) in [(Lane::Escape, escape), (Lane::Corp, corp), (Lane::Block, block)] {
-        for e in entries(list) {
+        for (e, insync) in marked_entries(list, lane == Lane::Corp) {
             if let Some(host) = e.strip_prefix(crate::render::EXACT_PREFIX) {
                 if !host.is_empty() && dest == host && exact.is_none() {
                     exact = Some((lane, host.to_string()));
@@ -254,6 +259,12 @@ pub fn longest_domain_hit(dest: &str, escape: &str, corp: &str, block: &str) -> 
                 continue;
             }
             // Byte length: the shell runs under LC_ALL=C, where ${#e} counts bytes.
+            if insync {
+                if synced.as_ref().is_none_or(|b| e.len() > b.len()) {
+                    synced = Some(e);
+                }
+                continue;
+            }
             let better = match &best {
                 Some((_, b)) => e.len() > b.len(),
                 None => true,
@@ -266,6 +277,23 @@ pub fn longest_domain_hit(dest: &str, escape: &str, corp: &str, block: &str) -> 
     exact
         .map(|(l, e)| (l, HitKind::Exact, e))
         .or_else(|| best.map(|(l, e)| (l, HitKind::Suffix, e)))
+        .or_else(|| synced.map(|e| (Lane::Corp, HitKind::Suffix, e)))
+}
+
+/// `entries`, each marked with whether it sits in the corp lane's DHCP block.
+/// Only the corp list has one; a sync marker line opens the block when it is
+/// the DHCP marker and closes it otherwise (`render::corp_split`).
+fn marked_entries(list: &str, corp: bool) -> Vec<(String, bool)> {
+    let mut insync = false;
+    let mut out = Vec::new();
+    for raw in list.lines() {
+        if corp && raw.starts_with(crate::render::CORP_SYNC_PREFIX) {
+            insync = raw == crate::render::CORP_SYNC_DOM_MARKER;
+            continue;
+        }
+        out.extend(entries(raw).map(|e| (e, insync)));
+    }
+    out
 }
 
 /// `_hotspot_hit` — is this name on the OS proxy BYPASS list?

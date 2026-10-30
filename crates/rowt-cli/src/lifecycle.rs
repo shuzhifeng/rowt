@@ -5,7 +5,8 @@
 //! still goes through `rowt_platform`, which honours ROWT_NO_SYSPROXY — so this
 //! whole path can be exercised on a machine that is using rowt for real.
 
-use rowt_core::render::{geosites_of, group, parse_list, render_host, render_vm, Filter, Geo, HostInput, Lists};
+use rowt_core::render::{corp_rule_set, corp_split, geosites_of, group, parse_list, render_host, render_vm, Filter, Geo,
+                        HostInput, Lists, CORP_SET_CIDR, CORP_SET_DOM};
 use rowt_platform::{Mac, Platform};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -159,6 +160,93 @@ pub fn reload_if_running(ctx: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
+/// The cksum of the host.json the running router was started from (`router
+/// up`, or the shell's in-place SIGHUP reload of `port`): `ROUTER_CFG_SUM`.
+pub fn router_cfg_sum(ctx: &Ctx) -> PathBuf { ctx.cfg.join("host.running") }
+
+/// `cksum < host.json` — "<crc> <bytes>", empty when there is no file (the
+/// shell's `|| true`).
+fn host_cfg_cksum(ctx: &Ctx) -> String {
+    match fs::read(ctx.host_cfg()) {
+        Ok(b) => format!("{} {}", rowt_core::cksum::posix(&b), b.len()),
+        Err(_) => String::new(),
+    }
+}
+
+/// `_corp_apply` — a corp-lane change reaches the running router through the two
+/// rule-sets it watches (`render::CORP_SET_CIDR`), so the router restarts only
+/// when it was not started from exactly the host.json this render produced: an
+/// older rowt started it, or another change is pending. ROWT_CORP_HOT=0 restores
+/// the old always-restart.
+pub fn corp_apply(ctx: &Ctx) -> Result<(), String> {
+    if host_running(ctx).is_none() {
+        return Ok(());
+    }
+    cmd_render(ctx)?;
+    let pid = read(&ctx.pidfile()).trim_end_matches('\n').to_string();
+    let run = read(&router_cfg_sum(ctx)).trim_end_matches('\n').to_string();
+    let now = host_cfg_cksum(ctx);
+    let hot = env_or("ROWT_CORP_HOT", "1");
+    if hot == "1" && !run.is_empty() && run == now {
+        eprintln!("==> corp sync: applied live through the corp rule-sets — router not restarted (pid {pid}), no connection dropped");
+        return Ok(());
+    }
+    if hot != "1" {
+        eprintln!("==> reloading router (ROWT_CORP_HOT={hot})");
+    } else if run.is_empty() {
+        eprintln!("==> reloading router (the running router predates live corp updates — once)");
+    } else {
+        eprintln!("==> reloading router (host.json differs from the one the router runs)");
+    }
+    // `cmd_router restart`, whose `up` prints its ✓ line.
+    router_stop(ctx);
+    say(&router_up(ctx)?);
+    Ok(())
+}
+
+/// `_corp_sets_write` — the corp lane's CIDRs (the whole file's) and its synced
+/// DHCP domains, as the two rule-sets host.json points at. Unchanged bytes are
+/// left alone (a rewrite would make sing-box reload the set for nothing); a
+/// change goes to a temp file in the same directory and is renamed over it, so
+/// sing-box's watcher only ever reads a whole file. The file it replaces is kept
+/// as `<file>.prev` until the render validates (`corp_sets_restore`).
+fn corp_sets_write(ctx: &Ctx) -> Result<(), String> {
+    let body = read(&ctx.cfg.join("corp-domains.txt"));
+    let sets = [
+        (ctx.cfg.join(CORP_SET_CIDR), corp_rule_set("ip_cidr", &parse_list(&body, Filter::Cidr))),
+        (ctx.cfg.join(CORP_SET_DOM),
+         corp_rule_set("domain_suffix", &parse_list(&corp_split(&body).1, Filter::Domain))),
+    ];
+    for (p, _) in &sets {
+        let _ = fs::remove_file(prev_of(p));
+    }
+    for (p, bytes) in &sets {
+        if fs::read(p).ok().as_deref() == Some(bytes.as_bytes()) {
+            continue;
+        }
+        if p.is_file() {
+            let _ = fs::copy(p, prev_of(p));
+        }
+        let tmp = PathBuf::from(format!("{}.tmp", p.display()));
+        fs::write(&tmp, bytes).map_err(|e| format!("could not write the corp rule-sets ({}: {e})", p.display()))?;
+        private(&tmp);
+        fs::rename(&tmp, p).map_err(|e| format!("could not write the corp rule-sets ({}: {e})", p.display()))?;
+    }
+    Ok(())
+}
+
+fn prev_of(p: &Path) -> PathBuf { PathBuf::from(format!("{}.prev", p.display())) }
+
+/// A host render that failed validation puts the previous corp sets back.
+fn corp_sets_restore(ctx: &Ctx) {
+    for f in [CORP_SET_CIDR, CORP_SET_DOM] {
+        let p = ctx.cfg.join(f);
+        if prev_of(&p).is_file() {
+            let _ = fs::rename(prev_of(&p), &p);
+        }
+    }
+}
+
 /// `sset` — replace the last value or append, preserving the rest.
 pub fn sset(ctx: &Ctx, key: &str, val: &str) {
     let p = ctx.cfg.join("state");
@@ -255,7 +343,7 @@ pub fn build_host(ctx: &Ctx) -> Result<Value, String> {
             .iter().map(|s| s.to_string()).collect(),
         lists: Lists {
             escape_domains: parse_list(&esc_src, Filter::Domain),
-            corp_domains: parse_list(&corp_src, Filter::Domain),
+            corp_domains: parse_list(&corp_split(&corp_src).0, Filter::Domain),
             corp_cidrs: parse_list(&corp_src, Filter::Cidr),
             block_domains: parse_list(&blk_src, Filter::Domain),
             escape_exact: parse_list(&esc_src, Filter::Exact),
@@ -265,6 +353,8 @@ pub fn build_host(ctx: &Ctx) -> Result<Value, String> {
         escape_outbound: if local { "direct".into() } else { "escape".into() },
         escape_hosts: ctx.cfg.join("escape-hosts").to_string_lossy().into_owned(),
         ports: rowt_core::ports::rows(&read(&ctx.cfg.join("ports.tsv"))),
+        corp_set_cidr: ctx.cfg.join(CORP_SET_CIDR).to_string_lossy().into_owned(),
+        corp_set_dom: ctx.cfg.join(CORP_SET_DOM).to_string_lossy().into_owned(),
         geo: Geo {
             escape: geosites_of(&esc_src).into_iter().filter(|n| cached(n)).collect(),
             block: geosites_of(&blk_src).into_iter().filter(|n| cached(n)).collect(),
@@ -308,6 +398,7 @@ pub fn cmd_render(ctx: &Ctx) -> Result<String, String> {
     // The escape servers' names, re-checked over DoH when stale, so this
     // render guards what it can (escape_dns; the shell's cmd_render, same spot).
     crate::escape_dns::before_render(ctx);
+    corp_sets_write(ctx)?;
     let host = build_host(ctx)?;
 
     let servers: Vec<Value> =
@@ -334,9 +425,16 @@ pub fn cmd_render(ctx: &Ctx) -> Result<String, String> {
             .map(|s| s.success()).unwrap_or(false);
         if !ok {
             let _ = fs::remove_file(&tmp);
+            // A host config that failed puts the corp sets back as they were.
+            if path == ctx.host_cfg() {
+                corp_sets_restore(ctx);
+            }
             return Err(format!("generated {} failed validation", path.display()));
         }
         fs::rename(&tmp, &path).map_err(|e| format!("mv: {e}"))?;
+    }
+    for f in [CORP_SET_CIDR, CORP_SET_DOM] {
+        let _ = fs::remove_file(prev_of(&ctx.cfg.join(f)));
     }
     Ok(format!("  host: {}\n  vm:   {}", ctx.host_cfg().display(), ctx.vm_cfg().display()))
 }
@@ -977,9 +1075,13 @@ pub fn router_up(ctx: &Ctx) -> Result<String, String> {
     // rather than reporting a spawn failure the user cannot act on.
     crate::fetch::ensure_singbox(&ctx.cfg, &crate::here_dir(), false)?;
     eprintln!("==> starting rule-router on 127.0.0.1:{}", ctx.port);
+    // What this router runs, for `corp_apply` — recorded only once it is up.
+    let cfgsum = host_cfg_cksum(ctx);
+    let _ = fs::remove_file(router_cfg_sum(ctx));
     let mut child = start_router(ctx, true)?;
     let pid = child.id();
     if router_ready(ctx, 5, &mut child) {
+        let _ = fs::write(router_cfg_sum(ctx), format!("{cfgsum}\n"));
         start_collector(ctx);
         start_follow(ctx);
         return Ok(format!("  ✓ running (pid {pid})"));
@@ -994,6 +1096,7 @@ pub fn router_up(ctx: &Ctx) -> Result<String, String> {
     let mut child = start_router(ctx, false)?;
     let pid = child.id();
     if router_ready(ctx, 5, &mut child) {
+        let _ = fs::write(router_cfg_sum(ctx), format!("{cfgsum}\n"));
         start_collector(ctx);
         start_follow(ctx);
         return Ok(format!("  ✓ running (pid {pid})  [plain log]"));

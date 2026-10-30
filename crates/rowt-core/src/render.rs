@@ -14,6 +14,8 @@ use serde_json::{json, Map, Value};
 #[derive(Debug, Default, Clone)]
 pub struct Lists {
     pub escape_domains: Vec<String>,
+    /// The corp suffixes OUTSIDE the DHCP block (`corp_split`'s first half).
+    /// The synced DHCP domains are the `corp-sync-dom` rule-set, not inline.
     pub corp_domains: Vec<String>,
     pub corp_cidrs: Vec<String>,
     pub block_domains: Vec<String>,
@@ -64,6 +66,64 @@ pub struct HostInput {
     /// Named extra ports (`ports.tsv`, in `ports::rows` order). Empty renders
     /// byte-identically to a config from before they existed.
     pub ports: Vec<crate::ports::Port>,
+    /// The two local rule-sets the corp lane's CIDRs and synced DHCP domains
+    /// live in (`CORP_SET_CIDR` / `CORP_SET_DOM`, under the config dir).
+    pub corp_set_cidr: String,
+    pub corp_set_dom: String,
+}
+
+/// What corp sync changes reaches the RUNNING router without a restart.
+///
+/// The corp lane's CIDRs (hand-added and synced alike — they were one rule) and
+/// its synced DHCP search domains are rendered as two local sing-box rule-sets
+/// rather than inline lists. sing-box watches a local rule-set file and swaps
+/// the rules in place when it is replaced, so host.json stays byte-identical
+/// across a corp sync and the router keeps every connection. Every other corp
+/// domain stays inline, in the longest-suffix ordering against escape and block
+/// (which one rule-set rule cannot take part in) — so the synced domains rank
+/// after every inline suffix. `bin/rowt`: CORP_SET_CIDR and `_corp_set_put`.
+pub const CORP_SET_CIDR: &str = "corp-cidr.json";
+pub const CORP_SET_DOM: &str = "corp-sync-domains.json";
+/// Every block `corp sync` writes into corp-domains.txt starts with this.
+pub const CORP_SYNC_PREFIX: &str = "# --- rowt corp sync";
+/// The DHCP search-domain block's marker. Compared EXACTLY: the CIDR block's
+/// marker shares the prefix.
+pub const CORP_SYNC_DOM_MARKER: &str =
+    "# --- rowt corp sync: DHCP search domains (auto-managed, do not edit below) ---";
+
+/// corp-domains.txt split for the render: (every line OUTSIDE the DHCP block,
+/// the lines INSIDE it). A sync marker line opens the DHCP block when it is that
+/// block's marker and closes it otherwise; the DHCP marker itself is in neither
+/// half. `_corp_inline_lines` and `_corp_block_domains` in bin/rowt — run either
+/// half through `parse_list` for what `list_json` makes of it.
+pub fn corp_split(body: &str) -> (String, String) {
+    let (mut inline, mut synced) = (String::new(), String::new());
+    let mut insync = false;
+    for l in body.lines() {
+        if l.starts_with(CORP_SYNC_PREFIX) {
+            insync = l == CORP_SYNC_DOM_MARKER;
+            if insync {
+                continue;
+            }
+        }
+        let half = if insync { &mut synced } else { &mut inline };
+        half.push_str(l);
+        half.push('\n');
+    }
+    (inline, synced)
+}
+
+/// One corp rule-set file, byte for byte what `_corp_set_put`'s `jq -c` writes:
+/// `{"version":1,"rules":[{"<key>":[…]}]}` and a newline, with no rule at all
+/// when the list is empty (an empty `ip_cidr` would match nothing anyway, but
+/// sing-box refuses a rule with no condition).
+pub fn corp_rule_set(key: &str, values: &[String]) -> String {
+    let rules = if values.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{{{}:{}}}]", Value::from(key), Value::from(values.to_vec()))
+    };
+    format!("{{\"version\":1,\"rules\":{rules}}}\n")
 }
 
 /// Parse one lane list exactly as `list_json` does.
@@ -339,6 +399,9 @@ pub fn render_host(i: &HostInput) -> Value {
     let mut rules: Vec<Value> = vec![json!({"action": "sniff"})];
     rules.extend(exact_rules(&i.lists, &i.escape_outbound));
     rules.extend(suffix_rules(&i.lists, &i.escape_outbound));
+    // The synced DHCP domains, after every inline suffix: a hand entry in escape
+    // or block still wins, as corp sync already promised.
+    rules.push(json!({"rule_set": ["corp-sync-dom"], "outbound": "corp"}));
     rules.extend(
         i.geo.escape.iter()
             .map(|n| json!({"rule_set": [format!("geosite-{n}")], "outbound": i.escape_outbound})),
@@ -357,9 +420,10 @@ pub fn render_host(i: &HostInput) -> Value {
     if i.final_route == "direct" && address_rules {
         rules.push(json!({"action": "resolve", "server": "dns-direct", "strategy": "prefer_ipv4"}));
     }
-    if !i.lists.corp_cidrs.is_empty() {
-        rules.push(json!({"ip_cidr": i.lists.corp_cidrs, "outbound": "corp"}));
-    }
+    // Always there: the set carries the CIDRs, none or many, so a corp sync that
+    // changes them leaves this file alone. (The resolve rule above still keys on
+    // whether there are any — the one shape change a corp sync can cause.)
+    rules.push(json!({"rule_set": ["corp-cidr"], "outbound": "corp"}));
     if i.private_default == "corp" {
         rules.push(json!({"ip_cidr": i.private_cidrs, "outbound": "corp"}));
     }
@@ -386,6 +450,8 @@ pub fn render_host(i: &HostInput) -> Value {
     if !i.lists.corp_domains.is_empty() {
         dns_rules.push(json!({"domain_suffix": i.lists.corp_domains, "server": "local"}));
     }
+    // The synced DHCP domains resolve locally too.
+    dns_rules.push(json!({"rule_set": ["corp-sync-dom"], "server": "local"}));
 
     let mut outbounds = i.escapes.as_array().cloned().unwrap_or_default();
     outbounds.push(json!({
@@ -415,9 +481,9 @@ pub fn render_host(i: &HostInput) -> Value {
             "format": "binary", "path": i.geo.ads_path
         }));
     }
-    if !allsets.is_empty() {
-        route.insert("rule_set".into(), json!(allsets));
-    }
+    allsets.push(json!({"type": "local", "tag": "corp-cidr", "format": "source", "path": i.corp_set_cidr}));
+    allsets.push(json!({"type": "local", "tag": "corp-sync-dom", "format": "source", "path": i.corp_set_dom}));
+    route.insert("rule_set".into(), json!(allsets));
 
     let mut root = Map::new();
     root.insert("log".into(), json!({"level": i.log_level, "timestamp": true}));
@@ -465,9 +531,7 @@ fn port_rules(rules: Vec<Value>, i: &HostInput) -> Vec<Value> {
         Some(ri) => {
             let mut out = rules[..ri].to_vec();
             for p in tun {
-                if !i.lists.corp_cidrs.is_empty() {
-                    out.push(json!({"inbound": inbound(&p.name), "ip_cidr": i.lists.corp_cidrs, "outbound": "corp"}));
-                }
+                out.push(json!({"inbound": inbound(&p.name), "rule_set": ["corp-cidr"], "outbound": "corp"}));
                 if i.private_default == "corp" {
                     out.push(json!({"inbound": inbound(&p.name), "ip_cidr": i.private_cidrs, "outbound": "corp"}));
                 }
@@ -697,6 +761,27 @@ mod tests {
         // escape suffix and `--domain` would silently do nothing.
         assert_eq!(r[0], json!({"domain": ["z.com"], "outbound": "block"}));
         assert_eq!(r[1], json!({"domain_suffix": ["z.com"], "outbound": "escape"}));
+    }
+
+    #[test]
+    fn the_corp_lane_splits_at_the_dhcp_block_only() {
+        let body = "corp.example\n10.1.0.0/16\n\n\
+                    # --- rowt corp sync: DHCP search domains (auto-managed, do not edit below) ---\n\
+                    hq.corp.example\n\n\
+                    # --- rowt corp sync (auto-managed; superset of live tunnel routes — do not edit below) ---\n\
+                    203.0.113.0/24\nstray.example\n";
+        let (inline, synced) = corp_split(body);
+        assert_eq!(parse_list(&inline, Filter::Domain), ["corp.example", "stray.example"]);
+        assert_eq!(parse_list(&synced, Filter::Domain), ["hq.corp.example"]);
+        // Every CIDR is the rule-set's, wherever it sits: read from the whole file.
+        assert_eq!(parse_list(body, Filter::Cidr), ["10.1.0.0/16", "203.0.113.0/24"]);
+    }
+
+    #[test]
+    fn a_corp_rule_set_is_what_jq_c_writes() {
+        assert_eq!(corp_rule_set("ip_cidr", &[]), "{\"version\":1,\"rules\":[]}\n");
+        assert_eq!(corp_rule_set("domain_suffix", &["a.example".into(), "b.example".into()]),
+                   "{\"version\":1,\"rules\":[{\"domain_suffix\":[\"a.example\",\"b.example\"]}]}\n");
     }
 
     #[test]

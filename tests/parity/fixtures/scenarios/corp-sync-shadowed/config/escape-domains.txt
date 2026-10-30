@@ -1,0 +1,3 @@
+# Synthetic parity fixture — never real destinations.
+example.com
+shadow.example

@@ -627,8 +627,9 @@ pub fn run(ctx: &Ctx, o: &Opts) -> Result<String, String> {
     // Logged even under --quiet: this is a real change that triggers a reload,
     // so the watchdog log has to record WHY it reloaded. No-op ticks stay silent.
     eprintln!("==> corp sync: updated corp lane — {nd} DHCP domain(s) + {nc} CIDR(s) (superset of {na} live route(s))");
+    // Live through the corp rule-sets when it can be; a restart only when it must.
     if !o.no_reload {
-        lifecycle::reload_if_running(ctx)?;
+        lifecycle::corp_apply(ctx)?;
     }
     Ok(String::new())
 }

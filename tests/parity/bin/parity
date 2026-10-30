@@ -172,6 +172,15 @@ make_sandbox() { # $1=outdir  [$2=scenario]
     # fixture.
     [ -d "$DIR/fixtures/scenarios/$scenario/home" ]   && cp -R "$DIR/fixtures/scenarios/$scenario/home/." "$out/home/"
   fi
+  # A rendered config names files inside the config dir — the corp lane's two
+  # rule-sets — so a committed host.json/vm.json that has to equal a fresh render
+  # (use-auto-unchanged) spells that dir `@CFG@`, and each sandbox fills in its own.
+  local f
+  for f in "$cfg/host.json" "$cfg/vm.json"; do
+    if [ -f "$f" ] && grep -q '@CFG@' "$f"; then
+      sed "s#@CFG@#$cfg#g" "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+    fi
+  done
   # "The router is running" cannot be a static fixture: `host_running` reads a
   # pidfile and then `kill -0`s it, so any pid committed to the repo is either
   # dead or, worse, someone else's. A scenario asks for it with an empty
